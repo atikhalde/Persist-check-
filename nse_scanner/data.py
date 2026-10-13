@@ -174,7 +174,7 @@ def patch_zero_volume(df5: pd.DataFrame, df5_from_1m: pd.DataFrame | None) -> pd
     else:
         src = src.copy()
         src.index = src.index.tz_convert(IST)
-    vol = out["Volume"].to_numpy(dtype=float)
+    vol = np.array(out["Volume"].to_numpy(dtype=float), copy=True)
     for i, ts in enumerate(out.index):
         if vol[i] == 0.0 and ts in src.index:
             v = src.at[ts, "Volume"]
@@ -184,6 +184,7 @@ def patch_zero_volume(df5: pd.DataFrame, df5_from_1m: pd.DataFrame | None) -> pd
                 continue
             if fv == fv and fv > 0:
                 vol[i] = fv
+    out = out.copy()
     out["Volume"] = vol
     return out
 
