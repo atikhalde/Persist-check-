@@ -1,0 +1,257 @@
+# Maps persistent-engine sector codes -> Yahoo indices + master-scanner stock batches.
+# TV NSE:FOO becomes FOO.NS; underscores become hyphens (BAJAJ_AUTO -> BAJAJ-AUTO.NS).
+
+nifty: "^NSEI"
+vix: "^INDIAVIX"
+
+sectors:
+  AUTO:
+    index: "^CNXAUTO"
+    scanner: "AUTO"
+    stocks:
+      - BAJAJ-AUTO
+      - BHARATFORG
+      - BOSCHLTD
+      - EICHERMOT
+      - EXIDEIND
+      - HEROMOTOCO
+      - M&M
+      - MARUTI
+      - MOTHERSON
+      - SONACOMS
+      - TVSMOTOR
+      - TMPV
+      - TIINDIA
+      - UNOMINDA
+      - ASHOKLEY
+  FIN:
+    index: "NIFTY_FIN_SERVICE.NS"
+    scanner: "FINANCE"
+    stocks:
+      - AXISBANK
+      - BSE
+      - BAJFINANCE
+      - BAJAJFINSV
+      - CHOLAFIN
+      - HDFCBANK
+      - HDFCLIFE
+      - ICICIBANK
+      - ICICIGI
+      - JIOFIN
+      - KOTAKBANK
+      - LICHSGFIN
+      - MFSL
+      - MUTHOOTFIN
+      - PFC
+      - RECLTD
+      - SBICARD
+      - SBILIFE
+      - SHRIRAMFIN
+      - SBIN
+  IT:
+    index: "^CNXIT"
+    scanner: "IT"
+    stocks:
+      - INFY
+      - TCS
+      - WIPRO
+      - COFORGE
+      - HCLTECH
+      - PERSISTENT
+      - TECHM
+      - MPHASIS
+      - TATAELXSI
+      - LTTS
+      - LTIM
+      - OFSS
+  MET:
+    index: "^CNXMETAL"
+    scanner: "METALS"
+    stocks:
+      - VEDL
+      - HINDALCO
+      - NATIONALUM
+      - TATASTEEL
+      - SAIL
+      - NMDC
+      - HINDZINC
+      - HINDCOPPER
+      - JSWSTEEL
+      - JINDALSTEL
+      - APLAPOLLO
+      - WELCORP
+  DEF:
+    index: "NIFTY_IND_DEFENCE.NS"
+    scanner: "DEFENCE"
+    stocks:
+      - MTARTECH
+      - APOLLO
+      - DATAPATTNS
+      - HAL
+      - BEL
+      - PARAS
+      - SOLARINDS
+      - GRSE
+      - MAZDOCK
+      - BDL
+      - ASTRAMICRO
+      - COCHINSHIP
+  ENE:
+    index: "^CNXENERGY"
+    scanner: "ENERGY"
+    stocks:
+      - COALINDIA
+      - NTPC
+      - ADANIGREEN
+      - POWERGRID
+      - TATAPOWER
+      - POWERINDIA
+      - ENRIN
+      - CGPOWER
+      - GVT&D
+      - THERMAX
+      - ABB
+      - SIEMENS
+  FMCG:
+    index: "^CNXFMCG"
+    scanner: "FMCG"
+    stocks:
+      - HINDUNILVR
+      - ITC
+      - NESTLEIND
+      - VBL
+      - TATACONSUM
+      - MARICO
+      - BRITANNIA
+      - GODREJCP
+      - DABUR
+      - COLPAL
+      - UBL
+      - PATANJALI
+  OIL:
+    index: "NIFTY_OIL_AND_GAS.NS"
+    scanner: "OIL GAS"
+    stocks:
+      - RELIANCE
+      - ATGL
+      - ONGC
+      - OIL
+      - HINDPETRO
+      - BPCL
+      - AEGISLOG
+      - IOC
+      - GAIL
+      - CHENNPETRO
+      - PETRONET
+      - IGL
+  PHA:
+    index: "^CNXPHARMA"
+    scanner: "PHARMA"
+    stocks:
+      - SUNPHARMA
+      - LAURUSLABS
+      - TORNTPHARM
+      - CIPLA
+      - DRREDDY
+      - DIVISLAB
+      - AUROPHARMA
+      - LUPIN
+      - ZYDUSLIFE
+      - GLENMARK
+      - MANKIND
+      - BIOCON
+  PSE:
+    index: "^CNXPSE"
+    scanner: "PSU"
+    stocks:
+      - BHEL
+      - CONCOR
+      - HAL
+      - IRCTC
+      - IRFC
+      - NHPC
+      - NMDC
+      - NTPC
+      - PFC
+      - POWERGRID
+      - RECLTD
+      - RVNL
+  PSUBK:
+    index: "^CNXPSUBANK"
+    scanner: "PSU BANK"
+    stocks:
+      - BANKBARODA
+      - BANKINDIA
+      - MAHABANK
+      - CANBK
+      - CENTRALBK
+      - INDIANB
+      - IOB
+      - PSB
+      - PNB
+      - SBIN
+      - UCOBANK
+      - UNIONBANK
+  BANK:
+    index: "^NSEBANK"
+    scanner: "BANK ALL"
+    stocks:
+      - HDFCBANK
+      - ICICIBANK
+      - SBIN
+      - AXISBANK
+      - KOTAKBANK
+      - FEDERALBNK
+      - CANBK
+      - BANKBARODA
+      - IDFCFIRSTB
+      - AUBANK
+      - PNB
+      - BANDHANBNK
+      - INDUSINDBK
+      - RBLBANK
+      - YESBANK
+  REALTY:
+    index: "^CNXREALTY"
+    scanner: "REALTY"
+    stocks:
+      - ABREL
+      - ANANTRAJ
+      - BRIGADE
+      - DLF
+      - GODREJPROP
+      - LODHA
+      - OBEROIRLTY
+      - PHOENIXLTD
+      - PRESTIGE
+      - SOBHA
+  CDUR:
+    index: "NIFTY_CONSR_DURBL.NS"
+    scanner: "CONSUMER ELECTRONICS"
+    stocks:
+      - AMBER
+      - BATAINDIA
+      - BLUESTARCO
+      - CROMPTON
+      - DIXON
+      - HAVELLS
+      - KALYANKJIL
+      - LGEINDIA
+      - PGEL
+      - TITAN
+      - VOLTAS
+      - WHIRLPOOL
+  MEDIA:
+    index: "^CNXMEDIA"
+    scanner: "MEDIA"
+    stocks:
+      - DBCORP
+      - HATHWAY
+      - NAZARA
+      - NETWORK18
+      - PVRINOX
+      - PFOCUS
+      - SAREGAMA
+      - SUNTV
+      - TIPSMUSIC
+      - ZEEL

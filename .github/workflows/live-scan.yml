@@ -1,0 +1,55 @@
+# Runs one 5-minute scan cycle during NSE cash hours.
+# GitHub cron is NOT sub-minute and jobs cold-start — for lowest delay run
+# `python -m nse_scanner live` on a VPS in India instead.
+#
+# Secrets:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+
+name: NSE 5m live scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:45–10:00 UTC = 09:15–15:30 IST, Mon–Fri
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "*/5 4-9 * * 1-5"
+    - cron: "0,5,10,15,20,25,30 10 * * 1-5"
+
+concurrency:
+  group: nse-live-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: IST date
+        id: ist
+        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore scanner state
+        uses: actions/cache@v4
+        with:
+          path: state/scan_state.json
+          key: nse-scan-state-${{ steps.ist.outputs.day }}
+          restore-keys: |
+            nse-scan-state-
+
+      - name: Scan last 5m bar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOG_LEVEL: INFO
+        run: python -m nse_scanner once

@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+state/*.json
+state/*.txt
+!state/.gitkeep
+.idea/
+.vscode/
+*.log
+.DS_Store
