@@ -130,7 +130,9 @@ Repo **Settings → Secrets and variables → Actions**:
 - `TELEGRAM_CHAT_ID`
 
 Workflow: `.github/workflows/live-scan.yml`  
-Cron: every 5 minutes **09:15–15:30 IST, Mon–Fri**, plus `workflow_dispatch`.
+Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m close, so Yahoo has the bar and we skip GitHub’s `:00` queue), plus `workflow_dispatch`. Overlapping late jobs are cancelled so the newest bar is not stuck behind a stale run.
+
+GitHub’s scheduler **cannot** fire faster than 5 minutes and may still slip under load. Actions is a heartbeat. For bar-close alerts run `python -m nse_scanner live`.
 
 Actions cache holds `scan_state.json` so the same INFY BUY-EX is not re-sent every run. The **first** successful run of each IST day has empty state, so it catch-up-sends every complementary fire already on the table (then later crons only send new/upgraded codes).
 

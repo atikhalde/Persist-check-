@@ -1,29 +1,33 @@
-# Runs one 5-minute scan cycle during NSE cash hours.
-# GitHub cron is NOT sub-minute and jobs cold-start — for lowest delay run
-# `python -m nse_scanner live` on a VPS in India instead.
+# NSE cash hours, Mon–Fri. GitHub’s scheduler minimum is 5 minutes and it
+# can still slip under load — this is a heartbeat, not a live feed.
+# Lowest delay: `python -m nse_scanner live` on a VPS in India.
 #
-# Secrets:
-#   TELEGRAM_BOT_TOKEN
-#   TELEGRAM_CHAT_ID
+# Crons are 2 minutes AFTER each 5m close (IST) so (1) Yahoo has published
+# the bar and (2) we avoid the :00/:05 UTC stampede that delays jobs.
+#
+# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 name: NSE 5m live scan
 
 on:
   workflow_dispatch:
   schedule:
-    # 03:45–10:00 UTC = 09:15–15:30 IST, Mon–Fri
-    - cron: "45,50,55 3 * * 1-5"
-    - cron: "*/5 4-9 * * 1-5"
-    - cron: "0,5,10,15,20,25,30 10 * * 1-5"
+    # 09:22, 09:27 IST (09:15 / 09:20 bars closed)
+    - cron: "52,57 3 * * 1-5"
+    # 09:32–15:27 IST every 5m
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 4-9 * * 1-5"
+    # 15:32 IST (15:25 bar closed)
+    - cron: "2 10 * * 1-5"
 
 concurrency:
   group: nse-live-scan
-  cancel-in-progress: false
+  # Drop a stuck/late run so the newest 5m bar is not queued behind it.
+  cancel-in-progress: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
