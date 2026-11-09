@@ -12,6 +12,7 @@ import pandas as pd
 from nse_scanner import pipeline, state
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
+from nse_scanner.trade import TradePlan
 
 ORIGINAL_FORMAT_STOCK = pipeline.format_stock
 
@@ -40,7 +41,7 @@ class LiveAlertTests(TestCase):
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
         self.now = BAR + timedelta(minutes=6)
-        self.times = [BAR - timedelta(minutes=5), BAR, BAR + timedelta(minutes=5)]
+        self.times = [BAR - timedelta(minutes=5 * i) for i in range(39, 0, -1)] + [BAR, BAR + timedelta(minutes=5)]
         self.uni = {"nifty": "NIFTY", "vix": "VIX",
                     "sectors": {"IT": {"index": "INDEX", "stocks": ["ABC"]}}}
         self.md = SimpleNamespace(bar_time=BAR.strftime("%Y-%m-%d %H:%M"),
@@ -73,7 +74,11 @@ class LiveAlertTests(TestCase):
         return self.md
 
     def test_message_distinguishes_bar_open_close_and_calculation_time(self):
-        text = ORIGINAL_FORMAT_STOCK(signal(), self.md)
+        plan = TradePlan(100.0, 100.0, 99.98, 0.02, 100.02, 100.04, 100.06)
+        text = ORIGINAL_FORMAT_STOCK(signal(), self.md, plan)
+        self.assertIn("Entry (candle close) <b>100.00</b>", text)
+        self.assertIn("SL 99.98 (0.02% below EMA9)", text)
+        self.assertIn("T1 1:1 100.02  T2 1:2 100.04  T3 1:3 100.06", text)
         self.assertIn("5m bar 10:00–10:05 IST", text)
         self.assertIn("Signal calculated 10:06:00 IST", text)
 
@@ -136,7 +141,7 @@ class LiveAlertTests(TestCase):
         self.now = BAR + timedelta(minutes=1)
         result = pipeline.run_once()
         self.assertEqual(result["bar"], "2026-11-09 09:55")
-        self.assertEqual(self.scan.call_args.args[1].index[-1], self.times[0])
+        self.assertEqual(self.scan.call_args.args[1].index[-1], self.times[-3])
         self.assertNotIn("stock", [c.args[0] for c in self.send.call_args_list])
 
     def test_stock_bar_missing_is_not_replayed(self):
@@ -166,12 +171,130 @@ class LiveAlertTests(TestCase):
         self.assertEqual(pipeline.run_once()["signals"], [])
         self.send.assert_not_called()
 
+    def test_trailing_exit_on_close_even_if_sector_becomes_wait(self):
+        entry = pipeline.run_once()
+        self.assertEqual(entry["signals"][0]["price"], 100.0)
+        self.assertEqual(entry["signals"][0]["sl"], 99.98)
+        self.assertIn("ABC", state.load()["positions"])
+
+        self.now = BAR + timedelta(minutes=11)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        result = pipeline.run_once()
+        self.assertEqual(result["action"], "WAIT")
+        exits = [c.args[0] for c in self.send.call_args_list if "EMA9 TRAIL EXIT" in c.args[0]]
+        self.assertEqual(len(exits), 1)
+        self.assertIn("Close 99.00", exits[0])
+        self.assertIn("10:05–10:10 IST", exits[0])
+        self.assertNotIn("ABC", state.load()["positions"])
+        pipeline.run_once()  # same bar must not send the exit again
+        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+
+    def test_trail_exit_works_when_nifty_feed_is_stale(self):
+        pipeline.run_once()
+        self.now = BAR + timedelta(minutes=11)
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        self.mocks[2].side_effect = lambda *args: {
+            "m5": bars(*self.times[:-1]), "d1": bars(BAR - timedelta(days=1))}
+        result = pipeline.run_once()
+        self.assertEqual(result["market"], "STALE")
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+
+    def test_trail_exit_survives_nifty_download_failure(self):
+        pipeline.run_once()
+        self.now = BAR + timedelta(minutes=11)
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        self.mocks[2].side_effect = lambda *args: {"m5": bars(), "d1": bars(BAR - timedelta(days=1))}
+        with self.assertRaisesRegex(RuntimeError, "No Nifty"):
+            pipeline.run_once()
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+
+    def test_sell_mirrors_stop_targets_and_ema_exit(self):
+        self.md.pick_side, self.md.dir_state, self.md.dir_label = -1, -1, "BEAR"
+        self.scan.return_value = [signal(side="SELL", code=201)]
+        entry = pipeline.run_once()["signals"][0]
+        self.assertEqual((entry["price"], entry["sl"], entry["t1"], entry["t2"], entry["t3"]),
+                         (100.0, 100.02, 99.98, 99.96, 99.94))
+        self.now = BAR + timedelta(minutes=11)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 101.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        pipeline.run_once()
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertTrue(any("closed above EMA9" in c.args[0] for c in self.send.call_args_list))
+
+    def test_trail_ignores_wick_and_waits_for_close(self):
+        pipeline.run_once()
+        self.now = BAR + timedelta(minutes=11)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], ["Low", "Close"]] = [90.0, 101.0]
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        pipeline.run_once()
+        self.assertIn("ABC", state.load()["positions"])
+        self.assertEqual(state.load()["positions"]["ABC"]["last_bar"],
+                         self.times[-1].isoformat())
+        self.assertFalse(any("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list))
+
+    def test_failed_exit_remains_open_for_retry(self):
+        pipeline.run_once()
+        self.now = BAR + timedelta(minutes=11)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        self.send.side_effect = [False, True, True]  # exit fails; market succeeds; exit retries
+        self.assertIn("ABC", state.load()["positions"])
+        pipeline.run_once()
+        self.assertIn("ABC", state.load()["positions"])
+        pipeline.run_once()
+        self.assertNotIn("ABC", state.load()["positions"])
+
     def test_new_ist_session_resets_dedupe(self):
         previous = state.reset_if_new_day({}, "2026-11-06")
         previous["sent"]["ABC"] = {"code": 101}
         state.save(previous)
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
         self.assertEqual(state.load()["session"], "2026-11-09")
+
+    def test_new_session_keeps_open_trail_but_resets_entry_dedupe(self):
+        pipeline.run_once()
+        before = state.load()
+        after = state.reset_if_new_day(before, "2026-11-10")
+        self.assertEqual(after["sent"], {})
+        self.assertEqual(after["positions"], before["positions"])
+
+    def test_trail_continues_next_ist_session(self):
+        pipeline.run_once()
+        next_bar = datetime(2026, 11, 10, 9, 15, tzinfo=IST)
+        self.now = next_bar + timedelta(minutes=6)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        index = bars(*self.times, next_bar)
+        stock = index.copy()
+        stock.loc[next_bar, "Close"] = 99.0
+        self.mocks[2].side_effect = lambda *args: {"m5": index, "d1": bars(BAR - timedelta(days=1))}
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: stock.copy() if t == "ABC.NS" else index.copy() for t in tickers}
+        pipeline.run_once()
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertEqual(state.load()["session"], "2026-11-10")
+        self.assertEqual(state.load()["sent"]["ABC"]["code"], "EXIT")
+        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
 
     def test_workflow_retries_until_target_bar_is_available(self):
         # External workflow_dispatch fires seconds after a close. Yahoo may

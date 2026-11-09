@@ -1,4 +1,4 @@
-"""Persist last market/sector lock and per-stock alerts for the IST session."""
+"""Persist per-session dedupe and open trades across IST sessions."""
 
 from __future__ import annotations
 
@@ -33,8 +33,10 @@ def load(path: Path | None = None) -> dict:
         return {}
     try:
         result = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(result, dict) or "session" not in result or not isinstance(result.get("sent"), dict):
-            raise ValueError("missing session/sent ledger")
+        if (not isinstance(result, dict) or "session" not in result or
+                not isinstance(result.get("sent"), dict) or
+                not isinstance(result.get("positions", {}), dict)):
+            raise ValueError("invalid session/sent/positions ledger")
         return result
     except (OSError, ValueError) as exc:
         # Failing open would resend already-delivered entries on every run.
@@ -57,7 +59,9 @@ def reset_if_new_day(state: dict, session: str) -> dict:
             "sector": {},
             "alerts": {},
             "sent": {},
+            "positions": state.get("positions", {}),  # trail until an exit, even across sessions
         }
+    state.setdefault("positions", {})
     state.setdefault("alerts", {})
     state.setdefault("sent", {})
     state.setdefault("market", {})
