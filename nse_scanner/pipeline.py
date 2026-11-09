@@ -44,13 +44,15 @@ def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     below = "below" if sig.side == "BUY" else "above"
+    targets = " · ".join(
+        f"T{i} {name + ' ' if name else ''}{value:.2f}" if value is not None else f"T{i} N/A"
+        for i, (name, value) in enumerate(zip(plan.pivot_names, (plan.t1, plan.t2, plan.t3)), 1))
     return (
-        f"{arrow} <b>{sig.name}</b>  {sig.symbol}\n"
+        f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
-        f"Entry EMA9 {plan.ema9:.4f}  |  SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
-        f"Risk {plan.risk:.2f}  |  T1 1:1 {plan.t1:.2f}  T2 1:2 {plan.t2:.2f}  T3 1:3 {plan.t3:.2f}\n"
-        f"Trail: alert on first completed 5m close {below} EMA9 (even after T3).\n"
+        f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
+        f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
         f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
@@ -327,7 +329,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if not allow_stale and not _recent_bar(last, now_ist()):
             log.warning("scan finished too late for %s @ %s; dropping entry", raw, best.time)
             continue
-        plan = build_plan(best, df5, last)
+        plan = build_plan(best, df5, last, sd1.get(ysym))
         if plan is None:
             log.warning("SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close", raw, best.time)
             continue
