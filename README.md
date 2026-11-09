@@ -39,20 +39,19 @@ Action: SCAN LONG
 **Stock entry** (only same side as the pick)
 
 ```
-🟢 BUY-EX  INFY
+🟢 BUY | BUY-EX  INFY
 Sector IT  |  Market BULL (74%)
 Entry (candle close) 1842.50
-Entry EMA9 1838.6500  |  SL 1838.28 (0.02% below EMA9)
-Risk 4.22  |  T1 1:1 1846.72  T2 1:2 1850.94  T3 1:3 1855.16
-Trail: alert on first completed 5m close below EMA9 (even after T3).
+SL 1838.28 (0.02% below EMA9)
+Risk 4.22  |  next pivot target: T1 R1 1845.00 · T2 R2 1855.00 · T3 R3 1865.00
 Score 68 Strong   base 20/21  cond22=0  score=68
 5m bar 10:25–10:30 IST (signal confirmed at close)
 Signal calculated 10:31:12 IST
 ```
 
-Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, then 1R/2R/3R targets are calculated from the rounded entry-to-stop distance; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
+Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, targets are the next three classic daily pivot levels strictly above entry for BUY or below entry for SELL (nearest first), using the previous trading session’s high/low/close. The levels are S3, S2, S1, PP, R1, R2, R3, where PP = (H + L + C) / 3; R1 = 2PP − L, S1 = 2PP − H; R2/S2 = PP ± (H − L); R3 = H + 2(PP − L), S3 = L − 2(H − PP). Current/future daily candles are excluded. Missing or exhausted levels show N/A rather than invented risk-multiple targets, without suppressing entry or EMA9 trailing; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
 
-The targets are **reference levels**, not auto-sell orders: the scanner continues monitoring the symbol, even when the sector switches or the market returns WAIT, and sends one separate **EMA9 TRAIL EXIT** Telegram alert on the first *completed* BUY candle closing strictly **below** EMA9 (SELL strictly **above**). A wick alone does not trigger a trail exit. The initial SL is a reference, **not an automatically executed broker stop**; neither SL nor targets are executed by this bot. Positions carry into later sessions if the state cache survives; a missing Yahoo bar or expired freshness window can cause a missed exit alert. For actual stop execution use broker-side orders.
+Trail continues through pivot targets, including beyond T3, until the EMA9 close-confirmed exit. The targets are **reference levels**, not auto-sell orders: the scanner continues monitoring the symbol, even when the sector switches or the market returns WAIT, and sends one separate **EMA9 TRAIL EXIT** Telegram alert on the first *completed* BUY candle closing strictly **below** EMA9 (SELL strictly **above**). A wick alone does not trigger a trail exit. The initial SL is a reference, **not an automatically executed broker stop**; neither SL nor targets are executed by this bot. Positions carry into later sessions if the state cache survives; a missing Yahoo bar or expired freshness window can cause a missed exit alert. For actual stop execution use broker-side orders.
 
 **Trailing exit** (only after a qualifying 5m candle closes)
 

@@ -74,11 +74,15 @@ class LiveAlertTests(TestCase):
         return self.md
 
     def test_message_distinguishes_bar_open_close_and_calculation_time(self):
-        plan = TradePlan(100.0, 100.0, 99.98, 0.02, 100.02, 100.04, 100.06)
+        plan = TradePlan(100.0, 100.0, 99.98, 0.02, 100.02, 100.04, 100.06, ("R1", "R2", "R3"))
         text = ORIGINAL_FORMAT_STOCK(signal(), self.md, plan)
         self.assertIn("Entry (candle close) <b>100.00</b>", text)
-        self.assertIn("SL 99.98 (0.02% below EMA9)", text)
-        self.assertIn("T1 1:1 100.02  T2 1:2 100.04  T3 1:3 100.06", text)
+        self.assertIn("\nSL 99.98 (0.02% below EMA9)\n", text)
+        self.assertNotIn("Entry EMA9", text)
+        self.assertIn("<b>BUY</b> | <b>BUY-EX</b>", text)
+        self.assertNotIn("Targets are reference levels", text)
+        self.assertNotIn("Trail through pivot targets", text)
+        self.assertIn("next pivot target: T1 R1 100.02 · T2 R2 100.04 · T3 R3 100.06", text)
         self.assertIn("5m bar 10:00–10:05 IST", text)
         self.assertIn("Signal calculated 10:06:00 IST", text)
 
@@ -225,7 +229,7 @@ class LiveAlertTests(TestCase):
         self.scan.return_value = [signal(side="SELL", code=201)]
         entry = pipeline.run_once()["signals"][0]
         self.assertEqual((entry["price"], entry["sl"], entry["t1"], entry["t2"], entry["t3"]),
-                         (100.0, 100.02, 99.98, 99.96, 99.94))
+                         (100.0, 100.02, None, None, None))
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
         trailing = bars(*self.times)
@@ -235,6 +239,20 @@ class LiveAlertTests(TestCase):
         pipeline.run_once()
         self.assertNotIn("ABC", state.load()["positions"])
         self.assertTrue(any("closed above EMA9" in c.args[0] for c in self.send.call_args_list))
+
+    def test_passing_all_pivot_targets_does_not_exit_before_ema_close(self):
+        pipeline.run_once()
+        st = state.load()
+        st["positions"]["ABC"].update(t1=100.1, t2=100.2, t3=100.3)
+        state.save(st)
+        self.now = BAR + timedelta(minutes=11)
+        trailing = bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 110.0
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+        pipeline.run_once()
+        self.assertIn("ABC", state.load()["positions"])
+        self.assertFalse(any("TRAIL EXIT" in c.args[0] for c in self.send.call_args_list))
 
     def test_trail_ignores_wick_and_waits_for_close(self):
         pipeline.run_once()
