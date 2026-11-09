@@ -43,10 +43,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("cmd", choices=["once", "live", "doctor", "backtest"], help="once | live | doctor | backtest")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
-    p.add_argument("--backfill", action="store_true", help="allow scanning the last session if today has no bars (holiday/weekend)")
+    p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
+    p.add_argument("--wait-for-bar", action="store_true", help="once: retry the just-closed bar until fresh data arrives or the 3m deadline")
     p.add_argument("--date", default="2026-10-01", help="backtest session YYYY-MM-DD (IST)")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args(argv)
+    if args.backfill and not args.dry_run:
+        p.error("--backfill requires --dry-run; old signals must never reach Telegram")
+    if args.wait_for_bar and args.cmd != "once":
+        p.error("--wait-for-bar is only valid with once")
+    if args.wait_for_bar and args.backfill:
+        p.error("--wait-for-bar cannot be combined with --backfill")
     _setup_log(args.log_level)
     if args.dry_run:
         os.environ["DRY_RUN"] = "1"
@@ -54,9 +61,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "doctor":
         return _doctor()
     if args.cmd == "once":
-        from .pipeline import run_once
+        from .pipeline import run_once, run_until_ready
 
-        out = run_once(force_sector=args.sector, backfill=args.backfill)
+        out = (run_until_ready(force_sector=args.sector) if args.wait_for_bar else
+               run_once(force_sector=args.sector, backfill=args.backfill))
         print(
             f"{out['bar']}  {out['market']}  pick={out['pick']}  {out['action']}  new_alerts={len(out['signals'])}"
         )

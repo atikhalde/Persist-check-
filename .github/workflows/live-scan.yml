@@ -62,10 +62,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOG_LEVEL: INFO
           MAX_ALERT_LAG_SECONDS: "180"
-        run: python -m nse_scanner once
+        # workflow_dispatch also fires at the exact UTC 5m boundary on this
+        # repo. Yahoo's closed candle may not yet be published on first fetch;
+        # retry only until the fixed freshness deadline, never replay old bars.
+        run: python -m nse_scanner once --wait-for-bar
+
+      # A corrupt ledger must not turn into another immutable cache snapshot.
+      # Validate even if the scan failed after successfully sending a message:
+      # in that case save the good ledger to prevent a duplicate next run.
+      - name: Validate scanner state
+        id: validate
+        if: ${{ !cancelled() && hashFiles('state/scan_state.json') != '' }}
+        run: python -c 'from nse_scanner.state import load; load()'
 
       - name: Save updated scanner state
-        if: ${{ !cancelled() && hashFiles('state/scan_state.json') != '' }}
+        if: ${{ !cancelled() && steps.validate.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: state/scan_state.json

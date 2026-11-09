@@ -1,4 +1,4 @@
-"""Persist last market/sector lock and per-stock alerts (dedupe + rank upgrade)."""
+"""Persist last market/sector lock and per-stock alerts for the IST session."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_PATH = ROOT / "state" / "scan_state.json"
+
+
+class InvalidStateError(RuntimeError):
+    """Existing alert ledger cannot be trusted; stop instead of resending."""
 
 # Higher rank replaces a weaker same-day signal (matches TV table).
 RANK = {
@@ -28,9 +32,13 @@ def load(path: Path | None = None) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        result = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(result, dict) or "session" not in result or not isinstance(result.get("sent"), dict):
+            raise ValueError("missing session/sent ledger")
+        return result
+    except (OSError, ValueError) as exc:
+        # Failing open would resend already-delivered entries on every run.
+        raise InvalidStateError(f"Invalid scanner state at {p}; refusing to send alerts: {exc}") from exc
 
 
 def save(state: dict, path: Path | None = None) -> None:
