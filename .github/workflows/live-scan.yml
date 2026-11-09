@@ -6,7 +6,8 @@
 # the bar and (2) we avoid the :00/:05 UTC stampede that delays jobs.
 # Late runs and old Yahoo candles are discarded by MAX_ALERT_LAG_SECONDS.
 #
-# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Required secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Optional mirror: TELEGRAM_BOT_TOKEN_2, TELEGRAM_CHAT_ID_2
 
 name: NSE 5m live scan
 
@@ -63,6 +64,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN_2: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
+          TELEGRAM_CHAT_ID_2: ${{ secrets.TELEGRAM_CHAT_ID_2 }}
           LOG_LEVEL: INFO
           MAX_ALERT_LAG_SECONDS: "180"
         # workflow_dispatch also fires at the exact UTC 5m boundary on this

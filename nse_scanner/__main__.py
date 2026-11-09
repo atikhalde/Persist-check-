@@ -102,8 +102,14 @@ def _doctor() -> int:
     vix = data.fetch_symbol(uni["vix"])
     print(f"VIX  5m bars: {len(vix['m5'])}  last={vix['m5'].index[-1] if len(vix['m5']) else 'NA'}")
     token, chat = telegram.config_from_env()
+    secondary_token, secondary_chat = telegram.secondary_config_from_env()
     print("Telegram token:", "set" if token else "MISSING")
     print("Telegram chat:", "set" if chat else "MISSING")
+    if secondary_token or secondary_chat:
+        secondary_status = "set" if secondary_token and secondary_chat else "INCOMPLETE"
+    else:
+        secondary_status = "not configured"
+    print("Telegram secondary:", secondary_status)
     if token and chat:
         ok = telegram.send("NSE scanner doctor ping", dry_run=os.environ.get("DRY_RUN") == "1")
         print("Telegram send:", "ok" if ok else "FAILED")

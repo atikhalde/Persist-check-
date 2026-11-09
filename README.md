@@ -109,14 +109,23 @@ cp .env.example .env
 
 ### Telegram
 
-1. BotFather → `/newbot` → copy token  
-2. Message the bot, then `https://api.telegram.org/bot<TOKEN>/getUpdates` → copy `chat.id`  
-3. Put both in `.env` **or** GitHub Actions secrets:
+1. BotFather → `/newbot` → copy the primary bot token.
+2. Message the bot, then `https://api.telegram.org/bot<TOKEN>/getUpdates` → copy `chat.id`.
+3. Put these required values in `.env` **or** GitHub Actions secrets:
 
 ```
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
+
+To mirror every alert through a second bot, create it with BotFather, start a chat with it (or add it to the target group), and optionally add:
+
+```
+TELEGRAM_BOT_TOKEN_2=...
+TELEGRAM_CHAT_ID_2=...
+```
+
+The second pair is optional but must be configured together. The existing primary bot remains unchanged and authoritative for alert deduplication; secondary delivery failures are logged and do not trigger a repeat to the primary bot.
 
 Load env (local):
 
@@ -145,8 +154,8 @@ State (dedupe) is `state/scan_state.json`.
 
 Repo **Settings → Secrets and variables → Actions**:
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+- Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- Optional secondary mirror: `TELEGRAM_BOT_TOKEN_2`, `TELEGRAM_CHAT_ID_2`
 
 Workflow: `.github/workflows/live-scan.yml`  
 Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m close), plus `workflow_dispatch`. The November 6 log shows an **additional `workflow_dispatch` roughly every five minutes** (for example 04:05:10 UTC = 09:35:10 IST); that event is triggered by an external automation, not the cron lines above. If it is still running, disable it in its own scheduler to avoid unnecessary overlapping runs. Jobs here are serialized; queued runs with expired candles are skipped, not sent late.
