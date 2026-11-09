@@ -1,5 +1,6 @@
 """Regression tests for late/repeated Telegram entries (no network access)."""
 from datetime import datetime, timedelta
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from nse_scanner import pipeline, state
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
 
+ORIGINAL_FORMAT_STOCK = pipeline.format_stock
 
 BAR = datetime(2026, 11, 9, 10, 0, tzinfo=IST)  # open; closes at 10:05
 
@@ -70,6 +72,11 @@ class LiveAlertTests(TestCase):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
         return self.md
 
+    def test_message_distinguishes_bar_open_close_and_calculation_time(self):
+        text = ORIGINAL_FORMAT_STOCK(signal(), self.md)
+        self.assertIn("5m bar 10:00–10:05 IST", text)
+        self.assertIn("Signal calculated 10:06:00 IST", text)
+
     def test_only_closed_candle_used_and_only_once_per_day(self):
         first = pipeline.run_once()
         self.assertEqual(len(first["signals"]), 1)
@@ -91,6 +98,32 @@ class LiveAlertTests(TestCase):
         self.scan.return_value = [signal("09:50")]
         self.assertEqual(pipeline.run_once()["signals"], [])
         self.assertEqual([call.args[0] for call in self.send.call_args_list], ["market"])
+
+    def test_mixed_old_and_current_fires_only_send_current(self):
+        # Nov 6's KALYANKJIL @09:20 and TITAN @09:30 were both sent at
+        # 09:35 in the same run. Only the current bar's fire is an entry.
+        self.scan.return_value = [signal("09:20", code=90), signal("10:00", code=101)]
+        self.assertEqual([s["time"] for s in pipeline.run_once()["signals"]], ["10:00"])
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_backfill_is_diagnostic_only(self):
+        with self.assertRaisesRegex(ValueError, "--dry-run"):
+            pipeline.run_once(backfill=True)
+        self.send.assert_not_called()
+        with patch.dict("os.environ", {"BACKFILL": "1"}):
+            with self.assertRaisesRegex(ValueError, "--dry-run"):
+                pipeline.run_once()
+        self.send.assert_not_called()
+
+    def test_corrupt_state_fails_closed_instead_of_repeating(self):
+        state.STATE_PATH.write_text('{"session": "2026-11-09", "sent": ', encoding="utf-8")
+        with self.assertRaisesRegex(state.InvalidStateError, "Invalid scanner state"):
+            pipeline.run_once()
+        self.send.assert_not_called()
+        with patch.object(pipeline.time, "sleep") as sleep:
+            with self.assertRaises(state.InvalidStateError):
+                pipeline.run_until_ready(expected_bar=BAR)
+        sleep.assert_not_called()
 
     def test_late_run_does_not_download_or_send(self):
         self.now = BAR + timedelta(minutes=9)
@@ -139,3 +172,59 @@ class LiveAlertTests(TestCase):
         state.save(previous)
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
         self.assertEqual(state.load()["session"], "2026-11-09")
+
+    def test_workflow_retries_until_target_bar_is_available(self):
+        # External workflow_dispatch fires seconds after a close. Yahoo may
+        # still have only the preceding candle on the first fetch.
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        target = BAR.strftime("%Y-%m-%d %H:%M")
+        with (patch.object(pipeline, "run_once", side_effect=[
+                {"bar": "2026-11-09 09:55", "action": "WAIT"},
+                {"bar": target, "action": "SCAN LONG"}]) as once,
+              patch.object(pipeline.time, "sleep") as sleep):
+            out = pipeline.run_until_ready(expected_bar=BAR)
+        self.assertEqual(out["bar"], target)
+        self.assertEqual(once.call_count, 2)
+        sleep.assert_called_once_with(15)
+
+    def test_workflow_retries_when_no_stock_bar_was_published(self):
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        target = BAR.strftime("%Y-%m-%d %H:%M")
+        with (patch.object(pipeline, "run_once", side_effect=[
+                {"bar": target, "action": "PENDING"},
+                {"bar": target, "action": "SCAN LONG"}]) as once,
+              patch.object(pipeline.time, "sleep") as sleep):
+            self.assertEqual(pipeline.run_until_ready(expected_bar=BAR)["action"], "SCAN LONG")
+        self.assertEqual(once.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_partial_stock_publication_retries_without_duplicate_alerts(self):
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        self.uni["sectors"]["IT"]["stocks"] = ["ABC", "DEF"]
+        self.scan.side_effect = lambda raw, *args, **kw: [replace(signal(), symbol=raw)]
+        calls = 0
+
+        def stock_data(tickers, period, interval):
+            nonlocal calls
+            if interval == "5m" and "DEF.NS" in tickers:
+                calls += 1
+                return {t: bars(*(self.times[:1] if t == "DEF.NS" and calls == 1 else self.times))
+                        for t in tickers}
+            return {t: bars(*self.times) for t in tickers}
+
+        self.fetch_many.side_effect = stock_data
+        with patch.object(pipeline.time, "sleep") as sleep:
+            result = pipeline.run_until_ready(expected_bar=BAR)
+        self.assertEqual(calls, 2)
+        self.assertEqual([s["symbol"] for s in result["signals"]], ["ABC", "DEF"])
+        self.assertEqual(self.send.call_count, 3)  # market, ABC, DEF (no replay)
+        self.assertEqual(set(state.load()["sent"]), {"ABC", "DEF"})
+        sleep.assert_called_once()
+
+    def test_expired_workflow_does_not_wait_or_backfill(self):
+        self.now = BAR + timedelta(minutes=9)
+        with (patch.object(pipeline, "run_once", return_value={"market": "STALE"}) as once,
+              patch.object(pipeline.time, "sleep") as sleep):
+            self.assertEqual(pipeline.run_until_ready(expected_bar=BAR)["market"], "STALE")
+        once.assert_called_once_with(force_sector=None)
+        sleep.assert_not_called()

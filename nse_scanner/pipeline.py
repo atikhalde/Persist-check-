@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, time as clock_time, timedelta
 
 from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
@@ -40,13 +41,14 @@ def format_market(md) -> str:
 
 def format_stock(sig: StockSignal, md) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
+    close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     return (
         f"{arrow} <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Price {sig.price}   SL {sig.sl}\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
-        f"Bar {sig.time} IST (open; 5m close +5m)\n"
-        f"Alert sent {now_ist().strftime('%H:%M:%S')} IST"
+        f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
+        f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
     )
 
 
@@ -91,6 +93,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     session = str(last.date())
     today = str(now.date())
     allow_stale = backfill or os.environ.get("BACKFILL", "0") == "1"
+    if allow_stale and not _dry():
+        raise ValueError("Backfill is diagnostic only; pass --dry-run so old trades cannot reach Telegram")
     if session != today and not allow_stale:
         log.info("no NSE bar for %s (last %s) — skip (pass --backfill to scan last session)", today, session)
         return {
@@ -197,16 +201,21 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
            for sym, df in sm5.items()}
     current = [sym for sym in tickers if sm5.get(sym) is not None
                and not sm5[sym].empty and to_ist(sm5[sym].index[-1]) == last]
+    sent = st.setdefault("sent", {})
+    missing = [raw for raw, sym in zip(stocks, tickers) if sym not in current and raw not in sent]
+    if missing:
+        log.info("waiting for %d stock bar(s) @ %s: %s", len(missing),
+                 last.strftime("%H:%M"), ", ".join(missing))
+        result["pending"] = missing
     if not current:
-        log.info("no stocks published the decision bar %s yet", last)
-        result["action"] = "PENDING"  # live loop can retry before the freshness deadline
+        if missing:
+            result["action"] = "PENDING"  # retry within the freshness deadline
         _save(st)
         return result
     sm1 = data.fetch_many(current, "7d", "1m")
     sd1 = data.fetch_many(current, period_1d, "1d")
 
     want_buy = md.pick_side == 1
-    sent = st.setdefault("sent", {})
     new_signals: list[StockSignal] = []
 
     for raw, ysym in zip(stocks, tickers):
@@ -227,6 +236,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         fresh = [s for s in fires if s.time == last.strftime("%H:%M")
                  and s.side == ("BUY" if want_buy else "SELL")]
         if not fresh:
+            if fires:
+                log.info("SKIP historical/wrong-side %s fires=%s; decision bar=%s",
+                         raw, ",".join(f"{s.name}@{s.time}" for s in fires),
+                         last.strftime("%H:%M"))
             continue
         best = fresh[-1]
         if not allow_stale and not _recent_bar(last, now_ist()):
@@ -254,8 +267,63 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     return result
 
 
+def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:
+    """Poll Yahoo for this specific closed bar, within the alert freshness limit.
+
+    A workflow_dispatch often starts only seconds after the close; one fetch can
+    see yesterday's/previous bar and otherwise miss the entry for good. Pin the
+    target once so a slow run never rolls forward and announces an older fire.
+    """
+    now = now_ist()
+    if expected_bar is None:
+        close = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        expected_bar = close - timedelta(minutes=5)
+    expected = expected_bar.strftime("%Y-%m-%d %H:%M")
+    close_time = expected_bar + timedelta(minutes=5)
+    deadline = close_time + timedelta(seconds=_max_lag())
+    log.info("IST %s: target 5m bar %s (closes %s; alert deadline %s)",
+             now.strftime("%Y-%m-%d %H:%M:%S"), expected,
+             close_time.strftime("%H:%M:%S"), deadline.strftime("%H:%M:%S"))
+    if (expected_bar.weekday() >= 5 or
+            not clock_time(9, 15) <= expected_bar.time() <= clock_time(15, 25) or
+            now > deadline):
+        return run_once(force_sector=force_sector)
+
+    last_error: RuntimeError | None = None
+    result: dict | None = None
+    delivered: list[dict] = []
+    while now_ist() <= deadline:
+        try:
+            result = run_once(force_sector=force_sector)
+            delivered.extend(result.get("signals", []))
+            if (result["bar"] == expected and result["action"] != "PENDING"
+                    and not result.get("pending")):
+                result["signals"] = delivered
+                return result
+        except state.InvalidStateError:
+            raise  # retrying cannot repair a corrupt cache; fail closed now
+        except RuntimeError as exc:
+            last_error = exc
+            log.warning("scan not ready for %s: %s", expected, exc)
+        remaining = (deadline - now_ist()).total_seconds()
+        if remaining <= 0:
+            break
+        delay = min(15, remaining)
+        log.info("waiting for completed Yahoo bar %s (%.0fs until deadline); retry in %.0fs",
+                 expected, remaining, delay)
+        time.sleep(delay)
+    if result is not None:
+        result["signals"] = delivered
+        if result.get("pending"):
+            log.warning("Yahoo stock bars did not publish by %s IST: %s; no late entries sent",
+                        deadline.strftime("%H:%M:%S"), ", ".join(result["pending"]))
+        return result
+    if last_error:
+        raise last_error
+    return run_once(force_sector=force_sector)
+
+
 def live_loop(grace: int | None = None) -> None:
-    import time
     from .session import next_5m_close, is_weekday
 
     grace = int(os.environ.get("POLL_GRACE_SECONDS", grace or 12))
@@ -284,19 +352,12 @@ def live_loop(grace: int | None = None) -> None:
         if wait > 0:
             log.info("sleep %.1fs until %s + %ss", wait, nxt.strftime("%H:%M"), grace)
             time.sleep(min(wait, 330))
-        # Yahoo may publish the just-closed candle after our first poll. Retry
-        # briefly within the freshness window rather than waiting for the next
-        # 5m tick (when the signal would already be stale).
+        # Same bounded retry path as Actions: skip an old signal, never replay
+        # an earlier bar merely because Yahoo published the new one late.
         if nxt.hour == 9 and nxt.minute == 15:
             continue
-        expected = (nxt - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
-        deadline = nxt + timedelta(seconds=_max_lag())
-        while now_ist() <= deadline:
-            try:
-                out = run_once()
-                if out["bar"] == expected and out["action"] != "PENDING":
-                    break
-            except Exception:
-                log.exception("scan cycle failed")
-            log.info("waiting for Yahoo 5m bar %s; retry in 15s", expected)
+        try:
+            run_until_ready(expected_bar=nxt - timedelta(minutes=5))
+        except Exception:
+            log.exception("scan cycle failed")
             time.sleep(15)

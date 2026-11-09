@@ -43,11 +43,11 @@ Action: SCAN LONG
 Sector IT  |  Market BULL (74%)
 Price 1842.50   SL 1831.20
 Score 68 Strong   base 20/21  cond22=0  score=68
-Bar 10:25 IST (open; 5m close +5m)
-Alert sent 10:31:12 IST
+5m bar 10:25–10:30 IST (signal confirmed at close)
+Signal calculated 10:31:12 IST
 ```
 
-One stock entry per symbol per IST session. Later rank upgrades or re-discovered table rows are **not** pushed again. The message labels the 5m candle **open** and the Telegram send time separately; a 10:25 candle cannot be confirmed before its 10:30 close.
+One stock entry per symbol per IST session. Later rank upgrades or re-discovered table rows are **not** pushed again. The message labels the 5m candle **open and close** and the calculation time separately; a 10:25 candle cannot be confirmed before its 10:30 close. Telegram's receipt time is the delivery time.
 
 ---
 
@@ -67,7 +67,7 @@ No pair-trades. No “rel-long the strongest bull while index is bear”.
 
 A five-minute entry is known only **after the candle closes**; the bar's printed time is its OPEN, so even perfect delivery is at least five minutes later than that printed time. yfinance NSE bars can arrive late or be rate-limited. GitHub Actions cron/dispatch can queue or cold-start unpredictably. **Neither service can guarantee an exactly-on-time trade alert.**
 
-The scanner now ignores forming candles, old Yahoo candles, and historical signals retained by the TV table. By default it suppresses all messages if more than **180 seconds after the 5m close** (configurable via `MAX_ALERT_LAG_SECONDS`); this prevents a 15–20-minute-old entry from being sent, but may mean **missed** entries. Each stock is notified at most once per IST day. Logs show skipped stale candles and actual send times.
+For example, the November 6 workflow started at 09:35:13 IST, sent KALYANKJIL's 09:20 candle at 09:35:38 (10m38s after its 09:25 close), and sent TITAN's 09:30 candle at 09:35:39 (39s after close). That contrast confirms the old KALYANKJIL alert was a **historical table replay**, not a 15-minute Telegram POST. The old run also labelled a still-forming 09:35 market candle as current; completed-bar filtering prevents that. The scanner now ignores forming candles, old Yahoo candles, and historical signals retained by the TV table. By default it suppresses all messages if more than **180 seconds after the 5m close** (configurable via `MAX_ALERT_LAG_SECONDS`); this prevents a 15–20-minute-old entry from being sent, but may mean **missed** entries. Each stock is notified at most once per IST day. Logs show skipped stale candles and actual send times.
 
 Lowest practical delay:
 
@@ -115,9 +115,10 @@ python -m nse_scanner live
 |---|---|
 | `python -m nse_scanner doctor` | yfinance + Telegram ping |
 | `python -m nse_scanner once` | one 5m cycle, send new alerts |
+| `python -m nse_scanner once --wait-for-bar` | retry the just-closed bar (up to 3 min after close) if Yahoo has not published it yet |
 | `python -m nse_scanner once --dry-run` | print, don’t send |
 | `python -m nse_scanner once --sector IT` | skip picker, scan IT |
-| `python -m nse_scanner once --backfill` | scan last session (holiday/weekend) |
+| `python -m nse_scanner once --backfill --dry-run` | diagnose last session without sending old entries |
 | `python -m nse_scanner live` | always-on 09:14–15:40 IST |
 
 State (dedupe) is `state/scan_state.json`.
@@ -132,11 +133,11 @@ Repo **Settings → Secrets and variables → Actions**:
 - `TELEGRAM_CHAT_ID`
 
 Workflow: `.github/workflows/live-scan.yml`  
-Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m close, so Yahoo has the bar and we skip GitHub’s `:00` queue), plus `workflow_dispatch`. Overlapping jobs are serialized; queued runs with expired candles are skipped, not sent late.
+Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m close), plus `workflow_dispatch`. The November 6 log shows an **additional `workflow_dispatch` roughly every five minutes** (for example 04:05:10 UTC = 09:35:10 IST); that event is triggered by an external automation, not the cron lines above. If it is still running, disable it in its own scheduler to avoid unnecessary overlapping runs. Jobs here are serialized; queued runs with expired candles are skipped, not sent late.
 
-GitHub’s scheduler **cannot** fire faster than 5 minutes and may still slip under load. Actions is a heartbeat. For bar-close alerts run `python -m nse_scanner live`.
+GitHub’s scheduler **cannot** fire faster than 5 minutes and may still slip under load. Actions now polls until Yahoo publishes the *specific* just-closed bar (at most 180 seconds after close); if it remains unavailable, the alert is missed rather than sent stale. A workflow run starting immediately at a candle boundary no longer silently misses the bar because of a single early Yahoo fetch; stocks whose bars appear later are retried within the same deadline without resending the ones already delivered. Logs show target bar and deadline, with explicit skipped historical fires. Actions is a heartbeat. For bar-close alerts run `python -m nse_scanner live`.
 
-Actions restores the **latest same-day snapshot**, then saves a new uniquely keyed snapshot after each run. (A fixed date-only cache key is immutable and would restore the first snapshot forever, causing repeated signals.) The first run has empty state, but **does not catch up** old table fires: only a fire on the current completed candle within the freshness window can be sent. State is reset at the next IST session. Cache may be evicted; fresh-only filtering still prevents historical replay, but if cache is lost an entry from a later bar for the same stock could be resent. For strict durable once-per-day behavior use an external durable state store; Telegram and cache saves are not an atomic transaction.
+Actions restores the **latest same-day snapshot**, validates the state file, then saves a new uniquely keyed snapshot after each run. If state is corrupt the scanner fails closed instead of forgetting earlier deliveries and repeating alerts. (A fixed date-only cache key is immutable and would restore the first snapshot forever, causing repeated signals.) The first run has empty state, but **does not catch up** old table fires: only a fire on the current completed candle within the freshness window can be sent. State is reset at the next IST session. Cache may be evicted; fresh-only filtering still prevents historical replay, but if cache is lost an entry from a later bar for the same stock could be resent. For strict durable once-per-day behavior use an external durable state store; Telegram and cache saves are not an atomic transaction.
 
 ---
 
