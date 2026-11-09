@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta
+
 from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
 from .session import now_ist, to_ist
-from .state import signal_rank
-from .stock import StockSignal, is_buy_code, scan_stock
+from .stock import StockSignal, scan_stock
 
 log = logging.getLogger("nse_scanner")
 
@@ -44,8 +45,25 @@ def format_stock(sig: StockSignal, md) -> str:
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Price {sig.price}   SL {sig.sl}\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
-        f"Time {sig.time} IST"
+        f"Bar {sig.time} IST (open; 5m close +5m)\n"
+        f"Alert sent {now_ist().strftime('%H:%M:%S')} IST"
     )
+
+
+def _max_lag() -> int:
+    """Maximum acceptable delay after a five-minute candle CLOSE."""
+    return int(os.environ.get("MAX_ALERT_LAG_SECONDS", "180"))
+
+
+def _recent_bar(bar: datetime, now: datetime) -> bool:
+    age = (now - (bar + timedelta(minutes=5))).total_seconds()
+    return 0 <= age <= _max_lag()
+
+
+def _save(st: dict) -> None:
+    # A dry-run must not consume tomorrow's real alert or today's alert.
+    if not _dry():
+        state.save(st)
 
 
 def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, backfill: bool = False) -> dict:
@@ -63,10 +81,16 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     if nifty_5 is None or nifty_5.empty:
         raise RuntimeError("No Nifty 5m data from yfinance")
 
+    # Yahoo timestamps 5m candles by OPEN; the last row can still be forming.
+    # Never evaluate or announce an unclosed candle.
+    now = now_ist()
+    nifty_5 = nifty_5.loc[nifty_5.index <= now - timedelta(minutes=5)]
+    if nifty_5.empty:
+        return {"session": str(now.date()), "bar": "", "market": "PENDING", "pick": "WAIT", "action": "WAIT", "signals": []}
     last = to_ist(nifty_5.index[-1])
     session = str(last.date())
-    today = str(now_ist().date())
-    allow_stale = backfill or bool(force_sector) or os.environ.get("BACKFILL", "0") == "1"
+    today = str(now.date())
+    allow_stale = backfill or os.environ.get("BACKFILL", "0") == "1"
     if session != today and not allow_stale:
         log.info("no NSE bar for %s (last %s) — skip (pass --backfill to scan last session)", today, session)
         return {
@@ -78,10 +102,23 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "signals": [],
         }
 
+    # No catch-up trades: a signal calculated from an older candle is not an
+    # actionable entry. In particular a late Actions dispatch must not replay
+    # a morning table row 15-20 minutes after its timestamp.
+    if not allow_stale and not _recent_bar(last, now):
+        lag = (now - (last + timedelta(minutes=5))).total_seconds()
+        log.warning("Nifty bar %s is not fresh (%.0fs since close); no alerts", last, lag)
+        return {"session": session, "bar": last.strftime("%Y-%m-%d %H:%M"),
+                "market": "STALE", "pick": "WAIT", "action": "WAIT", "signals": []}
+
     log.info("fetching vix / %d sector indices", len(index_map))
     idx_tickers = [vix_sym] + list(index_map.values())
     m5 = data.fetch_many(idx_tickers, period_5m, "5m")
     d1 = data.fetch_many(idx_tickers, period_1d, "1d")
+    # Align all inputs to the Nifty decision bar, not a newer in-progress
+    # sector/stock candle that happened to arrive during the fetch.
+    m5 = {sym: df.loc[df.index <= last] if df is not None and not df.empty else df
+          for sym, df in m5.items()}
     m5[nifty_sym] = nifty_5
     d1[nifty_sym] = nifty_pack["d1"]
 
@@ -106,6 +143,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         md.action,
         md.bar_time,
     )
+    if md.bar_time != last.strftime("%Y-%m-%d %H:%M"):
+        log.warning("market sanitation moved decision to %s; refusing to alert for %s", md.bar_time, last)
+        return {"session": session, "bar": md.bar_time, "market": "STALE",
+                "pick": "WAIT", "action": "WAIT", "signals": []}
 
     if force_sector:
         force_sector = force_sector.upper()
@@ -120,8 +161,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     prev_s = st.get("sector") or {}
     market_changed = prev_m.get("dir_state") != md.dir_state or prev_m.get("label") != md.dir_label
     sector_changed = prev_s.get("name") != md.pick_sector or prev_s.get("side") != md.pick_side
-    if market_changed or sector_changed:
-        telegram.send(format_market(md), dry_run=_dry())
+    if (market_changed or sector_changed) and (allow_stale or _recent_bar(last, now_ist())) and telegram.send(format_market(md), dry_run=_dry()):
         st["market"] = {
             "dir_state": md.dir_state,
             "label": md.dir_label,
@@ -129,6 +169,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "regime": md.regime,
         }
         st["sector"] = {"name": md.pick_sector, "side": md.pick_side, "reason": md.pick_reason}
+        _save(st)
 
     result = {
         "session": session,
@@ -142,7 +183,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     if md.pick_sector == "WAIT" or md.action == "WAIT":
         if ping_on_wait and not market_changed and not sector_changed:
             log.info("WAIT — no complementary persistent sector")
-        state.save(st)
+        _save(st)
         return result
 
     sec_cfg = uni["sectors"][md.pick_sector]
@@ -150,39 +191,49 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     tickers = [data.yahoo_stock(s) for s in stocks]
     log.info("scanning %s (%d names) 5m entries", md.pick_sector, len(tickers))
     sm5 = data.fetch_many(tickers, period_5m, "5m")
-    sm1 = data.fetch_many(tickers, "7d", "1m")
-    sd1 = data.fetch_many(tickers, period_1d, "1d")
+    # Only fetch the expensive 1m volume repair/daily history if there is a
+    # current completed stock candle to evaluate.
+    sm5 = {sym: df.loc[df.index <= last] if df is not None and not df.empty else df
+           for sym, df in sm5.items()}
+    current = [sym for sym in tickers if sm5.get(sym) is not None
+               and not sm5[sym].empty and to_ist(sm5[sym].index[-1]) == last]
+    if not current:
+        log.info("no stocks published the decision bar %s yet", last)
+        result["action"] = "PENDING"  # live loop can retry before the freshness deadline
+        _save(st)
+        return result
+    sm1 = data.fetch_many(current, "7d", "1m")
+    sd1 = data.fetch_many(current, period_1d, "1d")
 
     want_buy = md.pick_side == 1
     sent = st.setdefault("sent", {})
     new_signals: list[StockSignal] = []
 
     for raw, ysym in zip(stocks, tickers):
-        df5 = sm5.get(ysym)
-        df1 = sd1.get(ysym)
-        if df5 is None or df5.empty:
-            log.warning("no 5m data %s", ysym)
+        if ysym not in current:
             continue
-        df5 = data.apply_1m_volume(df5, sm1.get(ysym))
+        # One entry per stock per IST session, regardless of rank upgrades or
+        # later runs. A new session resets this in reset_if_new_day().
+        if raw in sent:
+            continue
+        df5 = data.apply_1m_volume(sm5[ysym], sm1.get(ysym))
         try:
-            sigs = scan_stock(raw, df5, df1)
+            fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
         except Exception as e:
             log.exception("scan failed %s: %s", raw, e)
             continue
-        if not sigs:
+        # The TradingView table retains the FIRST hit (and rank upgrades) for
+        # the whole day. That table is not a stream of new entry signals.
+        fresh = [s for s in fires if s.time == last.strftime("%H:%M")
+                 and s.side == ("BUY" if want_buy else "SELL")]
+        if not fresh:
             continue
-        # last (highest-rank) signal of the day
-        best = sigs[0]
-        for s in sigs[1:]:
-            if signal_rank(s.code) >= signal_rank(best.code):
-                best = s
-        # only complementary side
-        if want_buy and best.side != "BUY":
+        best = fresh[-1]
+        if not allow_stale and not _recent_bar(last, now_ist()):
+            log.warning("scan finished too late for %s @ %s; dropping entry", raw, best.time)
             continue
-        if (not want_buy) and best.side != "SELL":
-            continue
-        prev_code = int((sent.get(raw) or {}).get("code") or 0)
-        if prev_code and signal_rank(best.code) <= signal_rank(prev_code):
+        if not telegram.send(format_stock(best, md), dry_run=_dry()):
+            log.warning("Telegram failed for %s; leaving unsent for retry", raw)
             continue
         new_signals.append(best)
         sent[raw] = {
@@ -191,12 +242,14 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "time": best.time,
             "price": best.price,
         }
-        telegram.send(format_stock(best, md), dry_run=_dry())
-        log.info("ALERT %s %s %s @ %s", best.name, raw, best.price, best.time)
+        st["sent"] = sent
+        _save(st)  # persist each successful send in long-running live mode
+        log.info("ALERT %s %s %s @ %s (sent %s IST)", best.name, raw, best.price,
+                 best.time, now_ist().strftime("%H:%M:%S"))
 
     st["sent"] = sent
     st["session"] = session
-    state.save(st)
+    _save(st)
     result["signals"] = [s.__dict__ for s in new_signals]
     return result
 
@@ -231,8 +284,19 @@ def live_loop(grace: int | None = None) -> None:
         if wait > 0:
             log.info("sleep %.1fs until %s + %ss", wait, nxt.strftime("%H:%M"), grace)
             time.sleep(min(wait, 330))
-        try:
-            run_once()
-        except Exception:
-            log.exception("scan cycle failed")
+        # Yahoo may publish the just-closed candle after our first poll. Retry
+        # briefly within the freshness window rather than waiting for the next
+        # 5m tick (when the signal would already be stale).
+        if nxt.hour == 9 and nxt.minute == 15:
+            continue
+        expected = (nxt - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+        deadline = nxt + timedelta(seconds=_max_lag())
+        while now_ist() <= deadline:
+            try:
+                out = run_once()
+                if out["bar"] == expected and out["action"] != "PENDING":
+                    break
+            except Exception:
+                log.exception("scan cycle failed")
+            log.info("waiting for Yahoo 5m bar %s; retry in 15s", expected)
             time.sleep(15)

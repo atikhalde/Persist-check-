@@ -4,6 +4,7 @@
 #
 # Crons are 2 minutes AFTER each 5m close (IST) so (1) Yahoo has published
 # the bar and (2) we avoid the :00/:05 UTC stampede that delays jobs.
+# Late runs and old Yahoo candles are discarded by MAX_ALERT_LAG_SECONDS.
 #
 # Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
@@ -21,8 +22,9 @@ on:
 
 concurrency:
   group: nse-live-scan
-  # Drop a stuck/late run so the newest 5m bar is not queued behind it.
-  cancel-in-progress: true
+  # Serialize runs: cancelling after a Telegram POST but before saving state
+  # can cause a duplicate on the next run. Late queued runs self-discard.
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -43,17 +45,28 @@ jobs:
         id: ist
         run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
 
+      # Cache keys are IMMUTABLE. A fixed date key restores the *first* run's
+      # state forever and repeats its alerts every 5m. Use one key per run,
+      # restoring the most recently created cache from this IST session.
       - name: Restore scanner state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: state/scan_state.json
-          key: nse-scan-state-${{ steps.ist.outputs.day }}
+          key: nse-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            nse-scan-state-
+            nse-scan-state-${{ steps.ist.outputs.day }}-
 
       - name: Scan last 5m bar
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOG_LEVEL: INFO
+          MAX_ALERT_LAG_SECONDS: "180"
         run: python -m nse_scanner once
+
+      - name: Save updated scanner state
+        if: ${{ !cancelled() && hashFiles('state/scan_state.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: state/scan_state.json
+          key: nse-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
