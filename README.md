@@ -41,10 +41,26 @@ Action: SCAN LONG
 ```
 🟢 BUY-EX  INFY
 Sector IT  |  Market BULL (74%)
-Price 1842.50   SL 1831.20
+Entry (candle close) 1842.50
+Entry EMA9 1838.6500  |  SL 1838.28 (0.02% below EMA9)
+Risk 4.22  |  T1 1:1 1846.72  T2 1:2 1850.94  T3 1:3 1855.16
+Trail: alert on first completed 5m close below EMA9 (even after T3).
 Score 68 Strong   base 20/21  cond22=0  score=68
 5m bar 10:25–10:30 IST (signal confirmed at close)
 Signal calculated 10:31:12 IST
+```
+
+Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, then 1R/2R/3R targets are calculated from the rounded entry-to-stop distance; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
+
+The targets are **reference levels**, not auto-sell orders: the scanner continues monitoring the symbol, even when the sector switches or the market returns WAIT, and sends one separate **EMA9 TRAIL EXIT** Telegram alert on the first *completed* BUY candle closing strictly **below** EMA9 (SELL strictly **above**). A wick alone does not trigger a trail exit. The initial SL is a reference, **not an automatically executed broker stop**; neither SL nor targets are executed by this bot. Positions carry into later sessions if the state cache survives; a missing Yahoo bar or expired freshness window can cause a missed exit alert. For actual stop execution use broker-side orders.
+
+**Trailing exit** (only after a qualifying 5m candle closes)
+
+```
+🔔 EMA9 TRAIL EXIT — BUY  INFY
+5m bar 2026-11-09 11:00–11:05 IST closed below EMA9
+Close 1849.00  |  EMA9 1850.2000
+Entry 1842.50  |  Initial SL 1838.28
 ```
 
 One stock entry per symbol per IST session. Later rank upgrades or re-discovered table rows are **not** pushed again. The message labels the 5m candle **open and close** and the calculation time separately; a 10:25 candle cannot be confirmed before its 10:30 close. Telegram's receipt time is the delivery time.
@@ -137,7 +153,7 @@ Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m 
 
 GitHub’s scheduler **cannot** fire faster than 5 minutes and may still slip under load. Actions now polls until Yahoo publishes the *specific* just-closed bar (at most 180 seconds after close); if it remains unavailable, the alert is missed rather than sent stale. A workflow run starting immediately at a candle boundary no longer silently misses the bar because of a single early Yahoo fetch; stocks whose bars appear later are retried within the same deadline without resending the ones already delivered. Logs show target bar and deadline, with explicit skipped historical fires. Actions is a heartbeat. For bar-close alerts run `python -m nse_scanner live`.
 
-Actions restores the **latest same-day snapshot**, validates the state file, then saves a new uniquely keyed snapshot after each run. If state is corrupt the scanner fails closed instead of forgetting earlier deliveries and repeating alerts. (A fixed date-only cache key is immutable and would restore the first snapshot forever, causing repeated signals.) The first run has empty state, but **does not catch up** old table fires: only a fire on the current completed candle within the freshness window can be sent. State is reset at the next IST session. Cache may be evicted; fresh-only filtering still prevents historical replay, but if cache is lost an entry from a later bar for the same stock could be resent. For strict durable once-per-day behavior use an external durable state store; Telegram and cache saves are not an atomic transaction.
+Actions restores the **latest same-day snapshot**, validates the state file, then saves a new uniquely keyed snapshot after each run. If state is corrupt the scanner fails closed instead of forgetting earlier deliveries and repeating alerts. (A fixed date-only cache key is immutable and would restore the first snapshot forever, causing repeated signals.) The first run has empty state, but **does not catch up** old table fires: only a fire on the current completed candle within the freshness window can be sent. Entry dedupe resets at the next IST session while open EMA9-trailing positions carry over via the previous cache snapshot. Cache may be evicted; fresh-only filtering still prevents historical replay, but if cache is lost an entry from a later bar for the same stock could be resent. For strict durable once-per-day behavior use an external durable state store; Telegram and cache saves are not an atomic transaction.
 
 ---
 

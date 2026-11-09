@@ -55,6 +55,9 @@ jobs:
           key: nse-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             nse-scan-state-${{ steps.ist.outputs.day }}-
+            nse-scan-state-
+          # The second prefix restores the last session's open EMA9 trails.
+          # reset_if_new_day clears sent entries but keeps open positions.
 
       - name: Scan last 5m bar
         env:

@@ -11,6 +11,7 @@ from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
 from .session import now_ist, to_ist
 from .stock import StockSignal, scan_stock
+from .trade import TradePlan, build_plan, ema9_on_bar, trail_broken
 
 log = logging.getLogger("nse_scanner")
 
@@ -39,15 +40,32 @@ def format_market(md) -> str:
     )
 
 
-def format_stock(sig: StockSignal, md) -> str:
+def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
+    below = "below" if sig.side == "BUY" else "above"
     return (
         f"{arrow} <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
-        f"Price {sig.price}   SL {sig.sl}\n"
+        f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
+        f"Entry EMA9 {plan.ema9:.4f}  |  SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
+        f"Risk {plan.risk:.2f}  |  T1 1:1 {plan.t1:.2f}  T2 1:2 {plan.t2:.2f}  T3 1:3 {plan.t3:.2f}\n"
+        f"Trail: alert on first completed 5m close {below} EMA9 (even after T3).\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
+        f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
+    )
+
+
+def format_trail_exit(raw: str, pos: dict, bar: datetime, close: float, ema: float) -> str:
+    side = pos["side"]
+    direction = "below" if side == "BUY" else "above"
+    return (
+        f"🔔 <b>EMA9 TRAIL EXIT — {side}</b>  {raw}\n"
+        f"5m bar {bar.strftime('%Y-%m-%d %H:%M')}–"
+        f"{(bar + timedelta(minutes=5)).strftime('%H:%M')} IST closed {direction} EMA9\n"
+        f"Close {close:.2f}  |  EMA9 {ema:.4f}\n"
+        f"Entry {pos['entry']:.2f}  |  Initial SL {pos['sl']:.2f}\n"
         f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
     )
 
@@ -68,6 +86,54 @@ def _save(st: dict) -> None:
         state.save(st)
 
 
+def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
+    """Monitor open trades independently of today's market/sector selection.
+
+    Only the latest completed stock candle may generate an exit. A failed
+    Telegram POST keeps the position open so a same-bar retry can send it.
+    """
+    positions = st.setdefault("positions", {})
+    if not positions:
+        return []
+    symbols = {raw: data.yahoo_stock(raw) for raw in positions}
+    frames = data.fetch_many(symbols.values(), period_5m, "5m")
+    pending = []
+    changed = False
+    for raw, pos in list(positions.items()):
+        df = frames.get(symbols[raw])
+        df = df.loc[df.index <= bar] if df is not None and not df.empty else df
+        if df is None or df.empty or to_ist(df.index[-1]) != bar:
+            pending.append(raw)
+            log.info("trail pending %s: 5m candle %s not published", raw, bar)
+            continue
+        if pos.get("last_bar", pos["entry_bar"]) >= bar.isoformat():
+            continue  # not another candle; don't exit on the entry bar
+        ema = ema9_on_bar(df, bar)
+        if ema is None:
+            pending.append(raw)
+            continue
+        close = float(df["Close"].iloc[-1])
+        if trail_broken(pos["side"], close, ema):
+            if not _recent_bar(bar, now_ist()):
+                log.warning("trail exit %s @ %s became stale; no late exit sent", raw, bar)
+                continue
+            if not telegram.send(format_trail_exit(raw, pos, bar, close, ema), dry_run=_dry()):
+                pending.append(raw)
+                log.warning("trail exit %s failed; retain open position for retry", raw)
+                continue
+            del positions[raw]
+            # Block a new entry on the same IST session after an exit.
+            st.setdefault("sent", {}).setdefault(raw, {"code": "EXIT", "time": bar.strftime("%H:%M")})
+            _save(st)
+            log.info("TRAIL EXIT %s %s close=%.2f ema9=%.4f @ %s", raw, pos["side"], close, ema, bar)
+        else:
+            pos["last_bar"] = bar.isoformat()
+            changed = True
+    if changed:
+        _save(st)
+    return pending
+
+
 def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, backfill: bool = False) -> dict:
     uni = data.load_universe()
     period_5m = os.environ.get("YF_PERIOD_5M", "7d")
@@ -77,6 +143,22 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     vix_sym = uni["vix"]
     index_map = {name: uni["sectors"][name]["index"] for name in SECTOR_ORDER if name in uni["sectors"]}
 
+    now = now_ist()
+    today = str(now.date())
+    allow_stale = backfill or os.environ.get("BACKFILL", "0") == "1"
+    if allow_stale and not _dry():
+        raise ValueError("Backfill is diagnostic only; pass --dry-run so old trades cannot reach Telegram")
+
+    # Trailing exits must not depend on Nifty publication or the sector picker:
+    # the stock can close below EMA9 while the index feed is stale or WAIT.
+    trail_pending: list[str] = []
+    if not allow_stale:
+        st = state.reset_if_new_day(state.load(), today)
+        closed_bar = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0) - timedelta(minutes=5)
+        if (closed_bar.weekday() < 5 and clock_time(9, 15) <= closed_bar.time() <= clock_time(15, 25)
+                and _recent_bar(closed_bar, now)):
+            trail_pending = _track_positions(st, closed_bar, period_5m)
+
     log.info("fetching nifty 5m")
     nifty_pack = data.fetch_symbol(nifty_sym, period_5m, period_1d)
     nifty_5 = nifty_pack["m5"]
@@ -85,16 +167,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
     # Yahoo timestamps 5m candles by OPEN; the last row can still be forming.
     # Never evaluate or announce an unclosed candle.
-    now = now_ist()
     nifty_5 = nifty_5.loc[nifty_5.index <= now - timedelta(minutes=5)]
     if nifty_5.empty:
         return {"session": str(now.date()), "bar": "", "market": "PENDING", "pick": "WAIT", "action": "WAIT", "signals": []}
     last = to_ist(nifty_5.index[-1])
     session = str(last.date())
-    today = str(now.date())
-    allow_stale = backfill or os.environ.get("BACKFILL", "0") == "1"
-    if allow_stale and not _dry():
-        raise ValueError("Backfill is diagnostic only; pass --dry-run so old trades cannot reach Telegram")
     if session != today and not allow_stale:
         log.info("no NSE bar for %s (last %s) — skip (pass --backfill to scan last session)", today, session)
         return {
@@ -126,7 +203,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     m5[nifty_sym] = nifty_5
     d1[nifty_sym] = nifty_pack["d1"]
 
-    st = state.reset_if_new_day(state.load(), session)
+    if allow_stale:  # diagnostic only; does not touch the real position ledger
+        st = state.reset_if_new_day(state.load(), session)
 
     sector_5 = {name: m5.get(sym) for name, sym in index_map.items()}
     sector_d = {name: d1.get(sym) for name, sym in index_map.items()}
@@ -183,6 +261,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         "action": md.action,
         "signals": [],
     }
+    if trail_pending:
+        result["pending"] = trail_pending
 
     if md.pick_sector == "WAIT" or md.action == "WAIT":
         if ping_on_wait and not market_changed and not sector_changed:
@@ -202,11 +282,13 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     current = [sym for sym in tickers if sm5.get(sym) is not None
                and not sm5[sym].empty and to_ist(sm5[sym].index[-1]) == last]
     sent = st.setdefault("sent", {})
-    missing = [raw for raw, sym in zip(stocks, tickers) if sym not in current and raw not in sent]
+    positions = st.setdefault("positions", {})
+    missing = [raw for raw, sym in zip(stocks, tickers)
+               if sym not in current and raw not in sent and raw not in positions]
     if missing:
         log.info("waiting for %d stock bar(s) @ %s: %s", len(missing),
                  last.strftime("%H:%M"), ", ".join(missing))
-        result["pending"] = missing
+        result.setdefault("pending", []).extend(raw for raw in missing if raw not in trail_pending)
     if not current:
         if missing:
             result["action"] = "PENDING"  # retry within the freshness deadline
@@ -216,14 +298,14 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     sd1 = data.fetch_many(current, period_1d, "1d")
 
     want_buy = md.pick_side == 1
-    new_signals: list[StockSignal] = []
+    new_signals: list[dict] = []
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
             continue
         # One entry per stock per IST session, regardless of rank upgrades or
         # later runs. A new session resets this in reset_if_new_day().
-        if raw in sent:
+        if raw in sent or raw in positions:
             continue
         df5 = data.apply_1m_volume(sm5[ysym], sm1.get(ysym))
         try:
@@ -245,25 +327,37 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if not allow_stale and not _recent_bar(last, now_ist()):
             log.warning("scan finished too late for %s @ %s; dropping entry", raw, best.time)
             continue
-        if not telegram.send(format_stock(best, md), dry_run=_dry()):
+        plan = build_plan(best, df5, last)
+        if plan is None:
+            log.warning("SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close", raw, best.time)
+            continue
+        best.price = plan.entry
+        best.sl = plan.sl
+        if not telegram.send(format_stock(best, md, plan), dry_run=_dry()):
             log.warning("Telegram failed for %s; leaving unsent for retry", raw)
             continue
-        new_signals.append(best)
+        new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
+                            "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
         sent[raw] = {
             "code": best.code,
             "name": best.name,
             "time": best.time,
             "price": best.price,
         }
-        st["sent"] = sent
+        positions[raw] = {
+            "side": best.side, "entry": plan.entry, "sl": plan.sl,
+            "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+            "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
+        }
         _save(st)  # persist each successful send in long-running live mode
-        log.info("ALERT %s %s %s @ %s (sent %s IST)", best.name, raw, best.price,
-                 best.time, now_ist().strftime("%H:%M:%S"))
+        log.info("ALERT %s %s entry=%.2f sl=%.2f EMA9=%.4f @ %s (sent %s IST)",
+                 best.name, raw, plan.entry, plan.sl, plan.ema9, best.time,
+                 now_ist().strftime("%H:%M:%S"))
 
     st["sent"] = sent
     st["session"] = session
     _save(st)
-    result["signals"] = [s.__dict__ for s in new_signals]
+    result["signals"] = new_signals
     return result
 
 
