@@ -1,5 +1,5 @@
 """Regression tests for late/repeated Telegram entries (no network access)."""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import TestCase
@@ -12,7 +12,7 @@ import pandas as pd
 from nse_scanner import pipeline, state
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
-from nse_scanner.trade import TradePlan
+from nse_scanner.trade import PivotBasis, TradePlan
 
 ORIGINAL_FORMAT_STOCK = pipeline.format_stock
 
@@ -22,6 +22,13 @@ BAR = datetime(2026, 11, 9, 10, 0, tzinfo=IST)  # open; closes at 10:05
 def bars(*times):
     return pd.DataFrame({"Open": [100] * len(times), "High": [101] * len(times),
                          "Low": [99] * len(times), "Close": [100] * len(times),
+                         "Volume": [1000] * len(times)}, index=pd.DatetimeIndex(times))
+
+
+def quiet_bars(*times, close=100.0, high=100.01, low=99.99):
+    """5m candles that touch neither the first pivot target nor the initial SL."""
+    return pd.DataFrame({"Open": [close] * len(times), "High": [high] * len(times),
+                         "Low": [low] * len(times), "Close": [close] * len(times),
                          "Volume": [1000] * len(times)}, index=pd.DatetimeIndex(times))
 
 
@@ -54,7 +61,8 @@ class LiveAlertTests(TestCase):
             patch.object(pipeline.data, "fetch_symbol", side_effect=lambda *args: {
                 "m5": bars(*self.times), "d1": bars(BAR - timedelta(days=1))}),
             patch.object(pipeline.data, "fetch_many", side_effect=lambda tickers, period, interval: {
-                t: bars(*self.times) for t in tickers}),
+                t: (quiet_bars(*self.times) if t.endswith(".NS") else bars(*self.times))
+                for t in tickers}),
             patch.object(pipeline.data, "apply_1m_volume", side_effect=lambda df, _: df),
             patch.object(pipeline, "run_market", side_effect=self.market_at_bar),
             patch.object(pipeline, "format_market", return_value="market"),
@@ -82,7 +90,9 @@ class LiveAlertTests(TestCase):
         self.assertIn("<b>BUY</b> | <b>BUY-EX</b>", text)
         self.assertNotIn("Targets are reference levels", text)
         self.assertNotIn("Trail through pivot targets", text)
-        self.assertIn("next pivot target: T1 R1 100.02 · T2 R2 100.04 · T3 R3 100.06", text)
+        self.assertIn("next pivot target: T1 R1 100.02 (1.0R, +0.02%) · T2 R2 100.04 (2.0R, +0.04%) · "
+                      "T3 R3 100.06 (3.0R, +0.06%)", text)
+        self.assertIn("Pivot basis N/A (no completed previous session)", text)
         self.assertIn("5m bar 10:00–10:05 IST", text)
         self.assertIn("Signal calculated 10:06:00 IST", text)
 
@@ -183,24 +193,24 @@ class LiveAlertTests(TestCase):
 
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
-        trailing = bars(*self.times)
+        trailing = quiet_bars(*self.times)
         trailing.loc[self.times[-1], "Close"] = 99.0
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
         result = pipeline.run_once()
         self.assertEqual(result["action"], "WAIT")
-        exits = [c.args[0] for c in self.send.call_args_list if "EMA9 TRAIL EXIT" in c.args[0]]
+        exits = [c.args[0] for c in self.send.call_args_list if "EMA9 EXIT" in c.args[0]]
         self.assertEqual(len(exits), 1)
-        self.assertIn("Close 99.00", exits[0])
-        self.assertIn("10:05–10:10 IST", exits[0])
+        self.assertIn("close 99.00", exits[0])
+        self.assertIn("5m 10:05", exits[0])
         self.assertNotIn("ABC", state.load()["positions"])
         pipeline.run_once()  # same bar must not send the exit again
-        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
 
     def test_trail_exit_works_when_nifty_feed_is_stale(self):
         pipeline.run_once()
         self.now = BAR + timedelta(minutes=11)
-        trailing = bars(*self.times)
+        trailing = quiet_bars(*self.times)
         trailing.loc[self.times[-1], "Close"] = 99.0
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
@@ -209,12 +219,12 @@ class LiveAlertTests(TestCase):
         result = pipeline.run_once()
         self.assertEqual(result["market"], "STALE")
         self.assertNotIn("ABC", state.load()["positions"])
-        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
 
     def test_trail_exit_survives_nifty_download_failure(self):
         pipeline.run_once()
         self.now = BAR + timedelta(minutes=11)
-        trailing = bars(*self.times)
+        trailing = quiet_bars(*self.times)
         trailing.loc[self.times[-1], "Close"] = 99.0
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
@@ -222,7 +232,7 @@ class LiveAlertTests(TestCase):
         with self.assertRaisesRegex(RuntimeError, "No Nifty"):
             pipeline.run_once()
         self.assertNotIn("ABC", state.load()["positions"])
-        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
 
     def test_sell_mirrors_stop_targets_and_ema_exit(self):
         self.md.pick_side, self.md.dir_state, self.md.dir_label = -1, -1, "BEAR"
@@ -232,13 +242,13 @@ class LiveAlertTests(TestCase):
                          (100.0, 100.02, None, None, None))
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
-        trailing = bars(*self.times)
+        trailing = quiet_bars(*self.times, high=100.0, low=99.5)
         trailing.loc[self.times[-1], "Close"] = 101.0
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
         pipeline.run_once()
         self.assertNotIn("ABC", state.load()["positions"])
-        self.assertTrue(any("closed above EMA9" in c.args[0] for c in self.send.call_args_list))
+        self.assertTrue(any("above EMA9" in c.args[0] and "EMA9 EXIT" in c.args[0] for c in self.send.call_args_list))
 
     def test_passing_all_pivot_targets_does_not_exit_before_ema_close(self):
         pipeline.run_once()
@@ -246,33 +256,41 @@ class LiveAlertTests(TestCase):
         st["positions"]["ABC"].update(t1=100.1, t2=100.2, t3=100.3)
         state.save(st)
         self.now = BAR + timedelta(minutes=11)
-        trailing = bars(*self.times)
-        trailing.loc[self.times[-1], "Close"] = 110.0
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], ["High", "Close"]] = [110.0, 110.0]
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
         pipeline.run_once()
         self.assertIn("ABC", state.load()["positions"])
-        self.assertFalse(any("TRAIL EXIT" in c.args[0] for c in self.send.call_args_list))
+        self.assertEqual(state.load()["positions"]["ABC"]["hit_targets"], [1, 2, 3])
+        hits = [c.args[0] for c in self.send.call_args_list if "TARGET HIT" in c.args[0]]
+        self.assertEqual(len(hits), 1)                     # one line, not three
+        for level in ("T1 100.10", "T2 100.20", "T3 100.30"):
+            self.assertIn(level, hits[0])
+        self.assertFalse(any("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list))
 
     def test_trail_ignores_wick_and_waits_for_close(self):
         pipeline.run_once()
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
-        trailing = bars(*self.times)
-        trailing.loc[self.times[-1], ["Low", "Close"]] = [90.0, 101.0]
+        st = state.load()
+        st["positions"]["ABC"]["sl"] = 85.0          # keep the wick clear of the stop
+        state.save(st)
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], ["Low", "Close"]] = [90.0, 100.5]
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
         pipeline.run_once()
         self.assertIn("ABC", state.load()["positions"])
         self.assertEqual(state.load()["positions"]["ABC"]["last_bar"],
                          self.times[-1].isoformat())
-        self.assertFalse(any("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list))
+        self.assertFalse(any("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list))
 
     def test_failed_exit_remains_open_for_retry(self):
         pipeline.run_once()
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
-        trailing = bars(*self.times)
+        trailing = quiet_bars(*self.times)
         trailing.loc[self.times[-1], "Close"] = 99.0
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: trailing.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
@@ -282,6 +300,183 @@ class LiveAlertTests(TestCase):
         self.assertIn("ABC", state.load()["positions"])
         pipeline.run_once()
         self.assertNotIn("ABC", state.load()["positions"])
+
+    # --- one-line hit alerts -------------------------------------------------
+    def _trade(self, *, t1=101.0, t2=102.0, t3=103.0, names=("R1", "R2", "R3")):
+        pipeline.run_once()
+        st = state.load()
+        st["positions"]["ABC"].update(t1=t1, t2=t2, t3=t3, t_names=list(names))
+        state.save(st)
+        self.now = BAR + timedelta(minutes=11)
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+
+    def _frames(self, stock):
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: stock.copy() if t == "ABC.NS" else bars(*self.times) for t in tickers}
+
+    def test_target_hit_alert_is_one_line_and_keeps_the_trade_open(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0        # touches T1 only
+        self._frames(trailing)
+        pipeline.run_once()
+        hits = [c.args[0] for c in self.send.call_args_list if "TARGET HIT" in c.args[0]]
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("\n", hits[0])                     # one line
+        self.assertIn("ABC", hits[0])
+        self.assertIn("T1 R1 101.00 (+1.00%, +50.0R)", hits[0])   # 0.02 stop in this fixture
+        self.assertIn("5m 10:05", hits[0])
+        self.assertIn("entry 100.00", hits[0])
+        self.assertEqual(state.load()["positions"]["ABC"]["hit_targets"], [1])
+        self.assertIn("ABC", state.load()["positions"])
+        pipeline.run_once()                                  # same bar, no repeat
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 1)
+
+    def test_sl_hit_alert_is_one_line_and_closes_the_trade(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Low"] = 99.90          # through SL 99.98
+        self._frames(trailing)
+        pipeline.run_once()
+        sl = [c.args[0] for c in self.send.call_args_list if "SL HIT" in c.args[0]]
+        self.assertEqual(len(sl), 1)
+        self.assertNotIn("\n", sl[0])
+        self.assertIn("SL 99.98 (-0.02%, -1.0R)", sl[0])
+        self.assertIn("5m 10:05", sl[0])
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertIn("ABC", state.load()["sent"])           # same-day re-entry stays blocked
+        pipeline.run_once()                                  # closed: no repeat
+        self.assertEqual(sum("SL HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(pipeline.run_once()["signals"], [])  # no re-entry same day
+
+    def test_ema9_exit_is_one_line(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self._frames(trailing)
+        pipeline.run_once()
+        exits = [c.args[0] for c in self.send.call_args_list if "EMA9 EXIT" in c.args[0]]
+        self.assertEqual(len(exits), 1)
+        self.assertNotIn("\n", exits[0])
+        self.assertIn("close 99.00 below EMA9", exits[0])
+        self.assertIn("5m 10:05", exits[0])
+
+    def test_hits_are_replayed_bar_by_bar_after_a_missed_cycle(self):
+        # Positions are tracked from the last processed candle, so a late or
+        # skipped run still reports the hit on the candle where it happened.
+        self._trade()
+        self.now = BAR + timedelta(minutes=16)               # closed bar 10:10
+        trailing = quiet_bars(*self.times, BAR + timedelta(minutes=10))
+        trailing.loc[self.times[-1], "High"] = 101.0         # T1 on 10:05
+        trailing.loc[BAR + timedelta(minutes=10), "Low"] = 99.90   # SL on 10:10
+        self._frames(trailing)
+        pipeline.run_once()
+        hits = [c.args[0] for c in self.send.call_args_list if "TARGET HIT" in c.args[0]]
+        sl = [c.args[0] for c in self.send.call_args_list if "SL HIT" in c.args[0]]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("5m 10:05", hits[0])                   # not the run time
+        self.assertEqual(len(sl), 1)
+        self.assertIn("5m 10:10", sl[0])
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_entry_bar_never_produces_hit_alerts(self):
+        pipeline.run_once()
+        self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
+        self.now = BAR + timedelta(minutes=7)                # still the entry bar
+        trailing = quiet_bars(*self.times)
+        # the ENTRY candle itself would breach the stop and every target
+        trailing.loc[self.times[-2], ["Low", "High"]] = [90.0, 120.0]
+        self._frames(trailing)
+        pipeline.run_once()
+        self.assertFalse(any("HIT" in c.args[0] for c in self.send.call_args_list))
+        self.assertIn("ABC", state.load()["positions"])
+
+    # --- never twice (same guarantee as the entry alert) ---------------------
+    def test_target_alert_is_not_repeated_when_the_position_record_is_rebuilt(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        pipeline.run_once()
+        st = state.load()
+        self.assertEqual(list(st["alerts"]), ["ABC:2026-11-09T10:00:00+05:30:T1"])
+        # a rebuilt/older position record forwards the cursor and forgets the hit
+        st["positions"]["ABC"].pop("hit_targets", None)
+        st["positions"]["ABC"]["last_bar"] = st["positions"]["ABC"]["entry_bar"]
+        state.save(st)
+        pipeline.run_once()
+        pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertIn("ABC", state.load()["positions"])
+
+    def test_sl_alert_is_not_repeated_when_the_position_is_reinserted(self):
+        self._trade()
+        before = state.load()["positions"]["ABC"]
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Low"] = 99.90
+        self._frames(trailing)
+        pipeline.run_once()
+        self.assertEqual(sum("SL HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        st = state.load()
+        st["positions"]["ABC"] = dict(before)          # stale record reappears
+        state.save(st)
+        pipeline.run_once()
+        self.assertEqual(sum("SL HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_ema9_exit_is_not_repeated_when_the_position_is_reinserted(self):
+        self._trade()
+        before = state.load()["positions"]["ABC"]
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self._frames(trailing)
+        pipeline.run_once()
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        st = state.load()
+        st["positions"]["ABC"] = dict(before)
+        state.save(st)
+        pipeline.run_once()
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_the_same_level_is_never_announced_twice_across_many_cycles(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        for _ in range(5):
+            pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(len(state.load()["alerts"]), 1)
+
+    def test_a_new_trade_on_the_same_symbol_gets_its_own_alerts(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        pipeline.run_once()
+        st = state.load()
+        # a fresh trade (different entry candle) must not inherit the old dedupe
+        st["positions"]["ABC"].update(entry_bar="2026-11-09T09:55:00+05:30",
+                                      last_bar="2026-11-09T10:00:00+05:30",
+                                      hit_targets=[])
+        state.save(st)
+        self.now = BAR + timedelta(minutes=11)
+        pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 2)
+
+    def test_entry_alert_is_still_sent_exactly_once_per_session(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        for _ in range(3):
+            pipeline.run_once()
+        entries = [c.args[0] for c in self.send.call_args_list
+                   if "TARGET HIT" not in c.args[0] and "SL HIT" not in c.args[0]
+                   and "EMA9 EXIT" not in c.args[0] and c.args[0] != "market"]
+        self.assertEqual(len(entries), 1)               # the untouched entry alert
+        self.assertEqual(state.load()["sent"]["ABC"]["code"], 101)
 
     def test_new_ist_session_resets_dedupe(self):
         previous = state.reset_if_new_day({}, "2026-11-06")
@@ -303,7 +498,7 @@ class LiveAlertTests(TestCase):
         self.now = next_bar + timedelta(minutes=6)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
         index = bars(*self.times, next_bar)
-        stock = index.copy()
+        stock = quiet_bars(*self.times, next_bar)
         stock.loc[next_bar, "Close"] = 99.0
         self.mocks[2].side_effect = lambda *args: {"m5": index, "d1": bars(BAR - timedelta(days=1))}
         self.fetch_many.side_effect = lambda tickers, period, interval: {
@@ -312,7 +507,7 @@ class LiveAlertTests(TestCase):
         self.assertNotIn("ABC", state.load()["positions"])
         self.assertEqual(state.load()["session"], "2026-11-10")
         self.assertEqual(state.load()["sent"]["ABC"]["code"], "EXIT")
-        self.assertEqual(sum("EMA9 TRAIL EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
 
     def test_workflow_retries_until_target_bar_is_available(self):
         # External workflow_dispatch fires seconds after a close. Yahoo may
@@ -347,11 +542,14 @@ class LiveAlertTests(TestCase):
 
         def stock_data(tickers, period, interval):
             nonlocal calls
+            quiet = lambda *ts: quiet_bars(*ts)
             if interval == "5m" and "DEF.NS" in tickers:
                 calls += 1
-                return {t: bars(*(self.times[:1] if t == "DEF.NS" and calls == 1 else self.times))
-                        for t in tickers}
-            return {t: bars(*self.times) for t in tickers}
+                return {t: (quiet_bars(*ts) if t.endswith(".NS") else bars(*ts))
+                        for t in tickers
+                        for ts in [(self.times[:1] if t == "DEF.NS" and calls == 1 else self.times)]}
+            return {t: (quiet_bars(*self.times) if t.endswith(".NS") else bars(*self.times))
+                    for t in tickers}
 
         self.fetch_many.side_effect = stock_data
         with patch.object(pipeline.time, "sleep") as sleep:
@@ -369,3 +567,26 @@ class LiveAlertTests(TestCase):
             self.assertEqual(pipeline.run_until_ready(expected_bar=BAR)["market"], "STALE")
         once.assert_called_once_with(force_sector=None)
         sleep.assert_not_called()
+
+    def test_far_target_and_wide_basis_are_disclosed_not_silently_shipped(self):
+        # 11 Nov 2026 PNB: entry 135.73, risk 0.79, pivots from 09 Nov
+        # (H 132.48 / L 125.92 / C 132.17 -> R2 136.75, R3 141.02).
+        basis = PivotBasis(date(2026, 11, 9), 132.48, 125.92, 132.17, "1d", 4.9633, 1.70)
+        plan = TradePlan(135.73, 134.9670, 134.94, 0.79, 136.75, 141.02, None,
+                         ("R2", "R3", None), basis)
+        text = ORIGINAL_FORMAT_STOCK(signal(time="10:25", code=17), self.md, plan)
+        self.assertIn("T1 R2 136.75 (1.3R, +0.75%)", text)
+        self.assertIn("T2 R3 141.02 (6.7R, +3.90% ⚠)", text)   # 6.7R / 3.9% is not a 5m target
+        self.assertIn("T3 N/A", text)
+        self.assertIn("Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%", text)
+        self.assertIn("2.9× median", text)
+        self.assertIn("wide basis", text)
+
+    def test_normal_basis_shows_levels_without_the_wide_warning(self):
+        basis = PivotBasis(date(2026, 11, 9), 135.40, 133.10, 135.10, "1d", 1.70, 1.65)
+        plan = TradePlan(135.73, 134.9670, 134.94, 0.79, 135.95, 136.80, 138.20,
+                         ("R1", "R2", "R3"), basis)
+        text = ORIGINAL_FORMAT_STOCK(signal(time="10:25", code=17), self.md, plan)
+        self.assertNotIn("wide basis day", text)
+        self.assertNotIn("⚠", text)
+        self.assertIn("Pivot basis 09 Nov", text)

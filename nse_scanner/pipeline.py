@@ -6,12 +6,15 @@ import logging
 import os
 import time
 from datetime import datetime, time as clock_time, timedelta
+from math import isfinite
+
+import pandas as pd
 
 from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
-from .session import now_ist, to_ist
+from .session import IST, now_ist, session_date, to_ist
 from .stock import StockSignal, scan_stock
-from .trade import TradePlan, build_plan, ema9_on_bar, trail_broken
+from .trade import TradePlan, build_plan, ema9_frame, trail_broken
 
 log = logging.getLogger("nse_scanner")
 
@@ -40,36 +43,113 @@ def format_market(md) -> str:
     )
 
 
+# A pivot further than this many R — or this % of price — is not a 5m day-trade
+# target. It is shown (never hidden) with a warning marker so it cannot be
+# mistaken for T1. Both tests are needed: R alone is unstable because it depends
+# on where the stop sits, while % of price is stop-independent.
+FAR_TARGET_R = 4.0
+FAR_TARGET_PCT = 2.0
+
+
+def _distance(plan: TradePlan, value: float) -> tuple[float | None, float]:
+    delta = value - plan.entry
+    r = abs(delta) / plan.risk if plan.risk else None
+    return r, delta / plan.entry * 100.0
+
+
+def _target_text(plan: TradePlan) -> str:
+    parts = []
+    for i, (name, value) in enumerate(zip(plan.pivot_names, (plan.t1, plan.t2, plan.t3)), 1):
+        if value is None:
+            parts.append(f"T{i} N/A")
+            continue
+        r, pct = _distance(plan, value)
+        bits = ([f"{r:.1f}R"] if r is not None else []) + [f"{pct:+.2f}%"]
+        far = (r is not None and r > FAR_TARGET_R) or abs(pct) > FAR_TARGET_PCT
+        parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f} ({', '.join(bits)}{' ⚠' if far else ''})")
+    return " · ".join(parts)
+
+
+def _basis_text(plan: TradePlan) -> str:
+    """Disclose the session the pivots were built from, so they can be audited."""
+    b = plan.basis
+    if b is None:
+        return "Pivot basis N/A (no completed previous session)\n"
+    line = (f"Pivot basis {b.day:%d %b}  H {b.high:.2f}  L {b.low:.2f}  C {b.close:.2f}"
+            f"  range {b.range_pct:.2f}%")
+    mult = b.range_multiple
+    if mult:
+        line += f" ({mult:.1f}× median)"
+    if b.special:
+        line += " ⚠ special session"
+    if b.wide:
+        line += " ⚠ wide basis — distant levels are reference only"
+    elif b.compressed:
+        line += " ⚠ compressed basis — levels inside a few ticks"
+    return line + "\n"
+
+
 def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     below = "below" if sig.side == "BUY" else "above"
-    targets = " · ".join(
-        f"T{i} {name + ' ' if name else ''}{value:.2f}" if value is not None else f"T{i} N/A"
-        for i, (name, value) in enumerate(zip(plan.pivot_names, (plan.t1, plan.t2, plan.t3)), 1))
+    targets = _target_text(plan)
     return (
         f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
         f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
+        f"{_basis_text(plan)}"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
         f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
     )
 
 
+def _move_pct(pos: dict, price: float) -> float:
+    """Signed move from entry in the trade's favour (+) or against it (-), in %."""
+    delta = (price - pos["entry"]) if pos["side"] == "BUY" else (pos["entry"] - price)
+    return delta / pos["entry"] * 100.0
+
+
+def _r_of(pos: dict, price: float) -> str:
+    risk = abs(float(pos["entry"]) - float(pos.get("sl") or 0))
+    if risk <= 0:
+        return ""
+    signed = (price - pos["entry"]) if pos["side"] == "BUY" else (pos["entry"] - price)
+    return f", {signed / risk:+.1f}R"
+
+
+def _event_line(raw: str, pos: dict, bar: datetime, headline: str, detail: str) -> str:
+    return (f"{headline}  {raw} · {detail} · 5m {to_ist(bar).strftime('%H:%M')}"
+            f" · entry {pos['entry']:.2f}")
+
+
+def format_target_hit(raw: str, pos: dict, bar: datetime,
+                      hits: list[tuple[int, float]]) -> str:
+    """One line for the pivot target(s) first touched in this completed candle."""
+    names = list(pos.get("t_names") or ())
+    bits = []
+    for slot, level in hits:
+        name = names[slot - 1] if len(names) >= slot and names[slot - 1] else ""
+        bits.append(f"T{slot}{' ' + name if name else ''} {level:.2f}"
+                    f" ({_move_pct(pos, level):+.2f}%{_r_of(pos, level)})")
+    return _event_line(raw, pos, bar, f"🎯 <b>TARGET HIT — {pos['side']}</b>", " · ".join(bits))
+
+
+def format_sl_hit(raw: str, pos: dict, bar: datetime, level: float) -> str:
+    """One line when the initial SL is touched (intrabar, evaluated on a closed candle)."""
+    return _event_line(raw, pos, bar, f"🛑 <b>SL HIT — {pos['side']}</b>",
+                       f"SL {level:.2f} ({_move_pct(pos, level):+.2f}%{_r_of(pos, level)})")
+
+
 def format_trail_exit(raw: str, pos: dict, bar: datetime, close: float, ema: float) -> str:
-    side = pos["side"]
-    direction = "below" if side == "BUY" else "above"
-    return (
-        f"🔔 <b>EMA9 TRAIL EXIT — {side}</b>  {raw}\n"
-        f"5m bar {bar.strftime('%Y-%m-%d %H:%M')}–"
-        f"{(bar + timedelta(minutes=5)).strftime('%H:%M')} IST closed {direction} EMA9\n"
-        f"Close {close:.2f}  |  EMA9 {ema:.4f}\n"
-        f"Entry {pos['entry']:.2f}  |  Initial SL {pos['sl']:.2f}\n"
-        f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
-    )
+    """One line when a completed candle closes beyond EMA9."""
+    direction = "below" if pos["side"] == "BUY" else "above"
+    return _event_line(raw, pos, bar, f"🔔 <b>EMA9 EXIT — {pos['side']}</b>",
+                       f"close {close:.2f} {direction} EMA9 {ema:.2f}"
+                       f" ({_move_pct(pos, close):+.2f}%{_r_of(pos, close)})")
 
 
 def _max_lag() -> int:
@@ -88,48 +168,137 @@ def _save(st: dict) -> None:
         state.save(st)
 
 
-def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
-    """Monitor open trades independently of today's market/sector selection.
+def _alert_prefix(raw: str, pos: dict) -> str:
+    """Ledger namespace for one trade: symbol + the candle it was entered on.
 
-    Only the latest completed stock candle may generate an exit. A failed
-    Telegram POST keeps the position open so a same-bar retry can send it.
+    A later trade on the same symbol therefore gets its own alerts, while the same
+    trade can never be announced twice.
+    """
+    return f"{raw}:{pos.get('entry_bar') or pos.get('last_bar')}:"
+
+
+def _alert_key(raw: str, pos: dict, tag: str) -> str:
+    return _alert_prefix(raw, pos) + tag
+
+
+def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
+    """One-line hit alerts for open trades, independent of market/sector state.
+
+    Three events only, each on ONE line, each announced **once per level**:
+
+    * 🎯 TARGET HIT — the pivot target(s) first touched by that candle. Informational:
+      the position stays open and later targets are still watched.
+    * 🛑 SL HIT — the initial stop was touched intrabar. Closes the position.
+    * 🔔 EMA9 EXIT — the candle *closed* beyond EMA9 (the documented trail rule).
+      Closes the position.
+
+    Repeat protection mirrors the entry alert: every send is recorded in
+    ``st["alerts"]`` (written before the next Telegram call) and re-checked before
+    any send, so re-driving the same candle — a retried run, a replayed ledger, a
+    position record rebuilt by hand — cannot produce the same message twice. Target
+    levels are additionally remembered on the position (``hit_targets``) so they
+    stay quiet when a trade carries overnight.
+
+    Every candle since the last check is replayed, so a cycle that missed a bar
+    (slow Yahoo, queued Actions run) still reports what happened, stamped with
+    that candle's time. A failed Telegram POST stops the replay at that candle so
+    the next cycle can retry it without resending what already went out.
     """
     positions = st.setdefault("positions", {})
     if not positions:
         return []
+    ledger = st.setdefault("alerts", {})
     symbols = {raw: data.yahoo_stock(raw) for raw in positions}
     frames = data.fetch_many(symbols.values(), period_5m, "5m")
-    pending = []
+    pending: list[str] = []
     changed = False
+    session = session_date(bar)
     for raw, pos in list(positions.items()):
         df = frames.get(symbols[raw])
         df = df.loc[df.index <= bar] if df is not None and not df.empty else df
         if df is None or df.empty or to_ist(df.index[-1]) != bar:
             pending.append(raw)
-            log.info("trail pending %s: 5m candle %s not published", raw, bar)
+            log.info("hit-check pending %s: 5m candle %s not published", raw, bar)
             continue
-        if pos.get("last_bar", pos["entry_bar"]) >= bar.isoformat():
-            continue  # not another candle; don't exit on the entry bar
-        ema = ema9_on_bar(df, bar)
-        if ema is None:
+        grid = ema9_frame(df)
+        if grid is None or grid.empty:
             pending.append(raw)
             continue
-        close = float(df["Close"].iloc[-1])
-        if trail_broken(pos["side"], close, ema):
-            if not _recent_bar(bar, now_ist()):
-                log.warning("trail exit %s @ %s became stale; no late exit sent", raw, bar)
-                continue
-            if not telegram.send(format_trail_exit(raw, pos, bar, close, ema), dry_run=_dry()):
-                pending.append(raw)
-                log.warning("trail exit %s failed; retain open position for retry", raw)
-                continue
-            del positions[raw]
-            # Block a new entry on the same IST session after an exit.
-            st.setdefault("sent", {}).setdefault(raw, {"code": "EXIT", "time": bar.strftime("%H:%M")})
-            _save(st)
-            log.info("TRAIL EXIT %s %s close=%.2f ema9=%.4f @ %s", raw, pos["side"], close, ema, bar)
-        else:
-            pos["last_bar"] = bar.isoformat()
+        ema_at = dict(zip(grid.index, grid["EMA9"].to_numpy(float)))
+        side = pos["side"]
+        sl = float(pos.get("sl") or 0)
+        targets = [(i, float(pos[f"t{i}"])) for i in (1, 2, 3) if pos.get(f"t{i}") is not None]
+        done = set(pos.get("hit_targets") or ())
+        prefix = _alert_prefix(raw, pos)
+        announced = {k[len(prefix):] for k in ledger if k.startswith(prefix)}
+        stamp = pos.get("last_bar") or pos.get("entry_bar")
+        cursor = pd.Timestamp(stamp) if stamp else None
+        if cursor is not None and cursor.tzinfo is None:
+            cursor = cursor.tz_localize(IST)
+        replay = [ts for ts in grid.index
+                  if (cursor is None or ts > cursor) and session_date(to_ist(ts)) == session]
+        for ts in replay:
+            row = grid.loc[ts]
+            hhmm = to_ist(ts).strftime("%H:%M")
+
+            hit_now = [(slot, lvl) for slot, lvl in targets
+                       if slot not in done and f"T{slot}" not in announced
+                       and (row["High"] >= lvl if side == "BUY" else row["Low"] <= lvl)]
+            if hit_now:
+                if not telegram.send(format_target_hit(raw, pos, to_ist(ts), hit_now),
+                                     dry_run=_dry()):
+                    pending.append(raw)
+                    break
+                for slot, _ in hit_now:
+                    ledger[_alert_key(raw, pos, f"T{slot}")] = hhmm
+                    announced.add(f"T{slot}")
+                done.update(slot for slot, _ in hit_now)
+                pos["hit_targets"] = sorted(done)
+                changed = True
+                _save(st)                       # before the next send: never twice
+                log.info("TARGET HIT %s %s %s @ %s", raw, side,
+                         ",".join(f"T{slot} {lvl}" for slot, lvl in hit_now), ts)
+
+            sl_hit = bool(row["Low"] <= sl) if side == "BUY" else bool(row["High"] >= sl)
+            if sl_hit:
+                if "SL" in announced:           # already delivered: just reconcile
+                    del positions[raw]
+                    changed = True
+                    log.warning("SL for %s already announced; dropping stale position", raw)
+                    break
+                if not telegram.send(format_sl_hit(raw, pos, to_ist(ts), sl), dry_run=_dry()):
+                    pending.append(raw)
+                    break
+                ledger[_alert_key(raw, pos, "SL")] = hhmm
+                del positions[raw]
+                st.setdefault("sent", {}).setdefault(raw, {"code": "SL", "time": hhmm})
+                changed = True
+                _save(st)
+                log.info("SL HIT %s %s sl=%.2f @ %s", raw, side, sl, ts)
+                break
+
+            ema = ema_at.get(ts)
+            close = float(row["Close"])
+            if ema is not None and isfinite(ema) and trail_broken(side, close, float(ema)):
+                if "EXIT" in announced:         # already delivered: just reconcile
+                    del positions[raw]
+                    changed = True
+                    log.warning("EMA9 exit for %s already announced; dropping stale position", raw)
+                    break
+                if not telegram.send(format_trail_exit(raw, pos, to_ist(ts), close, float(ema)),
+                                     dry_run=_dry()):
+                    pending.append(raw)
+                    break
+                ledger[_alert_key(raw, pos, "EXIT")] = hhmm
+                del positions[raw]
+                # Block a new entry on the same IST session after an exit.
+                st.setdefault("sent", {}).setdefault(raw, {"code": "EXIT", "time": hhmm})
+                changed = True
+                _save(st)
+                log.info("EMA9 EXIT %s %s close=%.2f ema9=%.4f @ %s", raw, side, close, ema, ts)
+                break
+
+            pos["last_bar"] = ts.isoformat()
             changed = True
     if changed:
         _save(st)
