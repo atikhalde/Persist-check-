@@ -129,6 +129,15 @@ strictly above). A wick alone does not trigger it. Also closes the position.
 🔔 EMA9 EXIT — BUY  INFY · close 1849.00 below EMA9 1850.20 (+0.35%, +1.5R) · 5m 11:05 · entry 1842.50
 ```
 
+**Never twice.** Each alert has one identity — symbol + the candle the trade was entered
+on + the level — and that identity is written to the state file *after the POST returns
+and before the next one is attempted*. Re-driving the same candle, a retried run, a
+rewound or rebuilt position record, or a trade that carries overnight therefore cannot
+produce the same message twice; a later trade on the same symbol still gets its own
+alerts because its entry candle differs. This is the same once-only mechanism that
+guards entry alerts, and entry alerts are unchanged by it. Deleting the ledger entry by
+hand is the only way to see a repeat.
+
 Every candle since the last check is replayed, so a slow queue or a skipped run still
 reports the hit on the candle where it happened, stamped with *that* candle's time
 rather than the delivery time. A failed Telegram POST stops the replay at that candle

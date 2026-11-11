@@ -38,6 +38,20 @@ resume cursor (last processed candle) was parsed with a string test that is fals
 parsing the stored ISO timestamp with `pd.Timestamp`; `test_entry_bar_never_produces_hit_alerts`
 now fails if the cursor regresses.
 
+## Re-driving the session produces nothing (verified on the same bars)
+
+| pass | state | new alerts |
+|---|---|---|
+| 1 | real session from the 10:25 entry | **2** (T1 10:35, EMA9 exit 12:10) |
+| 2 | same state again, nothing open | 0 |
+| 3 | the original position record re-inserted, cursor rewound to 10:25 | 0 — reconciled silently |
+| 4 | `hit_targets` wiped **and** the EXIT ledger entry deleted by hand | 1 (only the wiped level re-fires) |
+
+Pass 3 is the case that used to be dangerous: a position record whose cursor points back
+at the entry candle is now suppressed by the ledger instead of replaying the whole
+session. Pass 4 is the same exposure the entry alert has — deleting a ledger record by
+hand is the only way to get a repeat.
+
 ## Behaviour notes
 
 - Every candle since the last processed one is replayed, so a slow or skipped Actions

@@ -391,6 +391,93 @@ class LiveAlertTests(TestCase):
         self.assertFalse(any("HIT" in c.args[0] for c in self.send.call_args_list))
         self.assertIn("ABC", state.load()["positions"])
 
+    # --- never twice (same guarantee as the entry alert) ---------------------
+    def test_target_alert_is_not_repeated_when_the_position_record_is_rebuilt(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        pipeline.run_once()
+        st = state.load()
+        self.assertEqual(list(st["alerts"]), ["ABC:2026-11-09T10:00:00+05:30:T1"])
+        # a rebuilt/older position record forwards the cursor and forgets the hit
+        st["positions"]["ABC"].pop("hit_targets", None)
+        st["positions"]["ABC"]["last_bar"] = st["positions"]["ABC"]["entry_bar"]
+        state.save(st)
+        pipeline.run_once()
+        pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertIn("ABC", state.load()["positions"])
+
+    def test_sl_alert_is_not_repeated_when_the_position_is_reinserted(self):
+        self._trade()
+        before = state.load()["positions"]["ABC"]
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Low"] = 99.90
+        self._frames(trailing)
+        pipeline.run_once()
+        self.assertEqual(sum("SL HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        st = state.load()
+        st["positions"]["ABC"] = dict(before)          # stale record reappears
+        state.save(st)
+        pipeline.run_once()
+        self.assertEqual(sum("SL HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_ema9_exit_is_not_repeated_when_the_position_is_reinserted(self):
+        self._trade()
+        before = state.load()["positions"]["ABC"]
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "Close"] = 99.0
+        self._frames(trailing)
+        pipeline.run_once()
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        st = state.load()
+        st["positions"]["ABC"] = dict(before)
+        state.save(st)
+        pipeline.run_once()
+        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_the_same_level_is_never_announced_twice_across_many_cycles(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        for _ in range(5):
+            pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertEqual(len(state.load()["alerts"]), 1)
+
+    def test_a_new_trade_on_the_same_symbol_gets_its_own_alerts(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        pipeline.run_once()
+        st = state.load()
+        # a fresh trade (different entry candle) must not inherit the old dedupe
+        st["positions"]["ABC"].update(entry_bar="2026-11-09T09:55:00+05:30",
+                                      last_bar="2026-11-09T10:00:00+05:30",
+                                      hit_targets=[])
+        state.save(st)
+        self.now = BAR + timedelta(minutes=11)
+        pipeline.run_once()
+        self.assertEqual(sum("TARGET HIT" in c.args[0] for c in self.send.call_args_list), 2)
+
+    def test_entry_alert_is_still_sent_exactly_once_per_session(self):
+        self._trade()
+        trailing = quiet_bars(*self.times)
+        trailing.loc[self.times[-1], "High"] = 101.0
+        self._frames(trailing)
+        for _ in range(3):
+            pipeline.run_once()
+        entries = [c.args[0] for c in self.send.call_args_list
+                   if "TARGET HIT" not in c.args[0] and "SL HIT" not in c.args[0]
+                   and "EMA9 EXIT" not in c.args[0] and c.args[0] != "market"]
+        self.assertEqual(len(entries), 1)               # the untouched entry alert
+        self.assertEqual(state.load()["sent"]["ABC"]["code"], 101)
+
     def test_new_ist_session_resets_dedupe(self):
         previous = state.reset_if_new_day({}, "2026-11-06")
         previous["sent"]["ABC"] = {"code": 101}
