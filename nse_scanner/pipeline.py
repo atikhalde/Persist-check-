@@ -40,19 +40,54 @@ def format_market(md) -> str:
     )
 
 
+# A pivot further than this many R is not a 5m day-trade target; it is shown
+# (never hidden) with a warning marker so it cannot be mistaken for T1.
+FAR_TARGET_R = 4.0
+
+
+def _r_multiple(plan: TradePlan, value: float | None) -> float | None:
+    if value is None or not plan.risk:
+        return None
+    return abs(value - plan.entry) / plan.risk
+
+
+def _target_text(plan: TradePlan) -> str:
+    parts = []
+    for i, (name, value) in enumerate(zip(plan.pivot_names, (plan.t1, plan.t2, plan.t3)), 1):
+        if value is None:
+            parts.append(f"T{i} N/A")
+            continue
+        r = _r_multiple(plan, value)
+        dist = f" ({r:.1f}R{' ⚠' if r is not None and r > FAR_TARGET_R else ''})" if r else ""
+        parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f}{dist}")
+    return " · ".join(parts)
+
+
+def _basis_text(plan: TradePlan) -> str:
+    """Disclose the session the pivots were built from, so they can be audited."""
+    b = plan.basis
+    if b is None:
+        return "Pivot basis N/A (no completed previous session)\n"
+    line = (f"Pivot basis {b.day:%d %b}  H {b.high:.2f}  L {b.low:.2f}  C {b.close:.2f}"
+            f"  range {b.range_pct:.2f}%")
+    mult = b.range_multiple
+    if b.wide and mult:
+        line += f" ⚠ {mult:.1f}× median — wide basis day, distant levels are reference only"
+    return line + "\n"
+
+
 def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     below = "below" if sig.side == "BUY" else "above"
-    targets = " · ".join(
-        f"T{i} {name + ' ' if name else ''}{value:.2f}" if value is not None else f"T{i} N/A"
-        for i, (name, value) in enumerate(zip(plan.pivot_names, (plan.t1, plan.t2, plan.t3)), 1))
+    targets = _target_text(plan)
     return (
         f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
         f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
+        f"{_basis_text(plan)}"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
         f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"

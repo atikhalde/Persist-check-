@@ -406,19 +406,18 @@ def run_market(
     vwap = float(last_row["VWAP"])
     npos = _pos_in_range(n_close, n_high, n_low)
     dir_conf = _dir_conf(mtf_bull, mtf_bear, above_vwap, below_vwap, adx, npos, dir_state, last_or_up, last_or_dn, last_slope)
-    strong_bull = dir_state == 1 and mtf_bull == 3 and above_vwap >= 4 and adx >= STRONG_ADX_MIN and npos >= 60
-    strong_bear = dir_state == -1 and mtf_bear == 3 and below_vwap >= 4 and adx >= STRONG_ADX_MIN and npos <= 40
-    dir_label = (
-        "STRONG BULL" if strong_bull else
-        "BULL" if dir_state == 1 else
-        "STRONG BEAR" if strong_bear else
-        "BEAR" if dir_state == -1 else
-        "NEUTRAL"
-    )
     dir_tier = "TREND-LOCK" if dir_conf >= 85 else "STRONG" if dir_conf >= 70 else "BUILDING" if dir_conf >= 55 else "WEAK"
 
     # Prefer concrete if committed
     commit_side = concrete if concrete != 0 else dir_state
+
+    # The label must describe the side the picker and the order action actually
+    # use (commit_side), not the raw dir_state. A concrete lock can survive a
+    # dir_state reset, and labelling that "NEUTRAL" produced alerts that read
+    # "Market NEUTRAL (88%)" on a BUY — a market the locked rule says to skip.
+    strong_bull = commit_side == 1 and mtf_bull == 3 and above_vwap >= 4 and adx >= STRONG_ADX_MIN and npos >= 60
+    strong_bear = commit_side == -1 and mtf_bear == 3 and below_vwap >= 4 and adx >= STRONG_ADX_MIN and npos <= 40
+    dir_label = _direction_label(commit_side, strong_bull, strong_bear)
 
     snaps: dict[str, SectorSnap] = {}
     for name in SECTOR_ORDER:
@@ -467,7 +466,7 @@ def run_market(
         adx=round(adx, 1),
         mtf_bull=mtf_bull,
         dir_state=int(commit_side),
-        dir_label=dir_label if commit_side != 0 else "NEUTRAL",
+        dir_label=dir_label,
         dir_conf=int(dir_conf),
         dir_tier=dir_tier,
         breadth_adv=breadth_adv,
@@ -485,6 +484,19 @@ def run_market(
         action=action,
         sectors={k: vars(v) for k, v in snaps.items()},
     )
+
+
+def _direction_label(side: int, strong_bull: bool = False, strong_bear: bool = False) -> str:
+    """Label for the side the engine actually trades.
+
+    ``side`` is the commit side, so it is never NEUTRAL while a sector is being
+    picked: NEUTRAL must mean "no pick, WAIT" everywhere in the alert.
+    """
+    if side > 0:
+        return "STRONG BULL" if strong_bull else "BULL"
+    if side < 0:
+        return "STRONG BEAR" if strong_bear else "BEAR"
+    return "NEUTRAL"
 
 
 def _dir_conf(mtf_bull, mtf_bear, above, below, adx, npos, dir_state, or_up, or_dn, slope) -> int:

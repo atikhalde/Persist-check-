@@ -1,5 +1,5 @@
 """Regression tests for late/repeated Telegram entries (no network access)."""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import TestCase
@@ -12,7 +12,7 @@ import pandas as pd
 from nse_scanner import pipeline, state
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
-from nse_scanner.trade import TradePlan
+from nse_scanner.trade import PivotBasis, TradePlan
 
 ORIGINAL_FORMAT_STOCK = pipeline.format_stock
 
@@ -82,7 +82,8 @@ class LiveAlertTests(TestCase):
         self.assertIn("<b>BUY</b> | <b>BUY-EX</b>", text)
         self.assertNotIn("Targets are reference levels", text)
         self.assertNotIn("Trail through pivot targets", text)
-        self.assertIn("next pivot target: T1 R1 100.02 · T2 R2 100.04 · T3 R3 100.06", text)
+        self.assertIn("next pivot target: T1 R1 100.02 (1.0R) · T2 R2 100.04 (2.0R) · T3 R3 100.06 (3.0R)", text)
+        self.assertIn("Pivot basis N/A (no completed previous session)", text)
         self.assertIn("5m bar 10:00–10:05 IST", text)
         self.assertIn("Signal calculated 10:06:00 IST", text)
 
@@ -369,3 +370,26 @@ class LiveAlertTests(TestCase):
             self.assertEqual(pipeline.run_until_ready(expected_bar=BAR)["market"], "STALE")
         once.assert_called_once_with(force_sector=None)
         sleep.assert_not_called()
+
+    def test_far_target_and_wide_basis_are_disclosed_not_silently_shipped(self):
+        # 11 Nov 2026 PNB: entry 135.73, risk 0.79, pivots from 09 Nov
+        # (H 132.48 / L 125.92 / C 132.17 -> R2 136.75, R3 141.02).
+        basis = PivotBasis(date(2026, 11, 9), 132.48, 125.92, 132.17, "1d", 4.9633, 1.70)
+        plan = TradePlan(135.73, 134.9670, 134.94, 0.79, 136.75, 141.02, None,
+                         ("R2", "R3", None), basis)
+        text = ORIGINAL_FORMAT_STOCK(signal(time="10:25", code=17), self.md, plan)
+        self.assertIn("T1 R2 136.75 (1.3R)", text)
+        self.assertIn("T2 R3 141.02 (6.7R ⚠)", text)      # 6.7R is not a day-trade target
+        self.assertIn("T3 N/A", text)
+        self.assertIn("Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%", text)
+        self.assertIn("2.9× median", text)
+        self.assertIn("wide basis day", text)
+
+    def test_normal_basis_shows_levels_without_the_wide_warning(self):
+        basis = PivotBasis(date(2026, 11, 9), 135.40, 133.10, 135.10, "1d", 1.70, 1.65)
+        plan = TradePlan(135.73, 134.9670, 134.94, 0.79, 135.95, 136.80, 138.20,
+                         ("R1", "R2", "R3"), basis)
+        text = ORIGINAL_FORMAT_STOCK(signal(time="10:25", code=17), self.md, plan)
+        self.assertNotIn("wide basis day", text)
+        self.assertNotIn("⚠", text)
+        self.assertIn("Pivot basis 09 Nov", text)

@@ -39,17 +39,67 @@ Action: SCAN LONG
 **Stock entry** (only same side as the pick)
 
 ```
-🟢 BUY | BUY-EX  INFY
-Sector IT  |  Market BULL (74%)
-Entry (candle close) 1842.50
-SL 1838.28 (0.02% below EMA9)
-Risk 4.22  |  next pivot target: T1 R1 1845.00 · T2 R2 1855.00 · T3 R3 1865.00
-Score 68 Strong   base 20/21  cond22=0  score=68
+🟢 BUY | BUY-EX17  PNB
+Sector PSUBK  |  Market BULL (88%)
+Entry (candle close) 135.73
+SL 134.94 (0.02% below EMA9)
+Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R) · T2 R3 141.02 (6.7R ⚠) · T3 N/A
+Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%
+Score 82 Extreme Strong   base 21/21 cond22=0  score=82
 5m bar 10:25–10:30 IST (signal confirmed at close)
-Signal calculated 10:31:12 IST
+Signal calculated 10:31:34 IST
 ```
 
-Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, targets are the next three classic daily pivot levels strictly above entry for BUY or below entry for SELL (nearest first), using the previous trading session’s high/low/close. The levels are S3, S2, S1, PP, R1, R2, R3, where PP = (H + L + C) / 3; R1 = 2PP − L, S1 = 2PP − H; R2/S2 = PP ± (H − L); R3 = H + 2(PP − L), S3 = L − 2(H − PP). Current/future daily candles are excluded. Missing or exhausted levels show N/A rather than invented risk-multiple targets, without suppressing entry or EMA9 trailing; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
+Each target carries its distance in **R** (multiples of that trade's risk). A level
+past `FAR_TARGET_R` (4R by default, `pipeline.FAR_TARGET_R`) keeps its price but
+gets a `⚠` marker so a far pivot can never be read as a peer of T1. Levels are
+never hidden or re-invented. The `Pivot basis` line names the session the levels
+were built from, so every number in the alert can be re-derived by hand.
+
+Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, targets are the next three classic daily pivot levels strictly above entry for BUY or below entry for SELL (nearest first), using the previous trading session’s high/low/close. The levels are S3, S2, S1, PP, R1, R2, R3, where PP = (H + L + C) / 3; R1 = 2PP − L, S1 = 2PP − H; R2/S2 = PP ± (H − L); R3 = H + 2(PP − L), S3 = L − 2(H − PP). Current/future daily candles are excluded.
+
+### Why a pivot target can look wrong (verified case: PNB, 11 Nov 2026)
+
+The levels above are real. NSE was shut on **Tue 10 Nov 2026** (Diwali-Balipratipada),
+so the previous session was **Mon 09 Nov 2026**: H 132.48, L 125.92, C 132.17.
+
+| | value | |
+|---|---|---|
+| PP = (H+L+C)/3 | 130.19 | |
+| R1 = 2PP − L | 134.46 | already passed by the 135.73 entry |
+| R2 = PP + (H−L) | **136.75** | first level above entry → T1 |
+| R3 = H + 2(PP−L) | **141.02** | → T2, 6.7R away |
+
+`R3 − R2 = PP − L = 4.27`, so the 4.27-point jump between T1 and T2 is the
+formula, not a rounding slip: 09 Nov had a **4.96% range** (a 125.95→132.48
+reversal day), and `R3` grows with that range while `R2` does not. Outcome that
+day: R2 (136.75) was tagged within ~10 minutes of the 10:31 alert, the session
+high was **₹139.00** (+5.1%, NSE via Upstox), and R3 at 141.02 stayed 1.5% above
+that high all session — a real level, but never a reachable 5m target. That is
+why a far level is labelled as far instead of being shown as a plain "T2".
+
+So the scanner does **not** silently trust one session:
+
+* **Basis disclosure** — every entry alert prints the previous session's date,
+  H/L/C and range, so the levels are auditable in the message itself.
+* **Wide-basis flag** — the basis range is compared with the median range of the
+  last 20 completed sessions (`PIVOT_RANGE_LOOKBACK`). Above 2.5×
+  (`PIVOT_RANGE_OUTLIER`) the alert says so; a wider basis day mechanically
+  stretches R3/S3.
+* **Stale-basis refusal** — if the newest completed session is more than
+  `MAX_BASIS_GAP_DAYS` (7) calendar days before the signal, no pivots are
+  published (`N/A`) instead of building levels from an old day.
+* **Feed reconciliation** — 5m-aggregated and daily OHLC for the basis day are
+  compared; a >0.5% disagreement (split, bad print, stale feed) is logged and the
+  daily bar wins.
+* **Single-row safety** — a 5m frame holding only the signal candle no longer
+  breaks grouping (pandas 3 turned a one-element key list into a 1-tuple, which
+  raised `TypeError` inside the trade plan).
+
+Known conventions differ on `R3/S3`: `PP + 2(H − L)` gives 143.31 for the PNB
+example and Fibonacci pivots give 140.80. This repo stays on the TradingView
+"Traditional" formula above; if your chart shows another number, check its
+pivot method before assuming the alert is wrong. Missing or exhausted levels show N/A rather than invented risk-multiple targets, without suppressing entry or EMA9 trailing; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
 
 Trail continues through pivot targets, including beyond T3, until the EMA9 close-confirmed exit. The targets are **reference levels**, not auto-sell orders: the scanner continues monitoring the symbol, even when the sector switches or the market returns WAIT, and sends one separate **EMA9 TRAIL EXIT** Telegram alert on the first *completed* BUY candle closing strictly **below** EMA9 (SELL strictly **above**). A wick alone does not trigger a trail exit. The initial SL is a reference, **not an automatically executed broker stop**; neither SL nor targets are executed by this bot. Positions carry into later sessions if the state cache survives; a missing Yahoo bar or expired freshness window can cause a missed exit alert. For actual stop execution use broker-side orders.
 
@@ -73,6 +123,10 @@ One stock entry per symbol per IST session. Later rank upgrades or re-discovered
 | BULL / STRONG BULL | strongest **PERSIST +** that still has RS ≥ 0 and is not a qualified short | that sector, **BUY** entries only |
 | BEAR / STRONG BEAR | strongest **PERSIST −** that still has RS ≤ 0 and is not a qualified long | that sector, **SELL** entries only |
 | NEUTRAL / CHOP / conf < 55 / VIX spike against the day | **WAIT** | none |
+
+The label describes the side the engine actually trades (`commit_side`, the concrete
+lock when one exists), so an alert can no longer read *"Market NEUTRAL"* on a BUY.
+`NEUTRAL` now always means no pick and no scan.
 
 No pair-trades. No “rel-long the strongest bull while index is bear”.
 
