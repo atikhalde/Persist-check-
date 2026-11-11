@@ -40,15 +40,18 @@ def format_market(md) -> str:
     )
 
 
-# A pivot further than this many R is not a 5m day-trade target; it is shown
-# (never hidden) with a warning marker so it cannot be mistaken for T1.
+# A pivot further than this many R — or this % of price — is not a 5m day-trade
+# target. It is shown (never hidden) with a warning marker so it cannot be
+# mistaken for T1. Both tests are needed: R alone is unstable because it depends
+# on where the stop sits, while % of price is stop-independent.
 FAR_TARGET_R = 4.0
+FAR_TARGET_PCT = 2.0
 
 
-def _r_multiple(plan: TradePlan, value: float | None) -> float | None:
-    if value is None or not plan.risk:
-        return None
-    return abs(value - plan.entry) / plan.risk
+def _distance(plan: TradePlan, value: float) -> tuple[float | None, float]:
+    delta = value - plan.entry
+    r = abs(delta) / plan.risk if plan.risk else None
+    return r, delta / plan.entry * 100.0
 
 
 def _target_text(plan: TradePlan) -> str:
@@ -57,9 +60,10 @@ def _target_text(plan: TradePlan) -> str:
         if value is None:
             parts.append(f"T{i} N/A")
             continue
-        r = _r_multiple(plan, value)
-        dist = f" ({r:.1f}R{' ⚠' if r is not None and r > FAR_TARGET_R else ''})" if r else ""
-        parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f}{dist}")
+        r, pct = _distance(plan, value)
+        bits = ([f"{r:.1f}R"] if r is not None else []) + [f"{pct:+.2f}%"]
+        far = (r is not None and r > FAR_TARGET_R) or abs(pct) > FAR_TARGET_PCT
+        parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f} ({', '.join(bits)}{' ⚠' if far else ''})")
     return " · ".join(parts)
 
 
@@ -71,8 +75,14 @@ def _basis_text(plan: TradePlan) -> str:
     line = (f"Pivot basis {b.day:%d %b}  H {b.high:.2f}  L {b.low:.2f}  C {b.close:.2f}"
             f"  range {b.range_pct:.2f}%")
     mult = b.range_multiple
-    if b.wide and mult:
-        line += f" ⚠ {mult:.1f}× median — wide basis day, distant levels are reference only"
+    if mult:
+        line += f" ({mult:.1f}× median)"
+    if b.special:
+        line += " ⚠ special session"
+    if b.wide:
+        line += " ⚠ wide basis — distant levels are reference only"
+    elif b.compressed:
+        line += " ⚠ compressed basis — levels inside a few ticks"
     return line + "\n"
 
 

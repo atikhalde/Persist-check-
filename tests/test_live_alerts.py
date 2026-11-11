@@ -82,7 +82,8 @@ class LiveAlertTests(TestCase):
         self.assertIn("<b>BUY</b> | <b>BUY-EX</b>", text)
         self.assertNotIn("Targets are reference levels", text)
         self.assertNotIn("Trail through pivot targets", text)
-        self.assertIn("next pivot target: T1 R1 100.02 (1.0R) · T2 R2 100.04 (2.0R) · T3 R3 100.06 (3.0R)", text)
+        self.assertIn("next pivot target: T1 R1 100.02 (1.0R, +0.02%) · T2 R2 100.04 (2.0R, +0.04%) · "
+                      "T3 R3 100.06 (3.0R, +0.06%)", text)
         self.assertIn("Pivot basis N/A (no completed previous session)", text)
         self.assertIn("5m bar 10:00–10:05 IST", text)
         self.assertIn("Signal calculated 10:06:00 IST", text)
@@ -378,12 +379,12 @@ class LiveAlertTests(TestCase):
         plan = TradePlan(135.73, 134.9670, 134.94, 0.79, 136.75, 141.02, None,
                          ("R2", "R3", None), basis)
         text = ORIGINAL_FORMAT_STOCK(signal(time="10:25", code=17), self.md, plan)
-        self.assertIn("T1 R2 136.75 (1.3R)", text)
-        self.assertIn("T2 R3 141.02 (6.7R ⚠)", text)      # 6.7R is not a day-trade target
+        self.assertIn("T1 R2 136.75 (1.3R, +0.75%)", text)
+        self.assertIn("T2 R3 141.02 (6.7R, +3.90% ⚠)", text)   # 6.7R / 3.9% is not a 5m target
         self.assertIn("T3 N/A", text)
         self.assertIn("Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%", text)
         self.assertIn("2.9× median", text)
-        self.assertIn("wide basis day", text)
+        self.assertIn("wide basis", text)
 
     def test_normal_basis_shows_levels_without_the_wide_warning(self):
         basis = PivotBasis(date(2026, 11, 9), 135.40, 133.10, 135.10, "1d", 1.70, 1.65)

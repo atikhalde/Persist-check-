@@ -93,8 +93,8 @@ The fixed alert for the same signal:
 Sector PSUBK  |  Market BULL (88%)
 Entry (candle close) 135.73
 SL 134.94 (0.02% below EMA9)
-Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R) · T2 R3 141.02 (6.7R ⚠) · T3 N/A
-Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%
+Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R, +0.75%) · T2 R3 141.02 (6.7R, +3.90% ⚠) · T3 N/A
+Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96% (2.2× median)
 Score 82 Extreme Strong   base 21/21 cond22=0  score=82
 ```
 

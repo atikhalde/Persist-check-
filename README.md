@@ -43,17 +43,18 @@ Action: SCAN LONG
 Sector PSUBK  |  Market BULL (88%)
 Entry (candle close) 135.73
 SL 134.94 (0.02% below EMA9)
-Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R) · T2 R3 141.02 (6.7R ⚠) · T3 N/A
-Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96%
+Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R, +0.75%) · T2 R3 141.02 (6.7R, +3.90% ⚠) · T3 N/A
+Pivot basis 09 Nov  H 132.48  L 125.92  C 132.17  range 4.96% (2.2× median)
 Score 82 Extreme Strong   base 21/21 cond22=0  score=82
 5m bar 10:25–10:30 IST (signal confirmed at close)
 Signal calculated 10:31:34 IST
 ```
 
-Each target carries its distance in **R** (multiples of that trade's risk). A level
-past `FAR_TARGET_R` (4R by default, `pipeline.FAR_TARGET_R`) keeps its price but
-gets a `⚠` marker so a far pivot can never be read as a peer of T1. Levels are
-never hidden or re-invented. The `Pivot basis` line names the session the levels
+Each target carries its distance in **R** (multiples of that trade's risk) *and*
+in **% of price**. R alone is unstable — it moves whenever the stop moves — so a
+level gets a `⚠` marker when it is past `FAR_TARGET_R` (4R) **or** past
+`FAR_TARGET_PCT` (2.0 % of price). The price is always kept: levels are never
+hidden or re-invented. The `Pivot basis` line names the session the levels
 were built from, so every number in the alert can be re-derived by hand.
 
 Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, targets are the next three classic daily pivot levels strictly above entry for BUY or below entry for SELL (nearest first), using the previous trading session’s high/low/close. The levels are S3, S2, S1, PP, R1, R2, R3, where PP = (H + L + C) / 3; R1 = 2PP − L, S1 = 2PP − H; R2/S2 = PP ± (H − L); R3 = H + 2(PP − L), S3 = L − 2(H − PP). Current/future daily candles are excluded.
@@ -82,10 +83,12 @@ So the scanner does **not** silently trust one session:
 
 * **Basis disclosure** — every entry alert prints the previous session's date,
   H/L/C and range, so the levels are auditable in the message itself.
-* **Wide-basis flag** — the basis range is compared with the median range of the
-  last 20 completed sessions (`PIVOT_RANGE_LOOKBACK`). Above 2.5×
-  (`PIVOT_RANGE_OUTLIER`) the alert says so; a wider basis day mechanically
-  stretches R3/S3.
+* **Basis quality** — the basis range is compared with the median range of the
+  last 20 completed sessions (`PIVOT_RANGE_LOOKBACK`) and the multiple is printed
+  on every alert. Above 2.5× (`PIVOT_RANGE_OUTLIER`) the alert adds a wide-basis
+  warning; below 0.4× (`PIVOT_RANGE_COMPRESSED`) it warns that the levels are
+  compressed; a Sat/Sun basis (Muhurat session) is called out as a special
+  session. A wider basis day mechanically stretches R3/S3.
 * **Stale-basis refusal** — if the newest completed session is more than
   `MAX_BASIS_GAP_DAYS` (7) calendar days before the signal, no pivots are
   published (`N/A`) instead of building levels from an old day.

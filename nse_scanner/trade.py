@@ -41,6 +41,7 @@ BUFFER = Decimal("0.0002")  # 0.02%, not 2%
 PIVOT_RANGE_LOOKBACK = 20   # completed sessions used for the robust range
 PIVOT_RANGE_OUTLIER = 2.5   # basis range > this x median -> "wide basis day"
 PIVOT_MIN_SAMPLES = 5       # below this the median is not trusted (no verdict)
+PIVOT_RANGE_COMPRESSED = 0.4  # basis range < this x median -> special/half session
 MAX_BASIS_GAP_DAYS = 7      # stale feed: longest NSE holiday run is well under
 FEED_TOLERANCE = 0.005      # 0.5% max 5m-vs-daily disagreement on H/L/C
 
@@ -64,6 +65,17 @@ class PivotBasis:
         if not self.median_range_pct:
             return None
         return self.range_pct / self.median_range_pct
+
+    @property
+    def special(self) -> bool:
+        """Sat/Sun basis = Muhurat / special session, which compresses the range."""
+        return self.day.weekday() >= 5
+
+    @property
+    def compressed(self) -> bool:
+        """A crushed basis day pulls every level into a few ticks."""
+        mult = self.range_multiple
+        return mult is not None and mult < PIVOT_RANGE_COMPRESSED
 
     @property
     def wide(self) -> bool:
@@ -184,6 +196,10 @@ def pivot_basis(df5: pd.DataFrame, bar, df1: pd.DataFrame | None = None) -> Pivo
                        median_range_pct=_median_range_pct(sessions, newest))
     if basis.wide:
         log.warning("pivot basis %s range %.2f%% is %.1fx the %.2f%% median — extended levels will be far",
+                    basis.day, basis.range_pct, basis.range_multiple or 0.0,
+                    basis.median_range_pct or 0.0)
+    if basis.compressed:
+        log.warning("pivot basis %s range %.2f%% is only %.1fx the %.2f%% median — compressed levels",
                     basis.day, basis.range_pct, basis.range_multiple or 0.0,
                     basis.median_range_pct or 0.0)
     return basis

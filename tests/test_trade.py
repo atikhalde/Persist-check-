@@ -7,7 +7,8 @@ import pandas as pd
 
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
-from nse_scanner.trade import (build_plan, ema9_on_bar, pivot_basis, pivot_targets,
+from nse_scanner.trade import (PivotBasis, build_plan, ema9_on_bar, pivot_basis,
+                             pivot_targets,
                              trail_broken)
 
 
@@ -193,3 +194,14 @@ class PivotBasisTests(TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.basis.day, PNB_DAY)
         self.assertEqual((plan.t1, plan.t2, plan.t3), (136.75, 141.02, None))
+
+    def test_basis_quality_flags_special_and_compressed_sessions(self):
+        # Sun 08 Nov 2026 was a ~1h Muhurat session: a legitimate but crushed basis.
+        special = PivotBasis(date(2026, 11, 8), 133.10, 132.60, 132.85, "5m", 0.38, 2.26)
+        self.assertTrue(special.special)
+        self.assertTrue(special.compressed)
+        self.assertFalse(special.wide)
+        normal = PivotBasis(date(2026, 11, 9), 132.48, 125.92, 132.17, "1d", 4.9633, 2.26)
+        self.assertFalse(normal.special)
+        self.assertFalse(normal.compressed)
+        self.assertFalse(normal.wide)       # 2.19x — under the 2.5x outlier gate
