@@ -113,6 +113,14 @@ def ema9_on_bar(df5: pd.DataFrame, bar) -> float | None:
     return value if isfinite(value) and value > 0 else None
 
 
+def ema9_frame(df5: pd.DataFrame) -> pd.DataFrame | None:
+    """Filled 5m grid with an EMA9 column (causal: matches ema9_on_bar bar by bar)."""
+    x = fill_nse_grid(df5)
+    if x is None or x.empty:
+        return None
+    return x.assign(EMA9=ta.ema(x["Close"].to_numpy(float), 9))
+
+
 def _same_ohlc(a: tuple[float, float, float], b: tuple[float, float, float]) -> bool:
     if not all(isfinite(v) for v in a + b):
         return False

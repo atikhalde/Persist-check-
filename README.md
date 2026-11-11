@@ -104,16 +104,42 @@ example and Fibonacci pivots give 140.80. This repo stays on the TradingView
 "Traditional" formula above; if your chart shows another number, check its
 pivot method before assuming the alert is wrong. Missing or exhausted levels show N/A rather than invented risk-multiple targets, without suppressing entry or EMA9 trailing; verify your symbol's exchange/broker tick size before placing an order. An entry with no EMA9 or with a stop on the wrong side of its entry is **skipped** instead of advertising invalid risk. SELL stop/targets and EMA9 exit are the mirror image of BUY.
 
-Trail continues through pivot targets, including beyond T3, until the EMA9 close-confirmed exit. The targets are **reference levels**, not auto-sell orders: the scanner continues monitoring the symbol, even when the sector switches or the market returns WAIT, and sends one separate **EMA9 TRAIL EXIT** Telegram alert on the first *completed* BUY candle closing strictly **below** EMA9 (SELL strictly **above**). A wick alone does not trigger a trail exit. The initial SL is a reference, **not an automatically executed broker stop**; neither SL nor targets are executed by this bot. Positions carry into later sessions if the state cache survives; a missing Yahoo bar or expired freshness window can cause a missed exit alert. For actual stop execution use broker-side orders.
+Every open trade is watched on each completed 5m candle, and **every level that is
+actually touched produces exactly one one-line alert**. Three events, nothing else:
 
-**Trailing exit** (only after a qualifying 5m candle closes)
+**Target hit** — the first candle that trades through a pivot target. Informational
+only: the position stays open, the trail keeps running, and each of `T1/T2/T3` fires at
+most once (candles that blow through several levels report them on one line).
 
 ```
-🔔 EMA9 TRAIL EXIT — BUY  INFY
-5m bar 2026-11-09 11:00–11:05 IST closed below EMA9
-Close 1849.00  |  EMA9 1850.2000
-Entry 1842.50  |  Initial SL 1838.28
+🎯 TARGET HIT — BUY  INFY · T1 R1 1850.20 (+0.42%, +1.8R) · 5m 11:05 · entry 1842.50
 ```
+
+**Initial stop hit** — the first candle whose low (BUY) reaches the initial SL. This
+closes the position in the ledger and blocks a fresh entry on that symbol for the day.
+
+```
+🛑 SL HIT — BUY  INFY · SL 1838.28 (-0.23%, -1.0R) · 5m 11:20 · entry 1842.50
+```
+
+**EMA9 trail exit** — the first *completed* candle closing strictly below EMA9 (SELL
+strictly above). A wick alone does not trigger it. Also closes the position.
+
+```
+🔔 EMA9 EXIT — BUY  INFY · close 1849.00 below EMA9 1850.20 (+0.35%, +1.5R) · 5m 11:05 · entry 1842.50
+```
+
+Every candle since the last check is replayed, so a slow queue or a skipped run still
+reports the hit on the candle where it happened, stamped with *that* candle's time
+rather than the delivery time. A failed Telegram POST stops the replay at that candle
+so the next cycle retries it without resending what already went out.
+
+The targets are **reference levels**, not auto-sell orders: passing them never exits by
+itself, and the scanner keeps monitoring the symbol even when the sector switches or the
+market returns WAIT. Neither the SL nor the targets are **executed** by this bot — the
+alerts tell you what happened; use broker-side orders for actual stop execution. Positions
+carry into later sessions if the state cache survives; a missing Yahoo bar or an expired
+freshness window can delay an alert until the next cycle sees the candle.
 
 One stock entry per symbol per IST session. Later rank upgrades or re-discovered table rows are **not** pushed again. The message labels the 5m candle **open and close** and the calculation time separately; a 10:25 candle cannot be confirmed before its 10:30 close. Telegram's receipt time is the delivery time.
 
