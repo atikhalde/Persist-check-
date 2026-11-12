@@ -241,11 +241,13 @@ def run_early(bar: datetime) -> list[dict]:
     want = "BUY" if side == 1 else "SELL"
     hhmm = bar.strftime("%H:%M")
     out: list[dict] = []
+    live = 0
     for raw, ysym in tickers.items():
         m1 = sm1.get(ysym)
         df5 = data.provisional_5m(sm5.get(ysym), m1, bar, now_ist(), _early_max_stale())
         if df5 is None:
             continue
+        live += 1
         df5 = data.apply_1m_volume(df5, m1)
         try:
             fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
@@ -273,6 +275,10 @@ def run_early(bar: datetime) -> list[dict]:
         log.info("EARLY %s %s price=%.2f sl=%.2f @ %s (sent %s IST, %.0fs before close)",
                  best.name, raw, plan.entry, plan.sl, hhmm, stamp.strftime("%H:%M:%S"),
                  (close - stamp).total_seconds())
+    # If "live 1m data" stays at 0 the Yahoo feed is too delayed for early alerts.
+    log.info("early %s %s %s: %d names, %d with live 1m data, %d alert(s), done %.0fs before close",
+             hhmm, scan["sector"], want, len(names), live, len(out),
+             (close - now_ist()).total_seconds())
     return out
 
 
@@ -324,6 +330,15 @@ def format_trail_exit(raw: str, pos: dict, bar: datetime, close: float, ema: flo
 def _max_lag() -> int:
     """Maximum acceptable delay after a five-minute candle CLOSE."""
     return int(os.environ.get("MAX_ALERT_LAG_SECONDS", "180"))
+
+
+def _settle_seconds() -> float:
+    """After this long past the close a published 5m candle is taken as final."""
+    return float(os.environ.get("BAR_SETTLE_SECONDS", "45"))
+
+
+def _has_print_since(df1m: pd.DataFrame | None, moment: datetime) -> bool:
+    return df1m is not None and not df1m.empty and df1m.index[-1] >= pd.Timestamp(moment)
 
 
 def _recent_bar(bar: datetime, now: datetime) -> bool:
@@ -643,6 +658,23 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _save(st)
         return result
     sm1 = data.fetch_many(current, "7d", "1m")
+    # A 5m row exists while its candle is still forming, so "the row is there"
+    # does not prove Yahoo has the candle's last trades. Right after the close,
+    # accept a stock only once its feed shows a print at/after the close; after
+    # BAR_SETTLE_SECONDS the candle is taken as final (the pre-loop behaviour).
+    close_at = last + timedelta(minutes=5)
+    if not allow_stale and (now_ist() - close_at).total_seconds() < _settle_seconds():
+        unsettled = [raw for raw, sym in zip(stocks, tickers)
+                     if sym in current and raw not in sent and raw not in positions
+                     and not _has_print_since(sm1.get(sym), close_at)]
+        if unsettled:
+            log.info("waiting for %d stock feed(s) to pass the %s close: %s", len(unsettled),
+                     close_at.strftime("%H:%M"), ", ".join(unsettled))
+            waiting = {data.yahoo_stock(raw) for raw in unsettled}
+            current = [sym for sym in current if sym not in waiting]
+            missing = missing + unsettled
+            result.setdefault("pending", []).extend(
+                raw for raw in unsettled if raw not in result.get("pending", []))
     sd1 = data.fetch_daily(current, period_1d)
 
     want_buy = md.pick_side == 1
@@ -752,7 +784,7 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
 def _retry_delay(close_time: datetime, remaining: float) -> float:
     """Poll fast right after the close (where it buys entry time), then back off."""
     since = (now_ist() - close_time).total_seconds()
-    return max(0.0, min(5 if since < 45 else 15, remaining))
+    return max(0.0, min(5 if since < 30 else 15, remaining))
 
 
 def _run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:
@@ -850,13 +882,14 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
     log.info("live loop IST: early pass %ss before each 5m close%s, confirm %ss after",
              lead, "" if lead else " (disabled)", grace)
     # Announce once per session: a planned handover between jobs is not news.
-    try:
-        resumed = state.load().get("session") == str(now.date())
-    except state.InvalidStateError:
-        raise
-    if not resumed:
-        telegram.send("NSE live scanner started (5m · IST · yfinance)"
-                      + (f" · early alerts {lead}s before close." if lead else "."), dry_run=_dry())
+    # The flag is stored, so restarts (handover, watchdog, holiday re-checks)
+    # stay silent for the rest of the session.
+    st0 = state.reset_if_new_day(state.load(), str(now.date()))
+    if not st0.get("announced") and telegram.send(
+            "NSE live scanner started (5m · IST · yfinance)"
+            + (f" · early alerts {lead}s before close." if lead else "."), dry_run=_dry()):
+        st0["announced"] = True
+        _save(st0)
     closed_streak = 0
     holiday = None
     while True:

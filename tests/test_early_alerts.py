@@ -104,6 +104,7 @@ class EarlyAlertTests(TestCase):
 
     def close(self):
         self.now = BAR + timedelta(minutes=5, seconds=10)
+        self.m1 = minute_bars(0, 1, 2, 3, 4, 5)                   # feed has passed the close
         return pipeline.run_once()
 
     def test_early_alert_is_sent_before_the_close_and_is_not_an_entry(self):
@@ -201,6 +202,7 @@ class EarlyAlertTests(TestCase):
         self.times = self.times + [nxt + timedelta(minutes=5)]
         self.scan.return_value = [signal(time="10:05")]
         self.now = nxt + timedelta(minutes=5, seconds=10)
+        self.m1 = minute_bars(8, 9, 10)
         out = pipeline.run_once()
         self.assertEqual(len(out["signals"]), 1)
         self.assertEqual(self.texts()[-1], "stock")               # plain entry, no early header
@@ -223,6 +225,32 @@ class EarlyAlertTests(TestCase):
                 pipeline.run_until_ready(expected_bar=BAR)
         self.assertIn("EARLY UNVERIFIED", self.texts()[-1])
         self.assertEqual(state.load()["early"]["ABC"]["result"], "unverified")
+
+    def test_candle_is_not_judged_until_the_feed_has_passed_the_close(self):
+        # +10s: the 5m row exists, but the newest 1m print is still inside the candle.
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        self.m1 = minute_bars(0, 1, 2, 3, 4)
+        out = pipeline.run_once()
+        self.assertEqual(out["signals"], [])
+        self.assertEqual(out["pending"], ["ABC"])                 # retried, not dropped
+        self.scan.assert_not_called()
+        self.m1 = minute_bars(0, 1, 2, 3, 4, 5)                   # first print after the close
+        self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+    def test_quiet_stock_is_judged_after_the_settle_time(self):
+        self.m1 = minute_bars(0, 1, 2, 3, 4)                      # no trade after the close
+        self.now = BAR + timedelta(minutes=5, seconds=44)
+        self.assertEqual(pipeline.run_once()["signals"], [])
+        self.now = BAR + timedelta(minutes=5, seconds=45)
+        self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+    def test_pending_feed_keeps_the_early_alert_open(self):
+        pipeline.run_early(BAR)
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        self.m1 = minute_bars(0, 1, 2, 3, 4)
+        pipeline.run_once()
+        self.assertNotIn("result", state.load()["early"]["ABC"])  # neither confirmed nor cancelled
+        self.assertEqual(sum("CANCELLED" in t or "CONFIRMED" in t for t in self.texts()), 0)
 
     def test_close_scan_records_the_pick_for_the_next_early_pass(self):
         self.close()
@@ -280,11 +308,19 @@ class LiveLoopTests(TestCase):
         ready.assert_called_once_with(expected_bar=BAR)
 
     def test_handover_does_not_announce_a_restart(self):
-        state.save({"session": str(BAR.date()), "sent": {}, "positions": {}})
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {}, "announced": True})
         self.now = BAR + timedelta(minutes=4, seconds=45)
         with patch.object(pipeline, "run_until_ready", return_value={"market": "BULL"}):
             pipeline.live_loop(max_minutes=0.01, exit_at_close=True)
         self.send.assert_not_called()
+
+    def test_start_is_announced_once_per_session_even_across_restarts(self):
+        for _ in range(3):                                        # e.g. holiday re-checks
+            self.now = BAR + timedelta(minutes=4, seconds=45)
+            with patch.object(pipeline, "run_until_ready", return_value={"market": "CLOSED"}):
+                pipeline.live_loop(max_minutes=0.01, exit_at_close=True)
+        self.assertEqual(sum("started" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertTrue(state.load()["announced"])
 
     def test_holiday_ends_the_loop_instead_of_polling_all_day(self):
         self.now = BAR + timedelta(minutes=4, seconds=45)
