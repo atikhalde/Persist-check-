@@ -1,7 +1,7 @@
 """Sector follow alert: scans persistent sectors even when Nifty is NEUTRAL.
 
 Completely separate from the original scanner. Original alerts are 100%
-untouched. This module only fires when the original scanner would say WAIT
+untouched. This module only fires when the original scanner would WAIT
 but a persistent sector exists that deserves a look.
 
 Easy removal: delete this file and revert the two CLI command additions in
