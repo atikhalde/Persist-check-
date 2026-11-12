@@ -82,6 +82,8 @@ class EarlyAlertTests(TestCase):
 
     def setUp(self):
         base.LiveAlertTests.setUp(self)
+        self.settled.stop()                                       # real settle rules here
+        self.addCleanup(self.settled.start)                       # keep the base cleanup balanced
         self.early_now = BAR + timedelta(minutes=4, seconds=2)   # 58s before the close
         self.now = self.early_now
         self.hist = self.times[:-2]                               # completed bars before BAR
@@ -237,12 +239,94 @@ class EarlyAlertTests(TestCase):
         self.m1 = minute_bars(0, 1, 2, 3, 4, 5)                   # first print after the close
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
 
+    def two_stocks(self, quiet_last, busy_last):
+        """ABC is quiet (no print after the close); DEF shows where the feed is."""
+        self.uni["sectors"]["IT"]["stocks"] = ["ABC", "DEF"]
+        self.scan.side_effect = lambda raw, *a, **k: [signal()] if raw == "ABC" else []
+        feeds = {"ABC.NS": minute_bars(*range(quiet_last + 1)), "DEF.NS": minute_bars(*range(busy_last + 1))}
+        base_frames = self.frames
+        self.fetch_many.side_effect = lambda tickers, period, interval: (
+            {t: feeds[t] for t in tickers} if interval == "1m" else base_frames(tickers, period, interval))
+
     def test_quiet_stock_is_judged_after_the_settle_time(self):
-        self.m1 = minute_bars(0, 1, 2, 3, 4)                      # no trade after the close
+        self.two_stocks(quiet_last=4, busy_last=5)                # the feed itself is past the close
         self.now = BAR + timedelta(minutes=5, seconds=44)
         self.assertEqual(pipeline.run_once()["signals"], [])
         self.now = BAR + timedelta(minutes=5, seconds=45)
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+    def test_delayed_feed_holds_every_candle_back_instead_of_reading_it_unfinished(self):
+        self.two_stocks(quiet_last=3, busy_last=4)                # nobody has printed past the close
+        self.now = BAR + timedelta(minutes=5, seconds=100)
+        out = pipeline.run_once()
+        self.assertEqual(out["signals"], [])
+        self.assertEqual(sorted(out["pending"]), ["ABC", "DEF"])
+        self.assertFalse(any("delayed" in t for t in self.texts()))
+        self.now = BAR + timedelta(minutes=5, seconds=130)        # two minutes on: say so, once
+        pipeline.run_once()
+        pipeline.run_once()
+        self.assertEqual(sum("Yahoo feed is delayed" in t for t in self.texts()), 1)
+        self.assertEqual(state.load()["sent"], {})
+        self.two_stocks(quiet_last=5, busy_last=5)                # feed catches up in time
+        self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+    def test_without_any_1m_data_the_settle_time_decides(self):
+        self.m1 = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        self.now = BAR + timedelta(minutes=5, seconds=20)
+        self.assertEqual(pipeline.run_once()["signals"], [])
+        self.now = BAR + timedelta(minutes=5, seconds=50)
+        self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+    def position(self):
+        st = state.load()
+        st["positions"]["ABC"] = {"side": "BUY", "entry": 100.0, "sl": 99.0, "entry_ema9": 99.5,
+                                  "t1": 101.0, "t2": None, "t3": None,
+                                  "entry_bar": (BAR - timedelta(minutes=10)).isoformat(),
+                                  "last_bar": (BAR - timedelta(minutes=10)).isoformat()}
+        state.save(st)
+
+    def exit_frames(self, last_1m):
+        prev = BAR - timedelta(minutes=5)
+        five = quiet_bars(*self.times)
+        five.loc[prev, "Close"] = 99.5                            # completed candle closes below EMA9
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: (minute_bars(*range(last_1m + 1)) if interval == "1m" else
+                five.copy() if t.endswith(".NS") else bars(*self.times)) for t in tickers}
+
+    def test_delayed_feed_postpones_a_hit_alert_by_one_candle_and_never_loses_it(self):
+        self.position()
+        self.exit_frames(last_1m=4)                               # feed has not passed 10:05
+        self.now = BAR + timedelta(minutes=5, seconds=100)
+        out = pipeline.run_once()
+        self.assertIn("ABC", out["pending"])
+        exits = [t for t in self.texts() if "EMA9 EXIT" in t]
+        self.assertEqual(len(exits), 1)                           # the older 09:55 candle is final
+        self.assertIn("5m 09:55", exits[0])
+        self.assertNotIn("ABC", state.load()["positions"])
+
+    def test_newest_candle_is_not_used_for_an_exit_until_the_feed_passes_its_close(self):
+        self.position()
+        five = quiet_bars(*self.times)
+        five.loc[BAR, "Close"] = 99.5                             # looks like an exit, may be unfinished
+        feed = {"last": 4}
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: (minute_bars(*range(feed["last"] + 1)) if interval == "1m" else
+                five.copy() if t.endswith(".NS") else bars(*self.times)) for t in tickers}
+        self.now = BAR + timedelta(minutes=5, seconds=100)
+        pipeline.run_once()
+        self.assertFalse(any("EMA9 EXIT" in t for t in self.texts()))
+        self.assertIn("ABC", state.load()["positions"])
+        feed["last"] = 5                                          # first print after the close
+        pipeline.run_once()
+        self.assertEqual(sum("EMA9 EXIT" in t and "5m 10:00" in t for t in self.texts()), 1)
+
+    def test_last_candle_of_the_day_does_not_wait_for_prints_that_never_come(self):
+        close = BAR.replace(hour=15, minute=30)
+        frames = {"A": minute_bars(0)}
+        self.now = close + timedelta(seconds=50)
+        self.assertEqual(pipeline._unsettled(frames, ["A"], close), (set(), False))
+        self.now = close + timedelta(seconds=20)
+        self.assertEqual(pipeline._unsettled(frames, ["A"], close), ({"A"}, False))
 
     def test_pending_feed_keeps_the_early_alert_open(self):
         pipeline.run_early(BAR)
@@ -251,6 +335,16 @@ class EarlyAlertTests(TestCase):
         pipeline.run_once()
         self.assertNotIn("result", state.load()["early"]["ABC"])  # neither confirmed nor cancelled
         self.assertEqual(sum("CANCELLED" in t or "CONFIRMED" in t for t in self.texts()), 0)
+
+    def test_statistics_follow_an_early_alert_through_its_confirmation(self):
+        pipeline.run_early(BAR)
+        self.close()
+        pipeline.run_once()                                       # same candle again: not recounted
+        x = state.load()["stats"]
+        self.assertEqual((x["candles"], x["picks"], x["early_passes"], x["early_live"],
+                          x["early_sent"], x["confirmed"], x["entries"]), (1, 1, 1, 1, 1, 1, 1))
+        self.assertEqual(x["lag_max"], 10.0)
+        self.assertEqual(x["early_age_sum"] / x["early_age_n"], 62.0)   # 10:03 bar seen at 10:04:02
 
     def test_close_scan_records_the_pick_for_the_next_early_pass(self):
         self.close()
@@ -321,6 +415,47 @@ class LiveLoopTests(TestCase):
                 pipeline.live_loop(max_minutes=0.01, exit_at_close=True)
         self.assertEqual(sum("started" in c.args[0] for c in self.send.call_args_list), 1)
         self.assertTrue(state.load()["announced"])
+
+    def test_dry_run_loop_uses_a_scratch_ledger_and_leaves_the_real_one_alone(self):
+        self.addCleanup(state.use_scratch, False)
+        real = {"session": str(BAR.date()), "sent": {"XYZ": {"code": 101, "time": "09:45"}},
+                "positions": {}, "announced": True}
+        state.save(real)
+        self.now = BAR + timedelta(minutes=4, seconds=45)
+
+        def one_cycle(expected_bar):
+            return pipeline._run_until_ready(expected_bar=expected_bar)
+
+        with (patch.dict("os.environ", {"DRY_RUN": "1"}),
+              patch.object(pipeline, "run_until_ready", side_effect=one_cycle)):
+            pipeline.live_loop(max_minutes=0.01, exit_at_close=True)
+            dry = state.load()
+        self.assertEqual(dry["scan"]["sector"], "IT")             # early pass can now work in a dry run
+        self.assertIn("ABC", dry["sent"])
+        state.use_scratch(False)
+        self.assertEqual(state.load(), real)                      # real ledger untouched
+
+    def test_session_summary_is_sent_once_after_the_close(self):
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {}, "announced": True,
+                    "stats": {"candles": 75, "picks": 40, "early_passes": 40, "early_live": 38,
+                              "early_sent": 3, "confirmed": 2, "cancelled": 1, "entries": 4,
+                              "lag_sum": 60.0, "lag_max": 47.0, "early_age_sum": 400.0,
+                              "early_age_n": 10, "close_age_sum": 90.0, "close_age_n": 10}})
+        for _ in range(2):
+            self.now = BAR.replace(hour=15, minute=31)
+            self.assertEqual(pipeline.live_loop(exit_at_close=True), "closed")
+        texts = [c.args[0] for c in self.send.call_args_list]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("Candles scanned 75 of 75 · with a sector pick 40", texts[0])
+        self.assertIn("Early passes 40 · with live 1m data 38 · newest 1m bar 40s old on average", texts[0])
+        self.assertIn("Early alerts 3: confirmed 2 · cancelled 1 · unverified 0", texts[0])
+        self.assertIn("Entries 4 · sent 15s after the close on average, slowest 47s", texts[0])
+        self.assertIn("At the confirm scan: newest 1m bar 9s old on average", texts[0])
+
+    def test_no_summary_when_nothing_was_scanned(self):
+        self.now = BAR.replace(hour=15, minute=34)
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {}})
+        self.assertIsNone(pipeline.format_summary(state.load()))
 
     def test_holiday_ends_the_loop_instead_of_polling_all_day(self):
         self.now = BAR + timedelta(minutes=4, seconds=45)

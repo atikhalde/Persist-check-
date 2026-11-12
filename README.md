@@ -210,7 +210,7 @@ Seconds after the close exactly one follow-up arrives:
 Rules: an early alert is **not** a confirmed signal — the last minute can undo it,
 which is the price of being early. It never touches the entry ledger; one early
 alert per stock per session (no flicker spam); it is skipped when the newest 1m
-print is older than `EARLY_MAX_STALE_SECONDS` (150) so a frozen feed is never shown
+print is older than `EARLY_MAX_STALE_SECONDS` (100) so a frozen feed is never shown
 as a live price; `EARLY_ALERT_SECONDS=0` restores close-only behaviour. A larger
 value (e.g. 120) is earlier but cancels more often.
 
@@ -227,15 +227,38 @@ Omit `--sector` for all sectors (≈30 s per stock).
 **Always-on loop.** `python -m nse_scanner live` sleeps to `close − 60s` (early
 pass), then to `close + POLL_GRACE_SECONDS` (10) and polls Yahoo every 5 s for the
 closed candle. Every confirmed alert prints its own delay
-(`Signal calculated 10:30:12 IST (+12s after close)`). Yahoo's 5m row exists
-while the candle is still forming, so right after the close a stock is judged only
-once its 1m feed shows a print at or after the close; after `BAR_SETTLE_SECONDS`
-(45) the candle is taken as final. A fast feed therefore alerts in seconds and a
-lagging feed is waited for instead of being read half-finished.
+(`Signal calculated 10:30:12 IST (+12s after close)`).
 
-The log line `early 10:25 PSUBK BUY: 12 names, 9 with live 1m data, …` shows on
-every candle whether Yahoo's 1m feed is live enough for early alerts. If that count
-stays at 0, the feed is too delayed and only close-confirmed alerts will arrive.
+**Unfinished candles are never judged.** Yahoo's 5m row exists while the candle is
+still forming, so "the row is there" does not mean the last trades have arrived. A
+stock's candle is used only once its 1m feed shows a print at or after the close.
+If other stocks already print past the close, a quiet stock is accepted after
+`BAR_SETTLE_SECONDS` (45). If *no* stock prints past the close the whole feed is
+behind, and every entry and EMA9-exit decision on that candle waits — up to the
+alert deadline for entries, and to the next cycle for exits (older candles are
+still replayed, so a hit alert is postponed by a candle, never lost). When that
+happens you get one `⚠ Yahoo feed is delayed` message per session.
+
+**Session summary.** After the close one message reports what actually happened:
+
+```
+📊 Scanner summary 2026-11-13
+Candles scanned 75 of 75 · with a sector pick 54
+Early passes 53 · with live 1m data 53 · newest 1m bar 62s old on average
+Early alerts 3: confirmed 2 · cancelled 1 · unverified 0
+Entries 4 · sent 14s after the close on average, slowest 47s
+At the confirm scan: newest 1m bar 19s old on average
+```
+
+`with live 1m data 0` or a very old "newest 1m bar" means Yahoo's feed is too
+delayed for early alerts; `Candles scanned` well below 75 means the loop started
+late or died. The per-candle log line `early 10:25 PSUBK BUY: 12 names, 9 with live
+1m data, …` shows the same thing live.
+
+**Dry run.** `python -m nse_scanner live --dry-run` (or *Run workflow* → `dry_run`)
+runs the complete loop — early pass, confirm/cancel, hit alerts, summary — printing
+instead of sending. It keeps its own throw-away ledger
+(`state/scan_state.dry.json`), so the real alert ledger is never touched.
 
 What this cannot fix: yfinance is not an exchange feed (it can lag or rate-limit),
 the entry price on a confirmed alert is still the candle close, and you still have

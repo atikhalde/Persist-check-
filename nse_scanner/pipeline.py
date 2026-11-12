@@ -127,6 +127,46 @@ def _lag_text(hhmm: str) -> str:
 # candle (rebuilt from 1m bars) shortly before the close and sends a clearly
 # labelled, unconfirmed heads-up; the close then confirms or cancels it.
 
+# --- session statistics -------------------------------------------------------
+# What actually happened today, sent once after the close: how many candles were
+# scanned, whether Yahoo's 1m feed was live enough for early alerts, and how long
+# after each close the confirmed alerts went out.
+
+def _bump(st: dict, key: str, n: float = 1) -> None:
+    stats = st.setdefault("stats", {})
+    stats[key] = stats.get(key, 0) + n
+
+
+def _note_feed_age(st: dict, prefix: str, frames: dict) -> None:
+    """Record how old the newest 1m bar of each stock is at this moment."""
+    now = pd.Timestamp(now_ist())
+    ages = [(now - df.index[-1]).total_seconds() for df in frames.values()
+            if df is not None and not df.empty]
+    ages = [a for a in ages if 0 <= a < 3600]
+    if ages:
+        _bump(st, prefix + "_age_sum", sum(ages))
+        _bump(st, prefix + "_age_n", len(ages))
+
+
+def format_summary(st: dict) -> str | None:
+    x = st.get("stats") or {}
+    if not x.get("candles"):
+        return None
+    avg = lambda k: x.get(k + "_sum", 0) / x[k + "_n"] if x.get(k + "_n") else None
+    age = lambda v: "no 1m data" if v is None else f"newest 1m bar {v:.0f}s old on average"
+    lines = [f"📊 <b>Scanner summary {st.get('session', '')}</b>",
+             f"Candles scanned {x['candles']} of 75 · with a sector pick {x.get('picks', 0)}",
+             f"Early passes {x.get('early_passes', 0)} · with live 1m data {x.get('early_live', 0)}"
+             f" · {age(avg('early_age'))}",
+             f"Early alerts {x.get('early_sent', 0)}: confirmed {x.get('confirmed', 0)}"
+             f" · cancelled {x.get('cancelled', 0)} · unverified {x.get('unverified', 0)}",
+             f"Entries {x.get('entries', 0)}"
+             + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
+                f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
+             f"At the confirm scan: {age(avg('close_age'))}"]
+    return "\n".join(lines)
+
+
 def _early_lead() -> int:
     """Seconds before the 5m close at which the forming candle is evaluated (0 = off)."""
     try:
@@ -136,7 +176,7 @@ def _early_lead() -> int:
 
 
 def _early_max_stale() -> float:
-    return float(os.environ.get("EARLY_MAX_STALE_SECONDS", "150"))
+    return float(os.environ.get("EARLY_MAX_STALE_SECONDS", "100"))
 
 
 def format_early(sig: StockSignal, scan: dict, plan: TradePlan, bar: datetime) -> str:
@@ -184,6 +224,7 @@ def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "c
     if not telegram.send(text, dry_run=_dry()):
         return False
     early["result"] = result
+    _bump(st, result)
     _save(st)
     log.info("EARLY %s %s %s: %s", result.upper(), raw, early["side"], reason)
     return True
@@ -238,6 +279,7 @@ def run_early(bar: datetime) -> list[dict]:
     sm5 = data.fetch_many(tickers.values(), period_5m, "5m")
     sm1 = data.fetch_many(tickers.values(), "7d", "1m")
     sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
+    _note_feed_age(st, "early", sm1)
     want = "BUY" if side == 1 else "SELL"
     hhmm = bar.strftime("%H:%M")
     out: list[dict] = []
@@ -266,7 +308,8 @@ def run_early(bar: datetime) -> list[dict]:
             log.info("early scan for %s finished at the close; leaving it to the close scan", hhmm)
             break
         best.price, best.sl = plan.entry, plan.sl
-        if not telegram.send(format_early(best, scan, plan, bar), dry_run=_dry()):
+        text = format_early(best, scan, plan, bar) + f" · price from 1m bar {m1.index[-1]:%H:%M}"
+        if not telegram.send(text, dry_run=_dry()):
             continue
         book[raw] = {"bar": bar.isoformat(), "side": best.side, "code": best.code,
                      "name": best.name, "price": plan.entry, "at": stamp.strftime("%H:%M:%S")}
@@ -279,6 +322,10 @@ def run_early(bar: datetime) -> list[dict]:
     log.info("early %s %s %s: %d names, %d with live 1m data, %d alert(s), done %.0fs before close",
              hhmm, scan["sector"], want, len(names), live, len(out),
              (close - now_ist()).total_seconds())
+    _bump(st, "early_passes")
+    _bump(st, "early_live", 1 if live else 0)
+    _bump(st, "early_sent", len(out))
+    _save(st)
     return out
 
 
@@ -341,6 +388,53 @@ def _has_print_since(df1m: pd.DataFrame | None, moment: datetime) -> bool:
     return df1m is not None and not df1m.empty and df1m.index[-1] >= pd.Timestamp(moment)
 
 
+def _unsettled(frames1m: dict, symbols, close_at: datetime) -> tuple[set, bool]:
+    """Symbols whose just-closed 5m candle may still be missing its last trades.
+
+    Yahoo's 5m row exists while the candle is forming, so its presence proves
+    nothing. A stock is settled once its own 1m feed shows a print at/after the
+    close. Without one there are two very different cases:
+
+    * other stocks of the batch already print past the close → this stock is
+      simply quiet; it is accepted after ``BAR_SETTLE_SECONDS``;
+    * nobody prints past the close → the whole feed is behind; every candle is
+      still filling, so all of them wait (until the alert deadline if need be).
+
+    Returns ``(unsettled, feed_behind)``. With no 1m data at all there is
+    nothing to judge by and only the settle time applies. The same holds for
+    the day's last candle: nothing prints after 15:30, so waiting for a print
+    would wait forever.
+    """
+    symbols = list(symbols)
+    since = (now_ist() - close_at).total_seconds()
+    frames = {sym: frames1m.get(sym) for sym in symbols}
+    if not any(df is not None and not df.empty for df in frames.values()):
+        return (set(symbols) if since < _settle_seconds() else set()), False
+    live = any(_has_print_since(df, close_at) for df in frames.values())
+    behind = not live and close_at.time() < clock_time(15, 30)
+    waiting = {sym for sym, df in frames.items()
+               if not _has_print_since(df, close_at) and (behind or since < _settle_seconds())}
+    return waiting, behind
+
+
+def _warn_feed_behind(st: dict, close_at: datetime, frames1m: dict) -> None:
+    """Say once per session that alerts are being held back by a delayed feed."""
+    stats = st.setdefault("stats", {})
+    if stats.get("feed_warned") or (now_ist() - close_at).total_seconds() < 120:
+        return
+    newest = max((df.index[-1] for df in frames1m.values() if df is not None and not df.empty),
+                 default=None)
+    if newest is None:
+        return
+    behind = (pd.Timestamp(now_ist()) - newest).total_seconds()
+    if telegram.send(f"⚠ <b>Yahoo feed is delayed</b> — newest 1m bar is {newest:%H:%M} "
+                     f"({behind:.0f}s old) two minutes after the {close_at:%H:%M} close. Entry alerts are "
+                     "held back rather than calculated on unfinished candles; if this continues, "
+                     "few or no alerts will arrive today.", dry_run=_dry()):
+        stats["feed_warned"] = True
+        _save(st)
+
+
 def _recent_bar(bar: datetime, now: datetime) -> bool:
     age = (now - (bar + timedelta(minutes=5))).total_seconds()
     return 0 <= age <= _max_lag()
@@ -348,7 +442,8 @@ def _recent_bar(bar: datetime, now: datetime) -> bool:
 
 def _save(st: dict) -> None:
     # A dry-run must not consume tomorrow's real alert or today's alert.
-    if not _dry():
+    # (The dry-run live loop writes to its own scratch ledger instead.)
+    if not _dry() or state.scratch_active():
         state.save(st)
 
 
@@ -394,14 +489,27 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
     ledger = st.setdefault("alerts", {})
     symbols = {raw: data.yahoo_stock(raw) for raw in positions}
     frames = data.fetch_many(symbols.values(), period_5m, "5m")
+    # An EMA9 exit is decided by the candle's CLOSE: never read it half-published.
+    # Older candles are still replayed, so a delayed feed postpones a hit alert
+    # by a candle instead of losing it.
+    waiting, _ = _unsettled(data.fetch_many(symbols.values(), "1d", "1m"),
+                            symbols.values(), bar + timedelta(minutes=5))
     pending: list[str] = []
     changed = False
     session = session_date(bar)
     for raw, pos in list(positions.items()):
         df = frames.get(symbols[raw])
         df = df.loc[df.index <= bar] if df is not None and not df.empty else df
-        if df is None or df.empty or to_ist(df.index[-1]) != bar:
+        newest = bar
+        if symbols[raw] in waiting:
             pending.append(raw)
+            log.info("hit-check %s: feed has not passed the %s candle's close; older candles only",
+                     raw, bar.strftime("%H:%M"))
+            newest = bar - timedelta(minutes=5)
+            df = df.loc[df.index <= newest] if df is not None and not df.empty else df
+        if df is None or df.empty or to_ist(df.index[-1]) != newest:
+            if raw not in pending:
+                pending.append(raw)
             log.info("hit-check pending %s: 5m candle %s not published", raw, bar)
             continue
         grid = ema9_frame(df)
@@ -599,6 +707,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                   "side": md.pick_side if scanning else 0,
                   "label": md.dir_label, "conf": md.dir_conf}
 
+    if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
+        st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
+        _bump(st, "candles")
+        _bump(st, "picks", 1 if scanning else 0)
+
     # market / sector change alerts
     prev_m = st.get("market") or {}
     prev_s = st.get("sector") or {}
@@ -663,14 +776,18 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # accept a stock only once its feed shows a print at/after the close; after
     # BAR_SETTLE_SECONDS the candle is taken as final (the pre-loop behaviour).
     close_at = last + timedelta(minutes=5)
-    if not allow_stale and (now_ist() - close_at).total_seconds() < _settle_seconds():
+    if not allow_stale:
+        _note_feed_age(st, "close", sm1)
+    if not allow_stale:
+        waiting, behind = _unsettled(sm1, current, close_at)
         unsettled = [raw for raw, sym in zip(stocks, tickers)
-                     if sym in current and raw not in sent and raw not in positions
-                     and not _has_print_since(sm1.get(sym), close_at)]
+                     if sym in waiting and raw not in sent and raw not in positions]
+        if behind:
+            _warn_feed_behind(st, close_at, sm1)
         if unsettled:
-            log.info("waiting for %d stock feed(s) to pass the %s close: %s", len(unsettled),
-                     close_at.strftime("%H:%M"), ", ".join(unsettled))
-            waiting = {data.yahoo_stock(raw) for raw in unsettled}
+            log.info("waiting for %d stock feed(s) to pass the %s close%s: %s", len(unsettled),
+                     close_at.strftime("%H:%M"), " (whole feed behind)" if behind else "",
+                     ", ".join(unsettled))
             current = [sym for sym in current if sym not in waiting]
             missing = missing + unsettled
             result.setdefault("pending", []).extend(
@@ -729,6 +846,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             continue
         if early:
             early["result"] = "confirmed"
+            _bump(st, "confirmed")
+        lag = max(0.0, (now_ist() - close_at).total_seconds())
+        _bump(st, "entries")
+        _bump(st, "lag_sum", lag)
+        st["stats"]["lag_max"] = max(st["stats"].get("lag_max", 0), lag)
         new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
                             "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
         sent[raw] = {
@@ -772,7 +894,7 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
         return _run_until_ready(expected_bar=expected_bar, force_sector=force_sector)
     finally:
         try:
-            if not _dry() and state.STATE_PATH.exists():
+            if (not _dry() or state.scratch_active()) and state.active_path().exists():
                 st = state.load()
                 if any(not e.get("result") for e in (st.get("early") or {}).values()):
                     _settle_early(st, expected_bar, set(), "could not be checked in time",
@@ -879,6 +1001,8 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
         log.info("outside the NSE session (%s IST) — nothing to do", now.strftime("%a %H:%M"))
         return "closed"
     data.enable_daily_cache()
+    if _dry():
+        state.use_scratch()   # full behaviour, real ledger untouched
     log.info("live loop IST: early pass %ss before each 5m close%s, confirm %ss after",
              lead, "" if lead else " (disabled)", grace)
     # Announce once per session: a planned handover between jobs is not news.
@@ -909,6 +1033,14 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
             time.sleep(min(sleep, 300))
             continue
         if t.hour > 15 or (t.hour == 15 and t.minute >= 33):
+            try:  # one summary of the session, never repeated
+                st1 = state.reset_if_new_day(state.load(), str(now.date()))
+                text = None if (st1.get("stats") or {}).get("reported") else format_summary(st1)
+                if text and telegram.send(text, dry_run=_dry()):
+                    st1["stats"]["reported"] = True
+                    _save(st1)
+            except Exception:
+                log.exception("session summary failed")
             if exit_at_close:
                 return "closed"
             log.info("session over, sleep until tomorrow")
