@@ -62,15 +62,24 @@ jobs:
           # stand down. An older run that is itself just a guard (or a loop
           # that is handing over) finishes within seconds: wait it out. One
           # that is still active after 2 minutes is the live loop.
+          answered=false
           for i in $(seq 1 24); do
             busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/live-scan.yml/runs?per_page=40" \
-              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID)] | length")
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID)] | length" || true)
             if [ "$busy" = "0" ]; then
               echo "no other run active - this run becomes the scanner loop"
               echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
             fi
+            if [ -n "$busy" ]; then answered=true; fi
             sleep 5
           done
+          if [ "$answered" = "false" ]; then
+            # The API never answered, so we do not know. Starting is the safe
+            # side: the scan job's concurrency group makes a second loop wait
+            # for the first instead of running beside it.
+            echo "could not list runs - starting; the concurrency group prevents a double loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           echo "scanner loop already running ($busy older run active) - standing down"
           echo "run=false" >> "$GITHUB_OUTPUT"
 
@@ -127,6 +136,9 @@ jobs:
           EARLY_ALERT_SECONDS: "60"
           # Seconds after the close before the confirmed scan asks Yahoo.
           POLL_GRACE_SECONDS: "10"
+          # Right after the close a candle is judged only once the stock's feed
+          # shows a print at/after the close; after this many seconds regardless.
+          BAR_SETTLE_SECONDS: "45"
           MAX_ALERT_LAG_SECONDS: "180"
         run: python -m nse_scanner live --exit-at-close --max-minutes 170
 

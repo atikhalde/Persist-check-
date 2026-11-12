@@ -227,8 +227,15 @@ Omit `--sector` for all sectors (≈30 s per stock).
 **Always-on loop.** `python -m nse_scanner live` sleeps to `close − 60s` (early
 pass), then to `close + POLL_GRACE_SECONDS` (10) and polls Yahoo every 5 s for the
 closed candle. Every confirmed alert prints its own delay
-(`Signal calculated 10:30:12 IST (+12s after close)`). A lower grace is faster but
-risks reading the candle before Yahoo has its final prints.
+(`Signal calculated 10:30:12 IST (+12s after close)`). Yahoo's 5m row exists
+while the candle is still forming, so right after the close a stock is judged only
+once its 1m feed shows a print at or after the close; after `BAR_SETTLE_SECONDS`
+(45) the candle is taken as final. A fast feed therefore alerts in seconds and a
+lagging feed is waited for instead of being read half-finished.
+
+The log line `early 10:25 PSUBK BUY: 12 names, 9 with live 1m data, …` shows on
+every candle whether Yahoo's 1m feed is live enough for early alerts. If that count
+stays at 0, the feed is too delayed and only close-confirmed alerts will arrive.
 
 What this cannot fix: yfinance is not an exchange feed (it can lag or rate-limit),
 the entry price on a confirmed alert is still the candle close, and you still have
