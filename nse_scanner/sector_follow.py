@@ -39,7 +39,7 @@ def _recent_bar(bar: datetime, now: datetime) -> bool:
     return 0 <= age <= _max_lag()
 
 
-def format_sector_follow_alert(sig, md, plan, reading=None) -> str:
+def format_sector_follow_alert(sig, md, plan, reading=None, aligned=False) -> str:
     """Separate message format — clearly labeled SECTOR FOLLOW."""
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
@@ -47,9 +47,10 @@ def format_sector_follow_alert(sig, md, plan, reading=None) -> str:
     if reading is not None:
         oi_line = (f"OI Regime: <b>{reading.regime.value}</b>\n"
                    f"OI chg: {reading.oi_chg_pct:+.2f}%  |  Price chg: {reading.price_chg_pct:+.2f}%\n")
+    align_tag = " (SMART$/MARKET/SECTOR/FLOW aligned)" if aligned else ""
     return (
         f"{arrow} <b>SECTOR FOLLOW</b> | <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        f"Sector <b>{md.pick_sector}</b>{align_tag}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f}\n"
         f"{oi_line}"
@@ -136,6 +137,12 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
     if md.action in ("SCAN LONG", "SCAN SHORT"):
         return {"bar": md.bar_time, "signals": [], "skipped": "original_scanning"}
 
+    # SMART$/MARKET/SECTOR/FLOW alignment — first priority for candidate ranking.
+    # Comma-separated sector codes where all four indicators agree
+    # (e.g. SF_ALIGNED_SECTORS=REALTY,FIN).
+    aligned_raw = os.environ.get("SF_ALIGNED_SECTORS", "")
+    aligned_sectors = {s.strip().upper() for s in aligned_raw.split(",") if s.strip()}
+
     # Build candidate list from sector snaps: persistent sectors only.
     snaps = md.sectors or {}
     candidates = []
@@ -145,12 +152,14 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
         qualified = bool(snap.get("qualified", False))
         side = int(snap.get("side", 0) or 0)
         score = max(persist_bull, persist_bear)
+        aligned = name in aligned_sectors
         if score > 0:
             candidates.append({
                 "name": name,
                 "side": side,
                 "score": score,
                 "qualified": qualified,
+                "aligned": aligned,
                 "persist_bull": persist_bull,
                 "persist_bear": persist_bear,
             })
@@ -158,8 +167,9 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
     if not candidates:
         return {"bar": md.bar_time, "signals": [], "skipped": "no_persistent_sector"}
 
-    # Sort: live-flow qualified first, then by score descending.
-    candidates.sort(key=lambda c: (not c["qualified"], -c["score"]))
+    # Sort: indicator-aligned sectors FIRST (SMART$/MARKET/SECTOR/FLOW priority),
+    # then by persist score descending within each group.
+    candidates.sort(key=lambda c: (not c["aligned"], -c["score"]))
 
     # When Nifty is NEUTRAL, only scan bull (PERSIST +) sectors — we don't
     # want to short into a neutral index.
@@ -250,16 +260,20 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
             md.pick_sector = pick_name
             md.pick_side = pick_side
             md.action = "SCAN LONG" if pick_side == 1 else "SCAN SHORT"
-            md.pick_reason = f"SECTOR FOLLOW {pick_name} (persistent, market {md.dir_label})"
+            align_tag = " (aligned: SMART$/MARKET/SECTOR/FLOW)" if cand.get("aligned") else ""
+            md.pick_reason = (f"SECTOR FOLLOW {pick_name} "
+                              f"(persistent{align_tag}, market {md.dir_label})")
 
-            if not telegram.send(format_sector_follow_alert(best, md, plan, reading), dry_run=_dry()):
+            if not telegram.send(format_sector_follow_alert(
+                    best, md, plan, reading, aligned=cand.get("aligned", False)), dry_run=_dry()):
                 log.warning("Sector follow Telegram failed for %s", raw)
                 continue
 
             new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
                                 "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
                                 "oi_regime": reading.regime.value if reading else None,
-                                "oi_chg_pct": reading.oi_chg_pct if reading else None})
+                                "oi_chg_pct": reading.oi_chg_pct if reading else None,
+                                "aligned": cand.get("aligned", False)})
 
             sent["sent"][raw] = {
                 "code": best.code, "name": best.name, "time": best.time,
