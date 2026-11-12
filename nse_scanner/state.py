@@ -59,6 +59,8 @@ def reset_if_new_day(state: dict, session: str) -> dict:
             "sector": {},
             "alerts": {},
             "sent": {},
+            "early": {},
+            "scan": {},
             "positions": state.get("positions", {}),  # trail until an exit, even across sessions
         }
     state.setdefault("positions", {})
@@ -66,4 +68,6 @@ def reset_if_new_day(state: dict, session: str) -> dict:
     state.setdefault("sent", {})
     state.setdefault("market", {})
     state.setdefault("sector", {})
+    state.setdefault("early", {})   # pre-close heads-up alerts awaiting the close
+    state.setdefault("scan", {})    # last completed bar's sector pick
     return state

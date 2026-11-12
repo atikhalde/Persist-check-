@@ -10,7 +10,7 @@ Python port of two TradingView engines, chained the way you specified:
 2. **Stock 5m scanner** (`MASTER SECTOR BATCH SCANNER`)  
    Runs **only on that sector’s full batch** (both TV batches — Python has no 12-symbol cap).  
    Aggressive window entries + 22-condition exception codes.  
-   **Only newly fired entries from the latest completed 5m candle** are eligible for Telegram (no historical table replay or digest). Each stock can alert once per IST trading day.
+   **Only newly fired entries from the latest completed 5m candle** are recorded as entries (an optional, clearly labelled *early* heads-up is sent ~60s before that close — see *Entry timing*) and eligible for Telegram (no historical table replay or digest). Each stock can alert once per IST trading day.
 
 L2 matches the TV master-scanner table: daily/15m `lookahead_on` on completed days, dual VWAP, first-hit + rank upgrade, 90/290 cleared after 09:45 (and 90/290 do not lock later exceptions). Interior Yahoo 5m gaps are filled; trailing 15:15–15:25 drops are not invented. Yahoo’s 5m **09:15 bar often has Volume=0** (the auction OHLC is real; volume lives on 1m). That zero volume broke VWAP / relVol / W1 `entry_sell_today` and printed false 09:30 EX1 instead of EX8. When 1m history exists (last ~7d) those zero-volume 5m slots are filled from 1m sums.
 
@@ -170,21 +170,69 @@ No pair-trades. No “rel-long the strongest bull while index is bear”.
 
 ---
 
-## Honest latency (yfinance)
+## Entry timing: early alerts + always-on loop
 
-A five-minute entry is known only **after the candle closes**; the bar's printed time is its OPEN, so even perfect delivery is at least five minutes later than that printed time. yfinance NSE bars can arrive late or be rate-limited. GitHub Actions cron/dispatch can queue or cold-start unpredictably. **Neither service can guarantee an exactly-on-time trade alert.**
+A close-confirmed 5m signal has three delays stacked on top of each other
+(measured on this repo, see `docs/latency-analysis-2026-11-12.md`):
 
-For example, the November 6 workflow started at 09:35:13 IST, sent KALYANKJIL's 09:20 candle at 09:35:38 (10m38s after its 09:25 close), and sent TITAN's 09:30 candle at 09:35:39 (39s after close). That contrast confirms the old KALYANKJIL alert was a **historical table replay**, not a 15-minute Telegram POST. The old run also labelled a still-forming 09:35 market candle as current; completed-bar filtering prevents that. The scanner now ignores forming candles, old Yahoo candles, and historical signals retained by the TV table. By default it suppresses all messages if more than **180 seconds after the 5m close** (configurable via `MAX_ALERT_LAG_SECONDS`); this prevents a 15–20-minute-old entry from being sent, but may mean **missed** entries. Each stock is notified at most once per IST day. Logs show skipped stale candles and actual send times.
+| stage | before | now |
+|---|---|---|
+| the candle itself — the breakout happens *inside* it | up to 5 min | **early alert ~60s before the close** |
+| trigger after the close (external dispatcher) | +65 s | 0 — the loop is already running |
+| runner boot + `pip install` | +20 s | 0 |
+| Yahoo fetch + scan | +9 s | not measured yet — every alert now prints it (daily candles cached, 5 s re-poll) |
+| candles actually scanned (10–12 Nov) | **7 of 75** (hourly trigger) | all 75 |
 
-Lowest practical delay:
+**Early alert.** `EARLY_ALERT_SECONDS` (default 60) before each 5m close the loop
+rebuilds the *forming* candle from Yahoo 1m bars and runs the unchanged stock
+engine on it, for the sector/side picked on the previous completed candle:
 
-```bash
-python -m nse_scanner live
+```
+⚡ 🟢 EARLY BUY (unconfirmed) | BUY-EX17  PNB
+Sector PSUBK  |  Market BULL (88%)
+Price now 135.52  ·  5m bar 10:25–10:30 still forming (55s left)
+SL ≈ 134.90 (EMA9 so far)  |  Risk ≈ 0.62
+next pivot target: T1 R2 136.75 (2.0R, +0.91%) · …
+Holds only if the 10:30 close keeps the signal — ✅ confirm or ❌ cancel follows
+Calculated 10:29:05 IST
 ```
 
-on a small VPS (Mumbai / any always-on box), with one instance and persistent `state/scan_state.json`. The loop sleeps until each 5m close + 12s grace, polls briefly for a late Yahoo bar, then computes and POSTs Telegram if still fresh. For genuinely low-latency, guaranteed delivery you need a licensed real-time NSE feed, a continuously running host and monitoring; a GitHub cron/yfinance scanner cannot promise this.
+Seconds after the close exactly one follow-up arrives:
 
-Actions is a **backup heartbeat**, not the primary live path. Do not run both modes simultaneously without sharing the same state store: their local/cache dedupe stores are independent.
+* `✅ CONFIRMED — early alert 10:29:05 @ 135.52 (close is +0.15% beyond it)` on top
+  of the normal entry alert. Only now is the trade recorded (entry = candle close,
+  SL, targets, hit alerts) — exactly as before.
+* `❌ EARLY CANCELLED — BUY PNB · … did not hold (10:30 close) · close 135.20 vs early 135.52`
+  when the completed candle no longer fires, the sector pick changed or the market
+  went to WAIT. No trade is recorded and the stock stays eligible for a later signal.
+* `⚠ EARLY UNVERIFIED` if Yahoo never published the closed candle in time.
+
+Rules: an early alert is **not** a confirmed signal — the last minute can undo it,
+which is the price of being early. It never touches the entry ledger; one early
+alert per stock per session (no flicker spam); it is skipped when the newest 1m
+print is older than `EARLY_MAX_STALE_SECONDS` (150) so a frozen feed is never shown
+as a live price; `EARLY_ALERT_SECONDS=0` restores close-only behaviour. A larger
+value (e.g. 120) is earlier but cancels more often.
+
+**Measure it before trusting it** (Yahoo 1m history, last ~7 days):
+
+```bash
+python -m nse_scanner early-check --date 2026-11-12 --sector PSUBK --lead 60
+```
+
+prints every early alert next to its close (confirmed / cancelled / close-only),
+the confirmation rate and how far the close already was from the early price.
+Omit `--sector` for all sectors (≈30 s per stock).
+
+**Always-on loop.** `python -m nse_scanner live` sleeps to `close − 60s` (early
+pass), then to `close + POLL_GRACE_SECONDS` (10) and polls Yahoo every 5 s for the
+closed candle. Every confirmed alert prints its own delay
+(`Signal calculated 10:30:12 IST (+12s after close)`). A lower grace is faster but
+risks reading the candle before Yahoo has its final prints.
+
+What this cannot fix: yfinance is not an exchange feed (it can lag or rate-limit),
+the entry price on a confirmed alert is still the candle close, and you still have
+to place the order. For exchange-grade timing use a broker WebSocket feed.
 
 ---
 
@@ -235,7 +283,9 @@ python -m nse_scanner live
 | `python -m nse_scanner once --dry-run` | print, don’t send |
 | `python -m nse_scanner once --sector IT` | skip picker, scan IT |
 | `python -m nse_scanner once --backfill --dry-run` | diagnose last session without sending old entries |
-| `python -m nse_scanner live` | always-on 09:14–15:40 IST |
+| `python -m nse_scanner live` | always-on loop: early pass before each close, confirmed scan after it |
+| `python -m nse_scanner live --exit-at-close --max-minutes 170` | same, for hosts with a job time limit (GitHub Actions) |
+| `python -m nse_scanner early-check --date D --sector S` | measure early alerts against their closes |
 
 State (dedupe) is `state/scan_state.json`.
 
@@ -248,10 +298,25 @@ Repo **Settings → Secrets and variables → Actions**:
 - Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - Optional secondary mirror: `TELEGRAM_BOT_TOKEN_2`, `TELEGRAM_CHAT_ID_2`
 
-Workflow: `.github/workflows/live-scan.yml`  
-Cron: every 5 minutes **09:22–15:32 IST, Mon–Fri** (2 minutes after each 5m close), plus `workflow_dispatch`. The November 6 log shows an **additional `workflow_dispatch` roughly every five minutes** (for example 04:05:10 UTC = 09:35:10 IST); that event is triggered by an external automation, not the cron lines above. If it is still running, disable it in its own scheduler to avoid unnecessary overlapping runs. Jobs here are serialized; queued runs with expired candles are skipped, not sent late.
+Workflow: `.github/workflows/live-scan.yml` runs the **live loop inside one
+long job** instead of one cold-started job per candle.
 
-GitHub’s scheduler **cannot** fire faster than 5 minutes and may still slip under load. Actions now polls until Yahoo publishes the *specific* just-closed bar (at most 180 seconds after close); if it remains unavailable, the alert is missed rather than sent stale. A workflow run starting immediately at a candle boundary no longer silently misses the bar because of a single early Yahoo fetch; stocks whose bars appear later are retried within the same deadline without resending the ones already delivered. Logs show target bar and deadline, with explicit skipped historical fires. Actions is a heartbeat. For bar-close alerts run `python -m nse_scanner live`.
+* Every trigger (`workflow_dispatch` from your external scheduler, or the backup
+  crons) only means "make sure the loop is alive". A `guard` job checks for an older
+  active run: if the loop is running it exits in seconds and sends nothing; if not,
+  that run becomes the loop. So the existing hourly dispatcher now acts as a
+  watchdog — a crashed loop is restarted at the next trigger.
+* A job cannot run longer than 6 h, so after 170 minutes the loop saves its state
+  and dispatches its own successor (≈1 minute gap, right after a finished candle).
+* Outside 08:30–15:33 IST Mon–Fri, and on exchange holidays, runs exit immediately.
+* **Add one trigger at 09:05 IST (03:35 UTC)** to the external scheduler. Its first
+  call today is 09:31 IST and GitHub's own cron has been hours late on this repo, so
+  without it the first candles of the day are not scanned.
+* Manual test without Telegram: *Run workflow* → tick `dry_run`.
+
+State is written to the Actions cache when a run ends (handover, session close,
+failure or cancel). If a runner is killed outright mid-session, alerts sent since
+the last handover are not remembered by the next run.
 
 Actions restores the **latest same-day snapshot**, validates the state file, then saves a new uniquely keyed snapshot after each run. If state is corrupt the scanner fails closed instead of forgetting earlier deliveries and repeating alerts. (A fixed date-only cache key is immutable and would restore the first snapshot forever, causing repeated signals.) The first run has empty state, but **does not catch up** old table fires: only a fire on the current completed candle within the freshness window can be sent. Entry dedupe resets at the next IST session while open EMA9-trailing positions carry over via the previous cache snapshot. Cache may be evicted; fresh-only filtering still prevents historical replay, but if cache is lost an entry from a later bar for the same stock could be resent. For strict durable once-per-day behavior use an external durable state store; Telegram and cache saves are not an atomic transaction.
 
@@ -309,4 +374,4 @@ nifty-live-scanner/
   .github/workflows/live-scan.yml
 ```
 
-Push this folder to GitHub, add the two secrets, enable Actions. For trading hours keep `python -m nse_scanner live` running.
+Push this folder to GitHub, add the two secrets, enable Actions. Run the live loop in ONE place only (Actions *or* your own box): two loops have separate dedupe state and would double-send.

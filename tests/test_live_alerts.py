@@ -521,7 +521,7 @@ class LiveAlertTests(TestCase):
             out = pipeline.run_until_ready(expected_bar=BAR)
         self.assertEqual(out["bar"], target)
         self.assertEqual(once.call_count, 2)
-        sleep.assert_called_once_with(15)
+        sleep.assert_called_once_with(5)  # fast poll right after the close
 
     def test_workflow_retries_when_no_stock_bar_was_published(self):
         self.now = BAR + timedelta(minutes=5, seconds=10)

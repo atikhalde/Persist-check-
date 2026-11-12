@@ -103,8 +103,177 @@ def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
         f"{_basis_text(plan)}"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
-        f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST"
+        f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST{_lag_text(sig.time)}"
     )
+
+
+def _lag_text(hhmm: str) -> str:
+    """Seconds between the 5m close and this calculation, printed on the alert."""
+    now = now_ist()
+    try:
+        opened = datetime.strptime(hhmm, "%H:%M")
+    except ValueError:
+        return ""
+    close = now.replace(hour=opened.hour, minute=opened.minute, second=0,
+                        microsecond=0) + timedelta(minutes=5)
+    lag = (now - close).total_seconds()
+    return f" (+{lag:.0f}s after close)" if 0 <= lag < 3600 else ""
+
+
+# --- early (pre-close) alerts -------------------------------------------------
+# A close-confirmed 5m signal cannot be known before the candle closes, and the
+# breakout that creates it normally happens INSIDE that candle. Waiting for the
+# close therefore hands over the move. The live loop evaluates the forming
+# candle (rebuilt from 1m bars) shortly before the close and sends a clearly
+# labelled, unconfirmed heads-up; the close then confirms or cancels it.
+
+def _early_lead() -> int:
+    """Seconds before the 5m close at which the forming candle is evaluated (0 = off)."""
+    try:
+        return max(0, min(240, int(os.environ.get("EARLY_ALERT_SECONDS", "60"))))
+    except ValueError:
+        return 60
+
+
+def _early_max_stale() -> float:
+    return float(os.environ.get("EARLY_MAX_STALE_SECONDS", "150"))
+
+
+def format_early(sig: StockSignal, scan: dict, plan: TradePlan, bar: datetime) -> str:
+    arrow = "🟢" if sig.side == "BUY" else "🔴"
+    close = bar + timedelta(minutes=5)
+    now = now_ist()
+    left = max(0, int((close - now).total_seconds()))
+    return (
+        f"⚡ {arrow} <b>EARLY {sig.side}</b> (unconfirmed) | <b>{sig.name}</b>  {sig.symbol}\n"
+        f"Sector <b>{scan.get('sector')}</b>  |  Market {scan.get('label')} ({scan.get('conf')}%)\n"
+        f"Price now <b>{plan.entry:.2f}</b>  ·  5m bar {bar.strftime('%H:%M')}–{close.strftime('%H:%M')}"
+        f" still forming ({left}s left)\n"
+        f"SL ≈ {plan.sl:.2f} (EMA9 so far)  |  Risk ≈ {plan.risk:.2f}\n"
+        f"next pivot target: {_target_text(plan)}\n"
+        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"Holds only if the {close.strftime('%H:%M')} close keeps the signal — "
+        f"✅ confirm or ❌ cancel follows\n"
+        f"Calculated {now.strftime('%H:%M:%S')} IST"
+    )
+
+
+def _open_early(st: dict, raw: str, bar: datetime) -> dict | None:
+    e = (st.get("early") or {}).get(raw)
+    return e if e and not e.get("result") and e.get("bar") == bar.isoformat() else None
+
+
+def _confirm_header(early: dict, entry: float) -> str:
+    diff = (entry - early["price"]) if early["side"] == "BUY" else (early["price"] - entry)
+    pct = diff / early["price"] * 100.0 if early["price"] else 0.0
+    return (f"✅ <b>CONFIRMED</b> — early alert {early['at']} @ {early['price']:.2f} "
+            f"(close is {pct:+.2f}% {'beyond' if diff >= 0 else 'back from'} it)\n")
+
+
+def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "cancelled",
+                  close: float | None = None) -> bool:
+    """Tell the user an early heads-up did not survive; once, then never again."""
+    bar = pd.Timestamp(early["bar"])
+    hhmm = (bar + timedelta(minutes=5)).strftime("%H:%M")
+    head = "❌ <b>EARLY CANCELLED</b>" if result == "cancelled" else "⚠ <b>EARLY UNVERIFIED</b>"
+    px = f" · close {close:.2f} vs early {early['price']:.2f}" if close is not None else ""
+    tail = ("no confirmed entry — manage/exit if you already entered" if result == "cancelled"
+            else "treat as unconfirmed")
+    text = (f"{head} — {early['side']}  {raw} · {early.get('name', '')} {reason} "
+            f"({hhmm} close){px} · {tail}")
+    if not telegram.send(text, dry_run=_dry()):
+        return False
+    early["result"] = result
+    _save(st)
+    log.info("EARLY %s %s %s: %s", result.upper(), raw, early["side"], reason)
+    return True
+
+
+def _settle_early(st: dict, bar: datetime, skip: set[str], reason: str,
+                  result: str = "cancelled", older: bool = False) -> None:
+    """Resolve early alerts for ``bar`` that the close scan did not look at."""
+    for raw, early in list((st.get("early") or {}).items()):
+        if early.get("result") or raw in skip:
+            continue
+        ebar = pd.Timestamp(early["bar"])
+        if ebar == bar or (older and ebar < bar):
+            _cancel_early(st, raw, early, reason, result)
+
+
+def run_early(bar: datetime) -> list[dict]:
+    """Heads-up alerts from the STILL-FORMING 5m candle ``bar`` (open time).
+
+    Uses the market/sector pick of the previous completed candle (the pick is a
+    persistence measure and is re-validated at the close), rebuilds the forming
+    candle from live 1m bars and runs the unchanged stock engine on it. Fires
+    are sent as ``EARLY … (unconfirmed)``; nothing is written to the entry
+    ledger or the position book — only the close-confirmed scan does that.
+
+    One early alert per stock per session, so a signal that flickers on and off
+    cannot spam; the regular close alert is still available afterwards.
+    """
+    now = now_ist()
+    close = bar + timedelta(minutes=5)
+    if _early_lead() <= 0 or not bar < now < close or bar.weekday() >= 5:
+        return []
+    st = state.reset_if_new_day(state.load(), str(now.date()))
+    scan = st.get("scan") or {}
+    prev = (bar - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+    side = scan.get("side")
+    if scan.get("bar") != prev or side not in (1, -1) or scan.get("sector") in (None, "WAIT"):
+        log.info("early %s: no current sector pick from %s — skipped", bar.strftime("%H:%M"), prev)
+        return []
+    uni = data.load_universe()
+    sector = uni["sectors"].get(scan["sector"])
+    if not sector:
+        return []
+    sent, positions = st.setdefault("sent", {}), st.setdefault("positions", {})
+    book = st.setdefault("early", {})
+    names = [raw for raw in sector["stocks"]
+             if raw not in sent and raw not in positions and raw not in book]
+    if not names:
+        return []
+    tickers = {raw: data.yahoo_stock(raw) for raw in names}
+    period_5m = os.environ.get("YF_PERIOD_5M", "7d")
+    sm5 = data.fetch_many(tickers.values(), period_5m, "5m")
+    sm1 = data.fetch_many(tickers.values(), "7d", "1m")
+    sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
+    want = "BUY" if side == 1 else "SELL"
+    hhmm = bar.strftime("%H:%M")
+    out: list[dict] = []
+    for raw, ysym in tickers.items():
+        m1 = sm1.get(ysym)
+        df5 = data.provisional_5m(sm5.get(ysym), m1, bar, now_ist(), _early_max_stale())
+        if df5 is None:
+            continue
+        df5 = data.apply_1m_volume(df5, m1)
+        try:
+            fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
+        except Exception as e:
+            log.exception("early scan failed %s: %s", raw, e)
+            continue
+        fresh = [s for s in fires if s.time == hhmm and s.side == want]
+        if not fresh:
+            continue
+        best = fresh[-1]
+        plan = build_plan(best, df5, bar, sd1.get(ysym))
+        if plan is None:
+            continue
+        stamp = now_ist()
+        if stamp >= close - timedelta(seconds=3):
+            log.info("early scan for %s finished at the close; leaving it to the close scan", hhmm)
+            break
+        best.price, best.sl = plan.entry, plan.sl
+        if not telegram.send(format_early(best, scan, plan, bar), dry_run=_dry()):
+            continue
+        book[raw] = {"bar": bar.isoformat(), "side": best.side, "code": best.code,
+                     "name": best.name, "price": plan.entry, "at": stamp.strftime("%H:%M:%S")}
+        _save(st)
+        out.append({**best.__dict__, "early": True})
+        log.info("EARLY %s %s price=%.2f sl=%.2f @ %s (sent %s IST, %.0fs before close)",
+                 best.name, raw, plan.entry, plan.sl, hhmm, stamp.strftime("%H:%M:%S"),
+                 (close - stamp).total_seconds())
+    return out
 
 
 def _move_pct(pos: dict, price: float) -> float:
@@ -366,7 +535,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     log.info("fetching vix / %d sector indices", len(index_map))
     idx_tickers = [vix_sym] + list(index_map.values())
     m5 = data.fetch_many(idx_tickers, period_5m, "5m")
-    d1 = data.fetch_many(idx_tickers, period_1d, "1d")
+    d1 = data.fetch_daily(idx_tickers, period_1d)
     # Align all inputs to the Nifty decision bar, not a newer in-progress
     # sector/stock candle that happened to arrive during the fetch.
     m5 = {sym: df.loc[df.index <= last] if df is not None and not df.empty else df
@@ -409,6 +578,12 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             md.action = "SCAN LONG" if md.pick_side == 1 else "SCAN SHORT"
             md.pick_reason = f"FORCED {force_sector}"
 
+    # The next early (pre-close) pass scans this pick; it must be this bar's.
+    scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
+    st["scan"] = {"bar": md.bar_time, "sector": md.pick_sector if scanning else "WAIT",
+                  "side": md.pick_side if scanning else 0,
+                  "label": md.dir_label, "conf": md.dir_conf}
+
     # market / sector change alerts
     prev_m = st.get("market") or {}
     prev_s = st.get("sector") or {}
@@ -438,6 +613,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     if md.pick_sector == "WAIT" or md.action == "WAIT":
         if ping_on_wait and not market_changed and not sector_changed:
             log.info("WAIT — no complementary persistent sector")
+        if not allow_stale:
+            _settle_early(st, last, set(), "market/sector pick dropped to WAIT")
         _save(st)
         return result
 
@@ -466,10 +643,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _save(st)
         return result
     sm1 = data.fetch_many(current, "7d", "1m")
-    sd1 = data.fetch_many(current, period_1d, "1d")
+    sd1 = data.fetch_daily(current, period_1d)
 
     want_buy = md.pick_side == 1
     new_signals: list[dict] = []
+    handled: set[str] = set(missing)
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
@@ -478,6 +656,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         # later runs. A new session resets this in reset_if_new_day().
         if raw in sent or raw in positions:
             continue
+        handled.add(raw)
+        early = None if allow_stale else _open_early(st, raw, last)
         df5 = data.apply_1m_volume(sm5[ysym], sm1.get(ysym))
         try:
             fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
@@ -493,6 +673,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 log.info("SKIP historical/wrong-side %s fires=%s; decision bar=%s",
                          raw, ",".join(f"{s.name}@{s.time}" for s in fires),
                          last.strftime("%H:%M"))
+            if early:
+                _cancel_early(st, raw, early, "did not hold", close=float(df5["Close"].iloc[-1]))
             continue
         best = fresh[-1]
         if not allow_stale and not _recent_bar(last, now_ist()):
@@ -501,12 +683,20 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         plan = build_plan(best, df5, last, sd1.get(ysym))
         if plan is None:
             log.warning("SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close", raw, best.time)
+            if early:
+                _cancel_early(st, raw, early, "has no valid EMA9 stop",
+                              close=float(df5["Close"].iloc[-1]))
             continue
         best.price = plan.entry
         best.sl = plan.sl
-        if not telegram.send(format_stock(best, md, plan), dry_run=_dry()):
+        text = format_stock(best, md, plan)
+        if early:
+            text = _confirm_header(early, plan.entry) + text
+        if not telegram.send(text, dry_run=_dry()):
             log.warning("Telegram failed for %s; leaving unsent for retry", raw)
             continue
+        if early:
+            early["result"] = "confirmed"
         new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
                             "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
         sent[raw] = {
@@ -525,6 +715,9 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                  best.name, raw, plan.entry, plan.sl, plan.ema9, best.time,
                  now_ist().strftime("%H:%M:%S"))
 
+    if not allow_stale:
+        # Early alerts on names the close scan never looked at (sector switched).
+        _settle_early(st, last, handled, "is no longer in the scanned sector/side")
     st["sent"] = sent
     st["session"] = session
     _save(st)
@@ -533,6 +726,36 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
 
 def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:
+    """``_run_until_ready`` plus a final word on every early alert of that bar.
+
+    An early heads-up must never be left dangling: if the close scan could not
+    judge it before the freshness deadline (bar unpublished, feed stale, scan
+    error) the user is told it is unverified.
+    """
+    if expected_bar is None:
+        now = now_ist()
+        expected_bar = (now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+                        - timedelta(minutes=5))
+    try:
+        return _run_until_ready(expected_bar=expected_bar, force_sector=force_sector)
+    finally:
+        try:
+            if not _dry() and state.STATE_PATH.exists():
+                st = state.load()
+                if any(not e.get("result") for e in (st.get("early") or {}).values()):
+                    _settle_early(st, expected_bar, set(), "could not be checked in time",
+                                  result="unverified", older=True)
+        except Exception:  # never mask the scan's own outcome
+            log.exception("early-alert settlement failed")
+
+
+def _retry_delay(close_time: datetime, remaining: float) -> float:
+    """Poll fast right after the close (where it buys entry time), then back off."""
+    since = (now_ist() - close_time).total_seconds()
+    return max(0.0, min(5 if since < 45 else 15, remaining))
+
+
+def _run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:
     """Poll Yahoo for this specific closed bar, within the alert freshness limit.
 
     A workflow_dispatch often starts only seconds after the close; one fetch can
@@ -573,7 +796,10 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
         remaining = (deadline - now_ist()).total_seconds()
         if remaining <= 0:
             break
-        delay = min(15, remaining)
+        if (result is not None and result.get("market") == "CLOSED"
+                and expected_bar.time() >= clock_time(9, 30)):
+            break  # no bar at all today by 09:35 = holiday; polling cannot help
+        delay = _retry_delay(close_time, remaining)
         log.info("waiting for completed Yahoo bar %s (%.0fs until deadline); retry in %.0fs",
                  expected, remaining, delay)
         time.sleep(delay)
@@ -588,16 +814,57 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
     return run_once(force_sector=force_sector)
 
 
-def live_loop(grace: int | None = None) -> None:
+def _sleep_until(target: datetime) -> None:
+    while True:
+        left = (target - now_ist()).total_seconds()
+        if left <= 0:
+            return
+        time.sleep(min(left, 60))
+
+
+def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
+              exit_at_close: bool = False) -> str:
+    """Always-on loop: early pass before each 5m close, confirmed scan after it.
+
+    Per candle:
+      close - EARLY_ALERT_SECONDS  → ``run_early``  (unconfirmed heads-up)
+      close + POLL_GRACE_SECONDS   → ``run_until_ready`` (confirm / cancel / entry)
+
+    ``max_minutes`` and ``exit_at_close`` exist for hosts with a job time limit
+    (GitHub Actions): the loop returns ``"budget"`` right after a finished cycle
+    so a successor can take over, ``"closed"`` once the session is over, or
+    ``"holiday"`` when the exchange publishes no bar. Without them it runs
+    forever, as before.
+    """
     from .session import next_5m_close, is_weekday
 
-    grace = int(os.environ.get("POLL_GRACE_SECONDS", grace or 12))
-    log.info("live loop IST, grace=%ss after each 5m close", grace)
-    telegram.send("NSE live scanner started (5m · IST · yfinance).", dry_run=_dry())
+    grace = int(os.environ.get("POLL_GRACE_SECONDS", grace or 10))
+    lead = _early_lead()
+    started = now_ist()
+    now = now_ist()
+    if exit_at_close and (not is_weekday(now) or now.time() < clock_time(8, 30)
+                          or now.time() >= clock_time(15, 33)):
+        log.info("outside the NSE session (%s IST) — nothing to do", now.strftime("%a %H:%M"))
+        return "closed"
+    data.enable_daily_cache()
+    log.info("live loop IST: early pass %ss before each 5m close%s, confirm %ss after",
+             lead, "" if lead else " (disabled)", grace)
+    # Announce once per session: a planned handover between jobs is not news.
+    try:
+        resumed = state.load().get("session") == str(now.date())
+    except state.InvalidStateError:
+        raise
+    if not resumed:
+        telegram.send("NSE live scanner started (5m · IST · yfinance)"
+                      + (f" · early alerts {lead}s before close." if lead else "."), dry_run=_dry())
+    closed_streak = 0
+    holiday = None
     while True:
         now = now_ist()
-        if not is_weekday(now):
-            log.info("weekend — sleeping 30m")
+        if not is_weekday(now) or holiday == now.date():
+            if exit_at_close:
+                return "holiday" if holiday else "closed"
+            log.info("no session today — sleeping 30m")
             time.sleep(1800)
             continue
         t = now.time()
@@ -608,21 +875,39 @@ def live_loop(grace: int | None = None) -> None:
             log.info("pre-open, sleep %.0fs", sleep)
             time.sleep(min(sleep, 300))
             continue
-        if t.hour > 15 or (t.hour == 15 and t.minute >= 40):
+        if t.hour > 15 or (t.hour == 15 and t.minute >= 33):
+            if exit_at_close:
+                return "closed"
             log.info("session over, sleep until tomorrow")
             time.sleep(1800)
             continue
         nxt = next_5m_close(now)
-        wait = (nxt - now).total_seconds() + grace
-        if wait > 0:
-            log.info("sleep %.1fs until %s + %ss", wait, nxt.strftime("%H:%M"), grace)
-            time.sleep(min(wait, 330))
+        bar = nxt - timedelta(minutes=5)
+        in_session = clock_time(9, 15) <= bar.time() <= clock_time(15, 25)
+        early_at = nxt - timedelta(seconds=lead)
+        if lead and in_session and now_ist() < early_at + timedelta(seconds=min(20, lead / 2)):
+            log.info("sleep until %s (early pass for %s)", early_at.strftime("%H:%M:%S"),
+                     bar.strftime("%H:%M"))
+            _sleep_until(early_at)
+            try:
+                run_early(bar)
+            except Exception:
+                log.exception("early pass failed")
+        log.info("sleep until %s + %ss", nxt.strftime("%H:%M"), grace)
+        _sleep_until(nxt + timedelta(seconds=grace))
         # Same bounded retry path as Actions: skip an old signal, never replay
         # an earlier bar merely because Yahoo published the new one late.
-        if nxt.hour == 9 and nxt.minute == 15:
+        if not in_session:
             continue
         try:
-            run_until_ready(expected_bar=nxt - timedelta(minutes=5))
+            out = run_until_ready(expected_bar=bar)
+            closed_streak = closed_streak + 1 if out.get("market") == "CLOSED" else 0
+            if closed_streak >= 3 and bar.time() >= clock_time(9, 30):
+                holiday = now_ist().date()
+                log.info("no NSE bar published today — treating %s as a holiday", holiday)
         except Exception:
             log.exception("scan cycle failed")
             time.sleep(15)
+        if max_minutes and (now_ist() - started).total_seconds() / 60.0 >= max_minutes:
+            log.info("runtime budget of %.0f min reached — handing over", max_minutes)
+            return "budget"
