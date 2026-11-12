@@ -135,6 +135,75 @@ def fetch_many(tickers: Iterable[str], period: str, interval: str) -> dict[str, 
     return out
 
 
+# --- per-session daily cache (long-running live loop only) -------------------
+# Completed daily candles cannot change intraday, yet a one-shot scan refetches
+# ~3 batches of them after every 5m close. In the always-on loop that is pure
+# latency between the candle close and the Telegram POST.
+_DAILY_CACHE: dict = {"on": False, "day": None, "frames": {}}
+
+
+def enable_daily_cache(on: bool = True) -> None:
+    _DAILY_CACHE.update(on=bool(on), day=None, frames={})
+
+
+def fetch_daily(tickers: Iterable[str], period: str) -> dict[str, pd.DataFrame]:
+    """Daily candles; memoised per IST date once ``enable_daily_cache`` is on.
+
+    Cached frames hold COMPLETED sessions only. Today's still-forming daily row
+    is dropped so a snapshot taken at 10:00 can never be served as the day's
+    final OHLC later; every consumer already falls back to the 5m aggregate
+    for the running session.
+    """
+    tickers = list(dict.fromkeys(tickers))
+    if not _DAILY_CACHE["on"]:
+        return fetch_many(tickers, period, "1d")
+    today = pd.Timestamp.now(tz=IST).date()
+    if _DAILY_CACHE["day"] != today:
+        _DAILY_CACHE.update(day=today, frames={})
+    frames: dict = _DAILY_CACHE["frames"]
+    missing = [t for t in tickers if (t, period) not in frames]
+    if missing:
+        for t, df in fetch_many(missing, period, "1d").items():
+            if df is None or df.empty:
+                continue  # never cache a failed download; retry next cycle
+            frames[(t, period)] = df.loc[[ts.date() < today for ts in df.index]]
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    return {t: frames.get((t, period), empty) for t in tickers}
+
+
+def provisional_5m(df5: pd.DataFrame | None, df1m: pd.DataFrame | None, bar, now,
+                   max_stale: float = 150.0) -> pd.DataFrame | None:
+    """Completed 5m history plus the STILL-FORMING candle rebuilt from 1m bars.
+
+    ``bar`` is the open time of the forming 5m candle. The provisional row is
+    Open=first, High=max, Low=min, Close=last, Volume=sum of the 1m bars seen so
+    far inside ``[bar, bar+5m)``. Returns ``None`` — never a guess — when there
+    is no completed history, no 1m print inside the candle yet, or the newest
+    1m print is older than ``max_stale`` seconds (a frozen/lagging feed must not
+    be presented as the live price).
+    """
+    if df5 is None or df5.empty or df1m is None or df1m.empty:
+        return None
+    bar = pd.Timestamp(bar)
+    end = bar + pd.Timedelta(minutes=5)
+    done = df5.loc[df5.index < bar]
+    part = df1m.loc[(df1m.index >= bar) & (df1m.index < end)].dropna(subset=["Close"])
+    if done.empty or part.empty:
+        return None
+    if (pd.Timestamp(now) - part.index[-1]).total_seconds() > max_stale:
+        return None
+    opens = part["Open"].dropna()
+    row = pd.DataFrame(
+        {"Open": [float(opens.iloc[0]) if len(opens) else float(part["Close"].iloc[0])],
+         "High": [float(part[["High", "Close"]].max().max())],
+         "Low": [float(part[["Low", "Close"]].min().min())],
+         "Close": [float(part["Close"].iloc[-1])],
+         "Volume": [float(part["Volume"].fillna(0.0).sum())]},
+        index=pd.DatetimeIndex([bar]),
+    )
+    return pd.concat([done[["Open", "High", "Low", "Close", "Volume"]], row])
+
+
 def resample_1m_to_5m(df1m: pd.DataFrame) -> pd.DataFrame:
     """Aggregate 1m OHLCV to NSE 5m bars (label = bar open)."""
     if df1m is None or df1m.empty:

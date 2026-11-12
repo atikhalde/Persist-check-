@@ -1,10 +1,17 @@
-# NSE cash hours, Mon–Fri. GitHub’s scheduler minimum is 5 minutes and it
-# can still slip under load — this is a heartbeat, not a live feed.
-# Lowest delay: `python -m nse_scanner live` on a VPS in India.
+# NSE live scanner — ONE long-running job per session, not one job per candle.
 #
-# Crons are 2 minutes AFTER each 5m close (IST) so (1) Yahoo has published
-# the bar and (2) we avoid the :00/:05 UTC stampede that delays jobs.
-# Late runs and old Yahoo candles are discarded by MAX_ALERT_LAG_SECONDS.
+# Why: a job-per-candle design can never be early. Each run has to be triggered
+# (the external dispatcher fired 65s after the close, and since 10 Nov only once
+# an hour), boot a runner and reinstall Python (~20s) before it even asks Yahoo
+# for the candle. The loop below is already running when the candle closes, and
+# it also looks at the FORMING candle 60s before the close (early alerts).
+#
+# Every trigger is only a "make sure the loop is alive" signal:
+#   * loop already running  -> the guard job exits in seconds, nothing is sent
+#   * loop not running      -> this run becomes the loop
+# A job may not run for more than 6h, so the loop hands over to a fresh run
+# every 170 minutes (state is saved first, then the successor is dispatched).
+# If a run dies, the next trigger restarts it — keep the hourly dispatcher.
 #
 # Required secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # Optional mirror: TELEGRAM_BOT_TOKEN_2, TELEGRAM_CHAT_ID_2
@@ -13,24 +20,70 @@ name: NSE 5m live scan
 
 on:
   workflow_dispatch:
+    inputs:
+      handoff:
+        description: "Planned takeover from a run that reached its time budget"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print alerts to the log instead of sending them to Telegram"
+        type: boolean
+        default: false
   schedule:
-    # 09:22, 09:27 IST (09:15 / 09:20 bars closed)
-    - cron: "52,57 3 * * 1-5"
-    # 09:32–15:27 IST every 5m
-    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 4-9 * * 1-5"
-    # 15:32 IST (15:25 bar closed)
-    - cron: "2 10 * * 1-5"
+    # GitHub's scheduler has been hours late on this repo, so these are only a
+    # backup for the external dispatcher. 09:07 IST start + half-hourly checks.
+    - cron: "37 3 * * 1-5"
+    - cron: "7,37 4-9 * * 1-5"
 
-concurrency:
-  group: nse-live-scan
-  # Serialize runs: cancelling after a Telegram POST but before saving state
-  # can cause a duplicate on the next run. Late queued runs self-discard.
-  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write   # list runs (guard) and dispatch the successor (handover)
 
 jobs:
-  scan:
+  guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Is a scanner loop already running?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Outside the session there is nothing to start.
+          now=$(TZ=Asia/Kolkata date +%u%H%M)
+          dow=${now:0:1}; hm=$((10#${now:1}))
+          if [ "$dow" -gt 5 ] || [ "$hm" -lt 830 ] || [ "$hm" -ge 1533 ]; then
+            echo "outside NSE session (IST $now) - nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Only OLDER runs count, so two simultaneous triggers cannot both
+          # stand down. An older run that is itself just a guard (or a loop
+          # that is handing over) finishes within seconds: wait it out. One
+          # that is still active after 2 minutes is the live loop.
+          for i in $(seq 1 24); do
+            busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/live-scan.yml/runs?per_page=40" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID)] | length")
+            if [ "$busy" = "0" ]; then
+              echo "no other run active - this run becomes the scanner loop"
+              echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 5
+          done
+          echo "scanner loop already running ($busy older run active) - standing down"
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      # Belt and braces: two loops would double-send. Never cancel a running
+      # loop (a Telegram POST may be in flight before its state is saved).
+      group: nse-live-scan
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -60,30 +113,44 @@ jobs:
           # The second prefix restores the last session's open EMA9 trails.
           # reset_if_new_day clears sent entries but keeps open positions.
 
-      - name: Scan last 5m bar
+      - name: Live loop (early pass before each 5m close, confirm after it)
+        id: scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN_2: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
           TELEGRAM_CHAT_ID_2: ${{ secrets.TELEGRAM_CHAT_ID_2 }}
           LOG_LEVEL: INFO
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # Seconds before each 5m close at which the forming candle is judged
+          # and an "EARLY (unconfirmed)" alert may be sent. 0 = close-only.
+          EARLY_ALERT_SECONDS: "60"
+          # Seconds after the close before the confirmed scan asks Yahoo.
+          POLL_GRACE_SECONDS: "10"
           MAX_ALERT_LAG_SECONDS: "180"
-        # workflow_dispatch also fires at the exact UTC 5m boundary on this
-        # repo. Yahoo's closed candle may not yet be published on first fetch;
-        # retry only until the fixed freshness deadline, never replay old bars.
-        run: python -m nse_scanner once --wait-for-bar
+        run: python -m nse_scanner live --exit-at-close --max-minutes 170
 
       # A corrupt ledger must not turn into another immutable cache snapshot.
-      # Validate even if the scan failed after successfully sending a message:
-      # in that case save the good ledger to prevent a duplicate next run.
+      # Validate and save even if the loop failed or was cancelled: whatever
+      # was already sent must be remembered by the next run.
       - name: Validate scanner state
         id: validate
-        if: ${{ !cancelled() && hashFiles('state/scan_state.json') != '' }}
+        if: ${{ always() && hashFiles('state/scan_state.json') != '' }}
         run: python -c 'from nse_scanner.state import load; load()'
 
       - name: Save updated scanner state
-        if: ${{ !cancelled() && steps.validate.outcome == 'success' }}
+        if: ${{ always() && steps.validate.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: state/scan_state.json
           key: nse-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Only after the state is saved: the successor's guard waits for this run
+      # to finish, then restores exactly this snapshot.
+      - name: Hand over to a fresh run
+        if: ${{ steps.scan.outputs.handoff == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh workflow run live-scan.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          -f handoff=true -f dry_run=${{ inputs.dry_run && 'true' || 'false' }}

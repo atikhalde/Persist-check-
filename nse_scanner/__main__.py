@@ -4,6 +4,7 @@
   python -m nse_scanner live
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
+  python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
 """
 
 from __future__ import annotations
@@ -40,11 +41,17 @@ def _setup_log(level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
-    p.add_argument("cmd", choices=["once", "live", "doctor", "backtest", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | doctor | backtest | dual | live-dual | sector-follow | live-sector-follow")
+    p.add_argument("cmd", choices=["once", "live", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
     p.add_argument("--wait-for-bar", action="store_true", help="once: retry the just-closed bar until fresh data arrives or the 3m deadline")
+    p.add_argument("--max-minutes", type=float, default=None,
+                   help="live: return after this many minutes (job time limits); prints handoff=true")
+    p.add_argument("--exit-at-close", action="store_true",
+                   help="live: exit when the NSE session is over instead of sleeping until tomorrow")
+    p.add_argument("--lead", type=int, default=60,
+                   help="early-check: seconds before the 5m close at which the forming candle is judged")
     p.add_argument("--date", default="2026-10-01", help="backtest session YYYY-MM-DD (IST)")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args(argv)
@@ -114,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
 
         live_loop_sector_follow()
         return 0
+    if args.cmd == "early-check":
+        from datetime import date as _date
+        from .early_check import render, run
+
+        d = _date.fromisoformat(args.date)
+        print(render(run(d, args.sector, args.lead), d, args.lead))
+        return 0
     if args.cmd == "backtest":
         from datetime import date as _date
         from pathlib import Path
@@ -130,7 +144,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     from .pipeline import live_loop
 
-    live_loop()
+    reason = live_loop(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close)
+    print(f"live loop ended: {reason}")
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:  # lets the workflow start a successor only on a planned handover
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write(f"handoff={'true' if reason == 'budget' else 'false'}\n")
     return 0
 
 
