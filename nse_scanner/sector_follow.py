@@ -154,43 +154,17 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
     # Sort: live-flow qualified first, then by score descending.
     candidates.sort(key=lambda c: (not c["qualified"], -c["score"]))
 
-    # Pick top candidate.
-    pick = candidates[0]
-    pick_name = pick["name"]
-    pick_side = pick["side"]
-
     # When Nifty is NEUTRAL, only scan bull (PERSIST +) sectors — we don't
-    # want to short into a neutral index. Fall back to next bull candidate.
-    if md.dir_state == 0 and pick_side != 1:
-        bull_candidates = [c for c in candidates if c["side"] == 1]
-        if not bull_candidates:
-            return {"bar": md.bar_time, "signals": [], "skipped": "no_bull_sector_neutral_market"}
-        pick = bull_candidates[0]
-        pick_name = pick["name"]
-        pick_side = 1
+    # want to short into a neutral index.
+    if md.dir_state == 0:
+        candidates = [c for c in candidates if c["side"] == 1]
+        if not candidates:
+            return {"bar": md.bar_time, "signals": [],
+                    "skipped": "no_bull_sector_neutral_market"}
 
-    # Override md for scanning (local copy only — original md is unchanged).
-    md.pick_sector = pick_name
-    md.pick_side = pick_side
-    md.action = "SCAN LONG" if pick_side == 1 else "SCAN SHORT"
-    md.pick_reason = f"SECTOR FOLLOW {pick_name} (persistent, market {md.dir_label})"
-
-    sec_cfg = uni["sectors"][pick_name]
-    stocks = sec_cfg["stocks"]
-    tickers = [data.yahoo_stock(s) for s in stocks]
-    sm5 = data.fetch_many(tickers, period_5m, "5m")
-    sm5 = {sym: df.loc[df.index <= last] if df is not None and not df.empty else df
-           for sym, df in sm5.items()}
-    current = [sym for sym in tickers if sm5.get(sym) is not None
-               and not sm5[sym].empty and to_ist(sm5[sym].index[-1]) == last]
-
-    if not current:
-        return {"bar": md.bar_time, "signals": [], "skipped": "no_stock_bars"}
-
-    sm1 = data.fetch_many(current, "7d", "1m")
-    sd1 = data.fetch_many(current, period_1d, "1d")
-
-    want_buy = pick_side == 1
+    # Fall-through: try each candidate in score order. If the top candidate
+    # (e.g. FIN at score 65) has no fresh fire on the current bar, move to
+    # the next (e.g. REALTY at score 61) until one produces an alert.
     sent = _load_sf_state()
     # Reset dedupe on new session.
     if sent.get("session") != session:
@@ -199,59 +173,97 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
     sent.setdefault("positions", {})
 
     new_signals = []
+    picked_sector = None
+    picked_side = 0
 
-    for raw, ysym in zip(stocks, tickers):
-        if ysym not in current:
-            continue
-        if raw in sent["sent"] or raw in sent["positions"]:
-            continue
+    for cand in candidates:
+        pick_name = cand["name"]
+        pick_side = cand["side"]
+        want_buy = pick_side == 1
 
-        df5 = data.apply_1m_volume(sm5[ysym], sm1.get(ysym))
-        try:
-            fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
-        except Exception as e:
-            log.exception("Sector follow scan failed %s: %s", raw, e)
-            continue
+        sec_cfg = uni["sectors"][pick_name]
+        stocks = sec_cfg["stocks"]
+        tickers = [data.yahoo_stock(s) for s in stocks]
+        sm5 = data.fetch_many(tickers, period_5m, "5m")
+        sm5 = {sym: df.loc[df.index <= last] if df is not None and not df.empty else df
+               for sym, df in sm5.items()}
+        current = [sym for sym in tickers if sm5.get(sym) is not None
+                   and not sm5[sym].empty and to_ist(sm5[sym].index[-1]) == last]
 
-        fresh = [s for s in fires if s.time == last.strftime("%H:%M")
-                 and s.side == ("BUY" if want_buy else "SELL")]
-        if not fresh:
-            continue
-
-        best = fresh[-1]
-        if not _recent_bar(last, now):
-            continue
-
-        plan = build_plan(best, df5, last, sd1.get(ysym))
-        if plan is None:
+        if not current:
+            log.info("Sector follow %s: no stock bars for bar %s",
+                     pick_name, last.strftime("%H:%M"))
             continue
 
-        best.price = plan.entry
-        best.sl = plan.sl
+        sm1 = data.fetch_many(current, "7d", "1m")
+        sd1 = data.fetch_many(current, period_1d, "1d")
 
-        if not telegram.send(format_sector_follow_alert(best, md, plan), dry_run=_dry()):
-            log.warning("Sector follow Telegram failed for %s", raw)
-            continue
+        for raw, ysym in zip(stocks, tickers):
+            if ysym not in current:
+                continue
+            if raw in sent["sent"] or raw in sent["positions"]:
+                continue
 
-        new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
-                            "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
+            df5 = data.apply_1m_volume(sm5[ysym], sm1.get(ysym))
+            try:
+                fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
+            except Exception as e:
+                log.exception("Sector follow scan failed %s: %s", raw, e)
+                continue
 
-        sent["sent"][raw] = {
-            "code": best.code, "name": best.name, "time": best.time,
-            "price": best.price,
-        }
-        sent["positions"][raw] = {
-            "side": best.side, "entry": plan.entry, "sl": plan.sl,
-            "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
-            "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
-        }
-        _save_sf_state(sent)
-        log.info("SECTOR FOLLOW ALERT %s %s entry=%.2f sl=%.2f @ %s",
-                 best.name, raw, plan.entry, plan.sl, best.time)
+            fresh = [s for s in fires if s.time == last.strftime("%H:%M")
+                     and s.side == ("BUY" if want_buy else "SELL")]
+            if not fresh:
+                continue
+
+            best = fresh[-1]
+            if not _recent_bar(last, now):
+                continue
+
+            plan = build_plan(best, df5, last, sd1.get(ysym))
+            if plan is None:
+                continue
+
+            best.price = plan.entry
+            best.sl = plan.sl
+
+            # Override md for this alert only (local copy — original md unchanged).
+            md.pick_sector = pick_name
+            md.pick_side = pick_side
+            md.action = "SCAN LONG" if pick_side == 1 else "SCAN SHORT"
+            md.pick_reason = f"SECTOR FOLLOW {pick_name} (persistent, market {md.dir_label})"
+
+            if not telegram.send(format_sector_follow_alert(best, md, plan), dry_run=_dry()):
+                log.warning("Sector follow Telegram failed for %s", raw)
+                continue
+
+            new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
+                                "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
+
+            sent["sent"][raw] = {
+                "code": best.code, "name": best.name, "time": best.time,
+                "price": best.price,
+            }
+            sent["positions"][raw] = {
+                "side": best.side, "entry": plan.entry, "sl": plan.sl,
+                "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+                "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
+            }
+            _save_sf_state(sent)
+            picked_sector = pick_name
+            picked_side = pick_side
+            log.info("SECTOR FOLLOW ALERT %s %s entry=%.2f sl=%.2f @ %s",
+                     best.name, raw, plan.entry, plan.sl, best.time)
+
+            # One entry per cycle — stop after first successful alert.
+            break
+
+        if new_signals:
+            break
 
     return {"bar": md.bar_time, "signals": new_signals,
-            "market": md.dir_label, "pick": pick_name,
-            "action": md.action}
+            "market": md.dir_label, "pick": picked_sector or "",
+            "action": "SCAN LONG" if picked_side == 1 else "WAIT"}
 
 
 def live_loop_sector_follow(*, grace: int | None = None) -> None:
