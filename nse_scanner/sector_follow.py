@@ -17,6 +17,8 @@ from datetime import datetime, time as clock_time, timedelta
 
 from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
+from .oi_data import CSV_OIReader, StubOIReader
+from .oi_filter import should_take_entry
 from .session import now_ist, to_ist
 from .stock import scan_stock
 from .trade import build_plan
@@ -37,15 +39,20 @@ def _recent_bar(bar: datetime, now: datetime) -> bool:
     return 0 <= age <= _max_lag()
 
 
-def format_sector_follow_alert(sig, md, plan) -> str:
+def format_sector_follow_alert(sig, md, plan, reading=None) -> str:
     """Separate message format — clearly labeled SECTOR FOLLOW."""
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
+    oi_line = ""
+    if reading is not None:
+        oi_line = (f"OI Regime: <b>{reading.regime.value}</b>\n"
+                   f"OI chg: {reading.oi_chg_pct:+.2f}%  |  Price chg: {reading.price_chg_pct:+.2f}%\n")
     return (
         f"{arrow} <b>SECTOR FOLLOW</b> | <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
         f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f}\n"
+        f"{oi_line}"
         f"Reason: persistent sector scanned despite {md.dir_label} market\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
         f"5m bar {sig.time}–{close_time} IST\n"
@@ -172,6 +179,10 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
     sent.setdefault("sent", {})
     sent.setdefault("positions", {})
 
+    oi_source = os.environ.get("OI_SOURCE", "stub")
+    oi_file = os.environ.get("OI_FILE", "data/oi_history.csv")
+    oi_reader = CSV_OIReader(oi_file) if oi_source == "csv" else StubOIReader()
+
     new_signals = []
     picked_sector = None
     picked_side = 0
@@ -227,18 +238,28 @@ def run_once_sector_follow(*, force_sector: str | None = None) -> dict:
             best.price = plan.entry
             best.sl = plan.sl
 
+            # OI × Price confirmation: only accept Long Build-up (price ↑, OI ↑)
+            # for buys. Rejects short-covering rallies that reverse (like FIN on 12-Nov).
+            reading = oi_reader.snapshot(raw, last)
+            if not should_take_entry(best.side, reading):
+                log.info("Sector follow OI rejected %s: %s", raw,
+                         reading.regime.value if reading else "no_data")
+                continue
+
             # Override md for this alert only (local copy — original md unchanged).
             md.pick_sector = pick_name
             md.pick_side = pick_side
             md.action = "SCAN LONG" if pick_side == 1 else "SCAN SHORT"
             md.pick_reason = f"SECTOR FOLLOW {pick_name} (persistent, market {md.dir_label})"
 
-            if not telegram.send(format_sector_follow_alert(best, md, plan), dry_run=_dry()):
+            if not telegram.send(format_sector_follow_alert(best, md, plan, reading), dry_run=_dry()):
                 log.warning("Sector follow Telegram failed for %s", raw)
                 continue
 
             new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
-                                "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
+                                "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+                                "oi_regime": reading.regime.value if reading else None,
+                                "oi_chg_pct": reading.oi_chg_pct if reading else None})
 
             sent["sent"][raw] = {
                 "code": best.code, "name": best.name, "time": best.time,
