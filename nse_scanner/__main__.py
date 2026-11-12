@@ -40,7 +40,7 @@ def _setup_log(level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
-    p.add_argument("cmd", choices=["once", "live", "doctor", "backtest", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | doctor | backtest | dual | live-dual | sector-follow | live-sector-follow")
+    p.add_argument("cmd", choices=["once", "live", "doctor", "backtest"], help="once | live | doctor | backtest")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
@@ -70,49 +70,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         for s in out["signals"]:
             print(f"  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
-        return 0
-    if args.cmd == "dual":
-        from .oi_live import run_once_dual
-
-        out = run_once_dual(
-            force_sector=args.sector,
-            oi_source=os.environ.get("OI_SOURCE", "stub"),
-            oi_file=os.environ.get("OI_FILE", "data/oi_history.csv"),
-        )
-        orig = out["original"]
-        oi = out["oi"]
-        print(
-            f"{orig['bar']}  {orig['market']}  pick={orig['pick']}  {orig['action']}  "
-            f"orig_alerts={len(orig['signals'])}  oi_alerts={len(oi['signals'])}"
-        )
-        for s in orig["signals"]:
-            print(f"  ORIG  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
-        for s in oi["signals"]:
-            print(f"  OI    {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}  OI={s.get('oi_regime')}")
-        return 0
-    if args.cmd == "live-dual":
-        from .oi_live import live_loop_dual
-
-        live_loop_dual(
-            oi_source=os.environ.get("OI_SOURCE", "stub"),
-            oi_file=os.environ.get("OI_FILE", "data/oi_history.csv"),
-        )
-        return 0
-    if args.cmd == "sector-follow":
-        from .sector_follow import run_once_sector_follow
-
-        out = run_once_sector_follow(force_sector=args.sector)
-        print(
-            f"{out['bar']}  {out['market']}  pick={out['pick']}  {out['action']}  "
-            f"sf_alerts={len(out['signals'])}  skipped={out.get('skipped','-')}"
-        )
-        for s in out["signals"]:
-            print(f"  SF    {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
-        return 0
-    if args.cmd == "live-sector-follow":
-        from .sector_follow import live_loop_sector_follow
-
-        live_loop_sector_follow()
         return 0
     if args.cmd == "backtest":
         from datetime import date as _date
