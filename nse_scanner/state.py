@@ -27,8 +27,30 @@ def signal_rank(code: int) -> int:
     return RANK.get(int(code), 0)
 
 
+# A dry-run LOOP needs a ledger to behave like the real one (the early pass
+# reads the previous candle's pick, a confirm needs its early alert), but it
+# must never touch the real ledger. It gets its own scratch file instead.
+_scratch: Path | None = None
+
+
+def use_scratch(on: bool = True) -> None:
+    """Route load/save to an empty throw-away ledger (dry-run live loop)."""
+    global _scratch
+    _scratch = STATE_PATH.with_name("scan_state.dry.json") if on else None
+    if _scratch is not None and _scratch.exists():
+        _scratch.unlink()
+
+
+def scratch_active() -> bool:
+    return _scratch is not None
+
+
+def active_path() -> Path:
+    return _scratch or STATE_PATH
+
+
 def load(path: Path | None = None) -> dict:
-    p = path or STATE_PATH
+    p = path or active_path()
     if not p.exists():
         return {}
     try:
@@ -44,7 +66,7 @@ def load(path: Path | None = None) -> dict:
 
 
 def save(state: dict, path: Path | None = None) -> None:
-    p = path or STATE_PATH
+    p = path or active_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")

@@ -69,6 +69,10 @@ class LiveAlertTests(TestCase):
             patch.object(pipeline, "format_stock", return_value="stock"),
             patch.object(pipeline, "scan_stock", return_value=[signal()]),
             patch.object(pipeline.telegram, "send", return_value=True),
+            # These tests feed the same frames for every interval, so there is no
+            # realistic 1m stream: treat the feed as settled (see test_early_alerts
+            # for the half-published-candle rules themselves).
+            patch.object(pipeline, "_unsettled", return_value=(set(), False)),
         ]
         self.mocks = [p.start() for p in self.contexts]
         for p in self.contexts:
@@ -76,6 +80,7 @@ class LiveAlertTests(TestCase):
         self.fetch_many = self.mocks[3]
         self.scan = self.mocks[8]
         self.send = self.mocks[9]
+        self.settled = self.contexts[10]
 
     def market_at_bar(self, df, *args):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")

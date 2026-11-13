@@ -17,6 +17,8 @@
 # Optional mirror: TELEGRAM_BOT_TOKEN_2, TELEGRAM_CHAT_ID_2
 
 name: NSE 5m live scan
+# The guard recognises dry runs by this title and does not count them as the loop.
+run-name: ${{ inputs.dry_run && 'DRY RUN - NSE live scan' || 'NSE 5m live scan' }}
 
 on:
   workflow_dispatch:
@@ -58,6 +60,12 @@ jobs:
             echo "outside NSE session (IST $now) - nothing to do"
             echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          # A dry run sends nothing and keeps its own throw-away ledger, so it
+          # may run beside the real loop (that is the only time it is useful).
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry run - starting next to any live loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           # Only OLDER runs count, so two simultaneous triggers cannot both
           # stand down. An older run that is itself just a guard (or a loop
           # that is handing over) finishes within seconds: wait it out. One
@@ -65,7 +73,7 @@ jobs:
           answered=false
           for i in $(seq 1 24); do
             busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/live-scan.yml/runs?per_page=40" \
-              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID)] | length" || true)
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID and ((.display_title // \"\") | startswith(\"DRY RUN\") | not))] | length" || true)
             if [ "$busy" = "0" ]; then
               echo "no other run active - this run becomes the scanner loop"
               echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
@@ -91,7 +99,7 @@ jobs:
     concurrency:
       # Belt and braces: two loops would double-send. Never cancel a running
       # loop (a Telegram POST may be in flight before its state is saved).
-      group: nse-live-scan
+      group: nse-live-scan${{ inputs.dry_run && '-dry' || '' }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +119,10 @@ jobs:
       # Cache keys are IMMUTABLE. A fixed date key restores the *first* run's
       # state forever and repeats its alerts every 5m. Use one key per run,
       # restoring the most recently created cache from this IST session.
+      # Dry runs never read or write the real ledger snapshot: a copy saved by a
+      # dry run would become the newest cache and be restored by the real loop.
       - name: Restore scanner state
+        if: ${{ !inputs.dry_run }}
         uses: actions/cache/restore@v4
         with:
           path: state/scan_state.json
@@ -147,7 +158,7 @@ jobs:
       # was already sent must be remembered by the next run.
       - name: Validate scanner state
         id: validate
-        if: ${{ always() && hashFiles('state/scan_state.json') != '' }}
+        if: ${{ always() && !inputs.dry_run && hashFiles('state/scan_state.json') != '' }}
         run: python -c 'from nse_scanner.state import load; load()'
 
       - name: Save updated scanner state

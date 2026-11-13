@@ -172,7 +172,7 @@ def fetch_daily(tickers: Iterable[str], period: str) -> dict[str, pd.DataFrame]:
 
 
 def provisional_5m(df5: pd.DataFrame | None, df1m: pd.DataFrame | None, bar, now,
-                   max_stale: float = 150.0) -> pd.DataFrame | None:
+                   max_stale: float = 100.0) -> pd.DataFrame | None:
     """Completed 5m history plus the STILL-FORMING candle rebuilt from 1m bars.
 
     ``bar`` is the open time of the forming 5m candle. The provisional row is
