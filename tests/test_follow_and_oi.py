@@ -48,6 +48,42 @@ class FollowScanTests(TestCase):
         self.assertEqual([c.args[0] for c in self.scan.call_args_list], ["ABC", "PQR"])
         self.assertFalse(state.load()["scan"]["follow"])
 
+    def test_summary_names_the_sectors_and_the_signals_that_were_not_alerted(self):
+        fires = {"ABC": [signal(time="09:30")],                      # fired before the pick
+                 "PQR": [signal(time="10:00", side="SELL")],         # this candle, wrong side
+                 "XYZ": [signal(time="09:40"), signal(time="10:00", side="SELL")]}
+        self.scan.side_effect = lambda raw, *a, **k: fires[raw]
+        for _ in range(3):                                           # retries of one candle
+            self.assertEqual(pipeline.run_once()["signals"], [])
+        text = pipeline.format_summary(state.load())
+        self.assertIn("Candles scanned 1 of 75 · with a sector pick 1", text)
+        self.assertIn("Sectors picked (candles): PHA long, follow 1 · ENE long, follow 1", text)
+        self.assertIn("Signals not alerted: 2 fired before their sector was picked "
+                      "(ABC 09:30, XYZ 09:40) · 2 on the opposite side to the pick "
+                      "(PQR 10:00, XYZ 10:00)", text)
+
+    def test_summary_says_so_when_nothing_fired_or_nothing_was_picked(self):
+        self.scan.side_effect = None
+        self.scan.return_value = []
+        pipeline.run_once()
+        text = pipeline.format_summary(state.load())
+        self.assertIn("Signals not alerted: none — no stock in the picked sectors gave a signal", text)
+        waited = {"session": "x", "stats": {"candles": 75, "picks": 0}}
+        text = pipeline.format_summary(waited)
+        self.assertIn("Sectors picked: none — the market said WAIT on every scanned candle", text)
+        self.assertIn("Signals not alerted: none", text)
+
+    def test_a_stock_that_was_alerted_is_not_listed_as_missed(self):
+        st = {"session": "x", "sent": {"ABC": {}},
+              "stats": {"candles": 5, "picks": 5, "entries": 1, "lag_sum": 10.0,
+                        "sectors": {"IT long": 5},
+                        "rejected": {"earlier": {"ABC": "ABC 09:30"},
+                                     "no_stop": {"DEF@10:00": "DEF 10:00"}}}}
+        text = pipeline.format_summary(st)
+        self.assertIn("Sectors picked (candles): IT long 5", text)
+        self.assertIn("Signals not alerted: 1 without a valid EMA9 stop (DEF 10:00)", text)
+        self.assertNotIn("ABC 09:30", text)
+
     def test_old_commands_run_the_main_scanner(self):
         with patch.object(pipeline, "run_once", return_value={"signals": [{"oi_regime": "LONG_BUILDUP"}, {}]}) as once:
             self.assertEqual(len(sector_follow.run_once_sector_follow(force_sector="IT")["signals"]), 2)
