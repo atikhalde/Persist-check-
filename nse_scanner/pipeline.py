@@ -201,6 +201,52 @@ def _bump(st: dict, key: str, n: float = 1) -> None:
     stats[key] = stats.get(key, 0) + n
 
 
+def _note_reject(st: dict, kind: str, raw: str, detail: str, *, per_bar: str | None = None) -> None:
+    """Remember a stock signal that did not become an alert (for the summary).
+
+    Keyed so that the retries of one candle, and a stale signal that shows up on
+    every later candle, are each counted once.
+    """
+    book = st.setdefault("stats", {}).setdefault("rejected", {}).setdefault(kind, {})
+    book.setdefault(f"{raw}@{per_bar}" if per_bar else raw, detail)
+
+
+_REJECT_TEXT = (
+    ("earlier", "fired before their sector was picked"),
+    ("opposite", "on the opposite side to the pick"),
+    ("no_stop", "without a valid EMA9 stop"),
+    ("oi", "not confirmed by open interest"),
+    ("late", "scanned too late"),
+)
+
+
+def _summary_sectors(x: dict) -> str:
+    picked = x.get("sectors") or {}
+    if not picked:
+        return "Sectors picked: none — the market said WAIT on every scanned candle"
+    parts = [f"{name} {n}" for name, n in sorted(picked.items(), key=lambda kv: -kv[1])]
+    return "Sectors picked (candles): " + " · ".join(parts)
+
+
+def _summary_rejects(st: dict) -> str:
+    x = st.get("stats") or {}
+    rejected = x.get("rejected") or {}
+    alerted = set(st.get("sent") or {})
+    parts = []
+    for kind, text in _REJECT_TEXT:
+        items = {k: v for k, v in (rejected.get(kind) or {}).items()
+                 if not (kind == "earlier" and k in alerted)}
+        if not items:
+            continue
+        shown = ", ".join(list(items.values())[:6]) + (" …" if len(items) > 6 else "")
+        parts.append(f"{len(items)} {text} ({shown})")
+    if parts:
+        return "Signals not alerted: " + " · ".join(parts)
+    if x.get("picks") and not x.get("entries"):
+        return "Signals not alerted: none — no stock in the picked sectors gave a signal"
+    return "Signals not alerted: none"
+
+
 def _note_feed_age(st: dict, prefix: str, frames: dict) -> None:
     """Record how old the newest 1m bar of each stock is at this moment."""
     now = pd.Timestamp(now_ist())
@@ -220,6 +266,7 @@ def format_summary(st: dict) -> str | None:
     age = lambda v: "no 1m data" if v is None else f"newest 1m bar {v:.0f}s old on average"
     lines = [f"📊 <b>Scanner summary {st.get('session', '')}</b>",
              f"Candles scanned {x['candles']} of 75 · with a sector pick {x.get('picks', 0)}",
+             _summary_sectors(x),
              f"Early passes {x.get('early_passes', 0)} · with live 1m data {x.get('early_live', 0)}"
              f" · {age(avg('early_age'))}",
              f"Early alerts {x.get('early_sent', 0)}: confirmed {x.get('confirmed', 0)}"
@@ -227,6 +274,7 @@ def format_summary(st: dict) -> str | None:
              f"Entries {x.get('entries', 0)}"
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
+             _summary_rejects(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
     return "\n".join(lines)
 
@@ -778,6 +826,13 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
         _bump(st, "candles")
         _bump(st, "picks", 1 if scanning else 0)
+        if scanning:
+            side = "long" if md.pick_side == 1 else "short"
+            tag = ", follow" if _follow_tag(md) else ""
+            book = st["stats"].setdefault("sectors", {})
+            for name in [md.pick_sector, *extra]:
+                key = f"{name} {side}{tag}"
+                book[key] = book.get(key, 0) + 1
 
     # market / sector change alerts
     prev_m = st.get("market") or {}
@@ -890,16 +945,26 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 log.info("SKIP historical/wrong-side %s fires=%s; decision bar=%s",
                          raw, ",".join(f"{s.name}@{s.time}" for s in fires),
                          last.strftime("%H:%M"))
+                if not allow_stale:
+                    hhmm, want = last.strftime("%H:%M"), "BUY" if want_buy else "SELL"
+                    if any(s.time == hhmm for s in fires):
+                        _note_reject(st, "opposite", raw, f"{raw} {hhmm}", per_bar=hhmm)
+                    before = [s.time for s in fires if s.side == want and s.time < hhmm]
+                    if before:
+                        _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
             if early:
                 _cancel_early(st, raw, early, "did not hold", close=float(df5["Close"].iloc[-1]))
             continue
         best = fresh[-1]
         if not allow_stale and not _recent_bar(last, now_ist()):
             log.warning("scan finished too late for %s @ %s; dropping entry", raw, best.time)
+            _note_reject(st, "late", raw, f"{raw} {best.time}", per_bar=best.time)
             continue
         plan = build_plan(best, df5, last, sd1.get(ysym))
         if plan is None:
             log.warning("SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close", raw, best.time)
+            if not allow_stale:
+                _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
                 _cancel_early(st, raw, early, "has no valid EMA9 stop",
                               close=float(df5["Close"].iloc[-1]))
@@ -910,6 +975,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
             why = reading.regime.value if reading else "no OI row"
             log.info("OI filter rejected %s %s @ %s: %s", raw, best.side, best.time, why)
+            _note_reject(st, "oi", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
                 _cancel_early(st, raw, early, f"was not confirmed by open interest ({why})",
                               close=float(df5["Close"].iloc[-1]))

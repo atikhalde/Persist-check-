@@ -244,11 +244,21 @@ happens you get one `⚠ Yahoo feed is delayed` message per session.
 ```
 📊 Scanner summary 2026-11-13
 Candles scanned 75 of 75 · with a sector pick 54
+Sectors picked (candles): PHA long, follow 31 · ENE long, follow 18 · IT long 23
 Early passes 53 · with live 1m data 53 · newest 1m bar 62s old on average
 Early alerts 3: confirmed 2 · cancelled 1 · unverified 0
 Entries 4 · sent 14s after the close on average, slowest 47s
+Signals not alerted: 3 fired before their sector was picked (LAURUSLABS 09:30, DRREDDY 09:30, DIVISLAB 09:30) · 1 on the opposite side to the pick (CIPLA 11:05)
 At the confirm scan: newest 1m bar 19s old on average
 ```
+
+`Sectors picked` counts the candles on which each sector was scanned (`follow` =
+picked while Nifty was NEUTRAL). `Signals not alerted` lists stock signals the
+scanner saw in those sectors but did not send, and why: the stock had already fired
+before its sector was picked (the scanner only alerts a signal on the candle it
+fires), it fired against the pick's side, it had no valid EMA9 stop, open interest
+did not confirm it, or the scan finished too late. Stocks in sectors that were never
+picked are not scanned and cannot appear here.
 
 `with live 1m data 0` or a very old "newest 1m bar" means Yahoo's feed is too
 delayed for early alerts; `Candles scanned` well below 75 means the loop started
