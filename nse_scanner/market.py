@@ -9,10 +9,13 @@ VIX, Nifty structure, 15-sector breadth, live flow and persistent +/- are kept.
 Scanner pick (user rule):
   only the strongest PERSISTENT bull or bear sector that COMPLEMENTS
   the committed Nifty direction that day. CHOP / NEUTRAL / conflict → WAIT.
+  Exception (sector follow): Nifty NEUTRAL + a qualified #1 PERSIST + sector
+  → scan that sector LONG (see ``_follow_pick``).
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -454,6 +457,10 @@ def run_market(
         action = "SCAN LONG"
     elif pick and pick_side == -1 and commit_side == -1:
         action = "SCAN SHORT"
+    elif not pick and commit_side == 0:
+        follow, follow_reason = _follow_pick(persist_plus)
+        if follow:
+            pick, pick_side, reason, action = follow, 1, follow_reason, "SCAN LONG"
 
     return MarketDecision(
         session=str(sid),
@@ -706,6 +713,38 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
         score=score,
         qualified=bool(qualified),
     )
+
+
+SECTOR_FOLLOW_PREFIX = "SECTOR FOLLOW"
+
+
+def _follow_pick(plus):
+    """Sector to scan LONG while Nifty itself is NEUTRAL (no committed side).
+
+    The complementary pick needs a committed Nifty direction, so on a flat index
+    it waits all day even when one sector is plainly leading. This is the
+    fallback for that case: the #1 PERSIST + sector, only if it is a real leader
+    right now — persist score high enough, up on the day, in the upper part of
+    its day range, positive RS vs Nifty, bullish live flow, and not currently
+    rolling over. (The stricter live-flow "qualified" flag also demands a fresh
+    push in the last few bars, so it flickers on and off inside a steady trend;
+    it is not used here.) Longs only — a flat index gives no reason to short.
+
+    Off with ``SECTOR_FOLLOW=0``; threshold ``SECTOR_FOLLOW_MIN_PERSIST`` (55).
+    """
+    if os.environ.get("SECTOR_FOLLOW", "1") == "0" or not plus:
+        return None, ""
+    need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST", "55"))
+    s = plus[0]
+    leading = (
+        s.side == 1 and s.persist_bull >= need
+        and s.day_ret >= BULL_MIN_DAY and s.pos >= BULL_MIN_POS and s.rs > 0
+        and s.bull >= FLOW_MIN and s.recent > -RECENT_MOVE_MIN
+    )
+    if leading:
+        return s.name, (f"{SECTOR_FOLLOW_PREFIX} — Nifty NEUTRAL, {s.name} leads "
+                        f"(persist {s.persist_bull:.0f}, day {s.day_ret:+.2f}%, range pos {s.pos:.0f})")
+    return None, ""
 
 
 def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_day_ret):

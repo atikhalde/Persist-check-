@@ -260,6 +260,16 @@ runs the complete loop — early pass, confirm/cancel, hit alerts, summary — p
 instead of sending. It keeps its own throw-away ledger
 (`state/scan_state.dry.json`), so the real alert ledger is never touched.
 
+**Sector follow (Nifty NEUTRAL).** The normal pick needs a committed Nifty
+direction, so on a flat index it used to say WAIT all day even when one sector was
+clearly leading. Now, when Nifty is NEUTRAL and the #1 `PERSIST +` sector is a real
+leader (persist score at least `SECTOR_FOLLOW_MIN_PERSIST` = 55, up on the day, in
+the upper part of its range, positive RS, bullish flow, not rolling over), that
+sector is scanned LONG. The market message
+then reads `SECTOR FOLLOW — Nifty NEUTRAL, PHA leads …` and stock alerts show
+`Sector PHA (sector follow) | Market NEUTRAL`. Longs only; a committed BULL/BEAR
+market is unaffected. Set `SECTOR_FOLLOW=0` to get the old WAIT behaviour back.
+
 What this cannot fix: yfinance is not an exchange feed (it can lag or rate-limit),
 the entry price on a confirmed alert is still the candle close, and you still have
 to place the order. For exchange-grade timing use a broker WebSocket feed.

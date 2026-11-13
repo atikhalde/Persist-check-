@@ -89,6 +89,11 @@ def _basis_text(plan: TradePlan) -> str:
     return line + "\n"
 
 
+def _follow_tag(md) -> str:
+    """Marks alerts taken on a leading sector while Nifty itself is NEUTRAL."""
+    return " (sector follow)" if str(getattr(md, "pick_reason", "")).startswith("SECTOR FOLLOW") else ""
+
+
 def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
@@ -96,7 +101,7 @@ def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
     targets = _target_text(plan)
     return (
         f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        f"Sector <b>{md.pick_sector}</b>{_follow_tag(md)}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
         f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
