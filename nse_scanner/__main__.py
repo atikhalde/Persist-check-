@@ -83,8 +83,8 @@ def main(argv: list[str] | None = None) -> int:
 
         out = run_once_dual(
             force_sector=args.sector,
-            oi_source=os.environ.get("OI_SOURCE", "stub"),
-            oi_file=os.environ.get("OI_FILE", "data/oi_history.csv"),
+            oi_source=os.environ.get("OI_SOURCE"),
+            oi_file=os.environ.get("OI_FILE"),
         )
         orig = out["original"]
         oi = out["oi"]
@@ -100,10 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "live-dual":
         from .oi_live import live_loop_dual
 
-        live_loop_dual(
-            oi_source=os.environ.get("OI_SOURCE", "stub"),
-            oi_file=os.environ.get("OI_FILE", "data/oi_history.csv"),
-        )
+        live_loop_dual(oi_source=os.environ.get("OI_SOURCE"), oi_file=os.environ.get("OI_FILE"))
         return 0
     if args.cmd == "sector-follow":
         from .sector_follow import run_once_sector_follow
@@ -111,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         out = run_once_sector_follow(force_sector=args.sector)
         print(
             f"{out['bar']}  {out['market']}  pick={out['pick']}  {out['action']}  "
-            f"sf_alerts={len(out['signals'])}  skipped={out.get('skipped','-')}"
+            f"alerts={len(out['signals'])}"
         )
         for s in out["signals"]:
             print(f"  SF    {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")

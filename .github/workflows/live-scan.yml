@@ -145,6 +145,10 @@ jobs:
           # Seconds before each 5m close at which the forming candle is judged
           # and an "EARLY (unconfirmed)" alert may be sent. 0 = close-only.
           EARLY_ALERT_SECONDS: "60"
+          # Optional repository variables (Settings → Secrets and variables → Actions → Variables).
+          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}              # "0" = NEUTRAL market always WAITs
+          SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}    # e.g. PHA,ENE - scanned first
+          OI_FILTER: ${{ vars.OI_FILTER }}                      # off | annotate | require
           # Seconds after the close before the confirmed scan asks Yahoo.
           POLL_GRACE_SECONDS: "10"
           # Right after the close a candle is judged only once the stock's feed

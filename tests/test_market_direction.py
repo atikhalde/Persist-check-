@@ -46,8 +46,35 @@ class SectorFollowTests(TestCase):
         self.assertEqual(name, "PHA")
         self.assertTrue(reason.startswith("SECTOR FOLLOW"))
 
-    def test_only_the_top_persistent_sector_counts(self):
-        self.assertIsNone(self.pick([self.snap(pos=40.0), self.snap("ENE")])[0])
+    def leaders(self, plus, **env):
+        from unittest.mock import patch
+        from nse_scanner.market import _follow_leaders
+        with patch.dict("os.environ", env):
+            return [x.name for x in _follow_leaders(plus)]
+
+    def test_next_leader_is_scanned_too_when_the_first_is_weak_or_quiet(self):
+        plus = [self.snap(), self.snap("ENE", persist_bull=60), self.snap("IT", persist_bull=58)]
+        self.assertEqual(self.leaders(plus), ["PHA", "ENE"])                 # two by default
+        self.assertEqual(self.leaders(plus, SECTOR_FOLLOW_MAX="1"), ["PHA"])
+        self.assertEqual(self.leaders(plus, SECTOR_FOLLOW_MAX="3"), ["PHA", "ENE", "IT"])
+        plus[0] = self.snap(pos=40.0)                                        # #1 not leading
+        self.assertEqual(self.leaders(plus), ["ENE", "IT"])
+
+    def test_only_the_persist_top_three_can_lead(self):
+        plus = [self.snap(pos=40.0), self.snap("B", pos=40.0), self.snap("C", pos=40.0), self.snap("D")]
+        self.assertEqual(self.leaders(plus), [])
+
+    def test_chart_aligned_sectors_are_scanned_first(self):
+        plus = [self.snap(), self.snap("ENE", persist_bull=60)]
+        self.assertEqual(self.leaders(plus, SF_ALIGNED_SECTORS="ene"), ["ENE", "PHA"])
+        name, reason = self.pick(plus, SF_ALIGNED_SECTORS="ENE")
+        self.assertEqual(name, "ENE")
+        self.assertIn("chart aligned", reason)
+        self.assertIn("also scanning PHA 72", reason)
+
+    def test_flow_agreement_is_reported_not_required(self):
+        self.assertIn("flow aligned", self.pick([self.snap(qualified=True)])[1])
+        self.assertNotIn("flow aligned", self.pick([self.snap(qualified=False)])[1])
 
     def test_a_leader_that_is_not_really_leading_is_not_followed(self):
         for weak in (dict(persist_bull=50.0),      # 09:15 on 13-Nov: PHA 50
@@ -63,6 +90,9 @@ class SectorFollowTests(TestCase):
     def test_alert_says_it_is_a_sector_follow_trade(self):
         from types import SimpleNamespace
         from nse_scanner.pipeline import _follow_tag
-        self.assertEqual(_follow_tag(SimpleNamespace(pick_reason="SECTOR FOLLOW — Nifty NEUTRAL")),
-                         " (sector follow)")
-        self.assertEqual(_follow_tag(SimpleNamespace(pick_reason="PERSIST + IT qualified")), "")
+        md = SimpleNamespace(pick_reason="SECTOR FOLLOW — Nifty NEUTRAL", pick_sector="PHA",
+                             flow_aligned=["ENE"])
+        self.assertEqual(_follow_tag(md), " (sector follow)")
+        self.assertEqual(_follow_tag(md, "ENE"), " (sector follow, flow aligned)")
+        self.assertEqual(_follow_tag(SimpleNamespace(pick_reason="PERSIST + IT qualified",
+                                                     pick_sector="IT")), "")
