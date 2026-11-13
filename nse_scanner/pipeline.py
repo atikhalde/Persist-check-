@@ -12,6 +12,8 @@ import pandas as pd
 
 from . import data, state, telegram
 from .market import run_market, SECTOR_ORDER
+from .oi_data import CSV_OIReader, StubOIReader
+from .oi_filter import should_take_entry
 from .session import IST, now_ist, session_date, to_ist
 from .stock import StockSignal, scan_stock
 from .trade import TradePlan, build_plan, ema9_frame, trail_broken
@@ -89,14 +91,76 @@ def _basis_text(plan: TradePlan) -> str:
     return line + "\n"
 
 
-def format_stock(sig: StockSignal, md, plan: TradePlan) -> str:
+def _follow_tag(md, sector: str | None = None) -> str:
+    """Marks alerts taken on a leading sector while Nifty itself is NEUTRAL."""
+    if not str(getattr(md, "pick_reason", "")).startswith("SECTOR FOLLOW"):
+        return ""
+    notes = ["sector follow"]
+    if (sector or md.pick_sector) in (getattr(md, "flow_aligned", None) or ()):
+        notes.append("flow aligned")
+    return f" ({', '.join(notes)})"
+
+
+def _scan_list(uni: dict, sector: str, extra=()) -> dict[str, str]:
+    """``{stock: sector}`` for the pick plus any extra follow sectors, pick first."""
+    out: dict[str, str] = {}
+    for name in [sector, *(extra or ())]:
+        for raw in (uni["sectors"].get(name) or {}).get("stocks", []):
+            out.setdefault(raw, name)
+    return out
+
+
+# ── Futures open interest (optional) ─────────────────────────────────────────
+def _oi_mode() -> str:
+    """``off`` | ``annotate`` (default: add an OI line when data exists) | ``require``."""
+    mode = os.environ.get("OI_FILTER", "annotate").strip().lower()
+    return mode if mode in ("off", "annotate", "require") else "annotate"
+
+
+def _oi_reader(session: str):
+    """Reader for today's OI rows, or None when there is nothing to read.
+
+    Yahoo has no open interest, so this only works when something fills
+    ``OI_FILE`` (``symbol,timestamp,oi,close``; timestamp = the 5m bar's start in
+    IST, the same label the alerts use). With no rows for today the filter is
+    simply unavailable: it must never silence every alert because a data file is
+    empty. ``OI_SOURCE=stub`` returns made-up numbers and is for tests only.
+    """
+    if _oi_mode() == "off":
+        return None
+    if os.environ.get("OI_SOURCE", "csv").strip().lower() == "stub":
+        return StubOIReader()
+    reader = CSV_OIReader(os.environ.get("OI_FILE", "data/oi_history.csv"))
+    try:
+        reader._load()
+    except Exception as e:                      # a broken file must not stop the scanner
+        log.warning("OI file unreadable (%s); OI filter unavailable", e)
+        return None
+    if not any(stamp.startswith(session) for _, stamp in reader._index):
+        return None
+    return reader
+
+
+def _oi_line(reading) -> str:
+    if reading is None or reading.oi_chg_pct is None or reading.price_chg_pct is None:
+        return ""
+    label = {"LONG_BUILDUP": "Long Build-up", "SHORT_BUILDUP": "Short Build-up",
+             "SHORT_COVERING": "Short covering", "LONG_UNWINDING": "Long unwinding"}.get(
+                 reading.regime.value, "Neutral")
+    return (f"OI <b>{label}</b> · OI {reading.oi_chg_pct:+.2f}% · price "
+            f"{reading.price_chg_pct:+.2f}% (5m)\n")
+
+
+def format_stock(sig: StockSignal, md, plan: TradePlan, *, sector: str | None = None,
+                 oi_line: str = "") -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     below = "below" if sig.side == "BUY" else "above"
     targets = _target_text(plan)
     return (
         f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{md.pick_sector}</b>  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        f"Sector <b>{sector or md.pick_sector}</b>{_follow_tag(md, sector)}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        f"{oi_line}"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
         f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
@@ -265,12 +329,12 @@ def run_early(bar: datetime) -> list[dict]:
         log.info("early %s: no current sector pick from %s — skipped", bar.strftime("%H:%M"), prev)
         return []
     uni = data.load_universe()
-    sector = uni["sectors"].get(scan["sector"])
-    if not sector:
+    sector_of = _scan_list(uni, scan["sector"], scan.get("extra"))
+    if not sector_of:
         return []
     sent, positions = st.setdefault("sent", {}), st.setdefault("positions", {})
     book = st.setdefault("early", {})
-    names = [raw for raw in sector["stocks"]
+    names = [raw for raw in sector_of
              if raw not in sent and raw not in positions and raw not in book]
     if not names:
         return []
@@ -308,7 +372,8 @@ def run_early(bar: datetime) -> list[dict]:
             log.info("early scan for %s finished at the close; leaving it to the close scan", hhmm)
             break
         best.price, best.sl = plan.entry, plan.sl
-        text = format_early(best, scan, plan, bar) + f" · price from 1m bar {m1.index[-1]:%H:%M}"
+        shown = {**scan, "sector": sector_of[raw] + (" (sector follow)" if scan.get("follow") else "")}
+        text = format_early(best, shown, plan, bar) + f" · price from 1m bar {m1.index[-1]:%H:%M}"
         if not telegram.send(text, dry_run=_dry()):
             continue
         book[raw] = {"bar": bar.isoformat(), "side": best.side, "code": best.code,
@@ -703,9 +768,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
     # The next early (pre-close) pass scans this pick; it must be this bar's.
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
+    extra = list(getattr(md, "extra_sectors", None) or ()) if scanning else []
     st["scan"] = {"bar": md.bar_time, "sector": md.pick_sector if scanning else "WAIT",
                   "side": md.pick_side if scanning else 0,
-                  "label": md.dir_label, "conf": md.dir_conf}
+                  "label": md.dir_label, "conf": md.dir_conf,
+                  "extra": extra, "follow": bool(scanning and _follow_tag(md))}
 
     if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
@@ -746,10 +813,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _save(st)
         return result
 
-    sec_cfg = uni["sectors"][md.pick_sector]
-    stocks = sec_cfg["stocks"]
+    sector_of = _scan_list(uni, md.pick_sector, extra)
+    stocks = list(sector_of)
     tickers = [data.yahoo_stock(s) for s in stocks]
-    log.info("scanning %s (%d names) 5m entries", md.pick_sector, len(tickers))
+    log.info("scanning %s (%d names) 5m entries", " + ".join([md.pick_sector, *extra]), len(tickers))
+    oi_reader = _oi_reader(session)
     sm5 = data.fetch_many(tickers, period_5m, "5m")
     # Only fetch the expensive 1m volume repair/daily history if there is a
     # current completed stock candle to evaluate.
@@ -838,7 +906,15 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             continue
         best.price = plan.entry
         best.sl = plan.sl
-        text = format_stock(best, md, plan)
+        reading = oi_reader.snapshot(raw, last) if oi_reader else None
+        if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
+            why = reading.regime.value if reading else "no OI row"
+            log.info("OI filter rejected %s %s @ %s: %s", raw, best.side, best.time, why)
+            if early:
+                _cancel_early(st, raw, early, f"was not confirmed by open interest ({why})",
+                              close=float(df5["Close"].iloc[-1]))
+            continue
+        text = format_stock(best, md, plan, sector=sector_of[raw], oi_line=_oi_line(reading))
         if early:
             text = _confirm_header(early, plan.entry) + text
         if not telegram.send(text, dry_run=_dry()):
@@ -852,7 +928,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _bump(st, "lag_sum", lag)
         st["stats"]["lag_max"] = max(st["stats"].get("lag_max", 0), lag)
         new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
-                            "t1": plan.t1, "t2": plan.t2, "t3": plan.t3})
+                            "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+                            "sector": sector_of[raw],
+                            "oi_regime": reading.regime.value if reading else None,
+                            "oi_chg_pct": reading.oi_chg_pct if reading else None})
         sent[raw] = {
             "code": best.code,
             "name": best.name,

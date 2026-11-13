@@ -260,6 +260,43 @@ runs the complete loop — early pass, confirm/cancel, hit alerts, summary — p
 instead of sending. It keeps its own throw-away ledger
 (`state/scan_state.dry.json`), so the real alert ledger is never touched.
 
+**Sector follow (Nifty NEUTRAL).** The normal pick needs a committed Nifty
+direction, so on a flat index it used to say WAIT all day even when a sector was
+clearly leading. Now, when Nifty is NEUTRAL, any `PERSIST +` top-3 sector that is a
+real leader (persist score at least `SECTOR_FOLLOW_MIN_PERSIST` = 55, up on the day,
+in the upper part of its range, positive RS, bullish flow, not rolling over) is
+scanned LONG — up to `SECTOR_FOLLOW_MAX` (2) sectors, so a quiet leader does not
+hide an entry in the next one. The market message reads
+`SECTOR FOLLOW — Nifty NEUTRAL, PHA leads (…); also scanning ENE 60` and stock
+alerts show `Sector PHA (sector follow) | Market NEUTRAL`, plus `flow aligned` when
+live flow agrees with persistence. Early alerts, confirmation and target / SL /
+EMA9-exit alerts work exactly as for a normal pick. Longs only; a committed
+BULL/BEAR market is unaffected.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SECTOR_FOLLOW` | `1` | `0` = old behaviour (NEUTRAL → WAIT) |
+| `SECTOR_FOLLOW_MIN_PERSIST` | `55` | persist score a sector needs |
+| `SECTOR_FOLLOW_MAX` | `2` | how many leading sectors are scanned |
+| `SF_ALIGNED_SECTORS` | empty | e.g. `PHA,ENE` — sectors your chart shows as SMART$/MARKET/SECTOR/FLOW aligned; scanned first. The scanner cannot read the chart, so this is manual. |
+
+**Open interest (optional).** Yahoo has no futures OI, so this only does something
+when you fill `data/oi_history.csv` (`symbol,timestamp,oi,close`; timestamp = the
+5m bar's start in IST, e.g. `2026-11-13 10:20`; one row per stock per 5m bar).
+
+| `OI_FILTER` | Effect |
+|---|---|
+| `annotate` (default) | entry alerts get a line such as `OI Long Build-up · OI +1.80% · price +0.35% (5m)` when a row exists |
+| `require` | an entry is sent only when OI confirms it (BUY = long build-up, SELL = short build-up) |
+| `off` | OI ignored |
+
+With no rows for today the filter is unavailable and alerts go out unchanged — an
+empty file can never silence the scanner.
+
+The older separate commands `sector-follow`, `live-sector-follow`, `dual` and
+`live-dual` still exist but now simply run the main scanner (`once` / `live`).
+Do not run them next to `live`.
+
 What this cannot fix: yfinance is not an exchange feed (it can lag or rate-limit),
 the entry price on a confirmed alert is still the candle close, and you still have
 to place the order. For exchange-grade timing use a broker WebSocket feed.

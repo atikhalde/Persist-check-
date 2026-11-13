@@ -9,10 +9,13 @@ VIX, Nifty structure, 15-sector breadth, live flow and persistent +/- are kept.
 Scanner pick (user rule):
   only the strongest PERSISTENT bull or bear sector that COMPLEMENTS
   the committed Nifty direction that day. CHOP / NEUTRAL / conflict → WAIT.
+  Exception (sector follow): Nifty NEUTRAL + a qualified #1 PERSIST + sector
+  → scan that sector LONG (see ``_follow_pick``).
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -178,6 +181,10 @@ class MarketDecision:
     pick_reason: str
     action: str
     sectors: dict = field(default_factory=dict)
+    # Sector follow (Nifty NEUTRAL): more leading sectors scanned with the pick,
+    # and which of the scanned sectors have live flow agreeing with persistence.
+    extra_sectors: list = field(default_factory=list)
+    flow_aligned: list = field(default_factory=list)
 
 
 def _day_ohlc_so_far(df: pd.DataFrame, sid) -> tuple[float, float, float, float]:
@@ -454,6 +461,15 @@ def run_market(
         action = "SCAN LONG"
     elif pick and pick_side == -1 and commit_side == -1:
         action = "SCAN SHORT"
+    extra_sectors: list[str] = []
+    flow_aligned: list[str] = []
+    if not pick and commit_side == 0:
+        leaders = _follow_leaders(persist_plus)
+        if leaders:
+            pick, pick_side, action = leaders[0].name, 1, "SCAN LONG"
+            extra_sectors = [s.name for s in leaders[1:]]
+            flow_aligned = [s.name for s in leaders if s.qualified]
+            reason = _follow_reason(leaders)
 
     return MarketDecision(
         session=str(sid),
@@ -483,6 +499,8 @@ def run_market(
         pick_reason=reason,
         action=action,
         sectors={k: vars(v) for k, v in snaps.items()},
+        extra_sectors=extra_sectors,
+        flow_aligned=flow_aligned,
     )
 
 
@@ -706,6 +724,79 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
         score=score,
         qualified=bool(qualified),
     )
+
+
+SECTOR_FOLLOW_PREFIX = "SECTOR FOLLOW"
+
+
+def _is_leading(s, need: float) -> bool:
+    return bool(
+        s.side == 1 and s.persist_bull >= need
+        and s.day_ret >= BULL_MIN_DAY and s.pos >= BULL_MIN_POS and s.rs > 0
+        and s.bull >= FLOW_MIN and s.recent > -RECENT_MOVE_MIN
+    )
+
+
+def _follow_leaders(plus) -> list:
+    """Sectors to scan LONG while Nifty itself is NEUTRAL (no committed side).
+
+    The complementary pick needs a committed Nifty direction, so on a flat index
+    it waits all day even when a sector is plainly leading. This is the fallback
+    for that case. A sector counts as a leader when it is in the PERSIST + top 3
+    and is leading right now: persist score high enough, up on the day, in the
+    upper part of its day range, positive RS vs Nifty, bullish live flow, and
+    not currently rolling over. (The stricter live-flow "qualified" flag also
+    demands a fresh push in the last few bars, so it flickers inside a steady
+    trend; it is reported as "flow aligned" but is not required.)
+
+    Order = scan priority: sectors named in ``SF_ALIGNED_SECTORS`` (your chart's
+    SMART$/MARKET/SECTOR/FLOW agreement, which this scanner cannot see) first,
+    then by persist score. The first is the pick; the rest are scanned with it,
+    so a quiet leader does not hide an entry in the next one.
+
+    Longs only — a flat index gives no reason to short a weak sector.
+    ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (55) is
+    the score needed, ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
+    """
+    if os.environ.get("SECTOR_FOLLOW", "1") == "0" or not plus:
+        return []
+    try:
+        need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
+    except ValueError:
+        need = 55.0
+    try:
+        most = max(1, int(os.environ.get("SECTOR_FOLLOW_MAX") or 2))
+    except ValueError:
+        most = 2
+    manual = _manual_aligned()
+    leaders = [s for s in plus[:3] if _is_leading(s, need)]
+    leaders.sort(key=lambda s: (s.name not in manual, -s.persist_bull))
+    return leaders[:most]
+
+
+def _manual_aligned() -> set:
+    raw = os.environ.get("SF_ALIGNED_SECTORS", "")
+    return {x.strip().upper() for x in raw.split(",") if x.strip()}
+
+
+def _follow_reason(leaders) -> str:
+    s = leaders[0]
+    manual = _manual_aligned()
+    notes = [f"persist {s.persist_bull:.0f}", f"day {s.day_ret:+.2f}%", f"range pos {s.pos:.0f}"]
+    if s.qualified:
+        notes.append("flow aligned")
+    if s.name in manual:
+        notes.append("chart aligned")
+    text = f"{SECTOR_FOLLOW_PREFIX} — Nifty NEUTRAL, {s.name} leads ({', '.join(notes)})"
+    if len(leaders) > 1:
+        text += "; also scanning " + ", ".join(f"{x.name} {x.persist_bull:.0f}" for x in leaders[1:])
+    return text
+
+
+def _follow_pick(plus):
+    """(sector, reason) of the first follow leader, or (None, "")."""
+    leaders = _follow_leaders(plus)
+    return (leaders[0].name, _follow_reason(leaders)) if leaders else (None, "")
 
 
 def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_day_ret):

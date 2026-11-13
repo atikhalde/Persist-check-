@@ -125,6 +125,17 @@ class EarlyAlertTests(TestCase):
         self.assertEqual(st["positions"], {})
         self.assertEqual(st["early"]["ABC"]["at"], "10:04:02")
 
+    def test_early_pass_covers_the_extra_follow_sector_and_names_it(self):
+        self.uni["sectors"]["ENE"] = {"index": "E", "stocks": ["XYZ"]}
+        st = state.load()
+        st["scan"].update({"label": "NEUTRAL", "conf": 52, "extra": ["ENE"], "follow": True})
+        state.save(st)
+        self.scan.side_effect = lambda raw, *a, **k: [signal()] if raw == "XYZ" else []
+        self.assertEqual(len(pipeline.run_early(BAR)), 1)
+        self.assertEqual([c.args[0] for c in self.scan.call_args_list], ["ABC", "XYZ"])
+        self.assertIn("Sector <b>ENE (sector follow)</b>  |  Market NEUTRAL (52%)", self.texts()[0])
+        self.assertIn("XYZ", state.load()["early"])
+
     def test_early_alert_is_never_repeated(self):
         pipeline.run_early(BAR)
         self.assertEqual(pipeline.run_early(BAR), [])
