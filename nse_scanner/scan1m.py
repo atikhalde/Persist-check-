@@ -136,6 +136,28 @@ def save_ledger(st: dict) -> None:
     state.save(st, ledger_path())
 
 
+_ledger_warned: set[str] = set()
+
+
+def _warn_ledger_once(bar: datetime) -> None:
+    """Say *why* ``ledger`` mode produced nothing — once per candle, not per minute."""
+    key = f"{bar:%Y-%m-%d %H:%M}"
+    if key in _ledger_warned:
+        return
+    _ledger_warned.add(key)
+    path = state.STATE_PATH
+    if not path.exists():
+        log.warning(
+            "SCAN1M_MARKET_SOURCE=ledger, but %s does not exist on this machine — the 5m scan "
+            "writes it on its own runner, so there is no pick to reuse and nothing is projected. "
+            "Use SCAN1M_MARKET_SOURCE=own (or auto) here.", path.name)
+        return
+    log.warning(
+        "SCAN1M_MARKET_SOURCE=ledger: %s has no usable pick for %s (last 5m decision: %s) — "
+        "nothing projected on this candle", path.name, key,
+        (_five_minute_scan() or {}).get("bar") or "none")
+
+
 def _five_minute_scan() -> dict:
     """The 5m scan's last decision (read-only) — same sector, same side.
 
@@ -231,6 +253,8 @@ def pick_for(bar: datetime, *, projection: bool) -> dict | None:
                 "extra": list(scan.get("extra") or []),
                 "follow": bool(scan.get("follow")),
             }
+    if found is None and source == "ledger":
+        _warn_ledger_once(decision)          # silent failure is the worst kind
     if found is None and source in ("own", "auto"):
         try:
             found = _own_pick(decision)
@@ -510,7 +534,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
             continue
-        stamp = now_ist()
+        stamp = now                     # the caller's clock (live loop → now_ist())
         if stamp >= bar + timedelta(minutes=BAR_MINUTES) - timedelta(seconds=2):
             log.info("1m projection for %s finished at the close; leaving it to the confirm pass", hhmm)
             continue
@@ -589,11 +613,17 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
     out: list[dict] = []
     confirmed: set[str] = set()
     checked: set[str] = set()
+    closes: dict[str, float] = {}
     for raw, ysym in tickers.items():
         frame = closed_frame(sm5.get(ysym), sm1.get(ysym), bar)
         if frame is None:
             continue                    # still filling: retried, never written off
         checked.add(raw)
+        try:
+            if to_ist(frame.index[-1]) == bar:
+                closes[raw] = float(frame["Close"].iloc[-1])
+        except Exception:               # a close price is a nicety, never a reason to fail
+            log.debug("no close price for %s at %s", raw, hhmm)
         try:
             fires = scan_stock(raw, frame, sd1.get(ysym), keep_all=True)
         except Exception:
@@ -639,7 +669,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
         log.info("1m CONFIRMED %s %s %s @ %.2f (sent %s IST)", raw, best.side, best.name,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
-    _settle(st, bar, confirmed, checked, "did not hold at the close")
+    _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes)
     save_ledger(st)
     return out
 
@@ -679,7 +709,7 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
 
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
-            reason: str = "") -> None:
+            reason: str = "", closes: dict[str, float] | None = None) -> None:
     """Resolve projected alerts of ``bar`` that the close did not confirm.
 
     ``checked`` limits this to the stocks the close scan could actually judge:
@@ -694,10 +724,19 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
         st.setdefault("stats", {})["cancelled"] = st.get("stats", {}).get("cancelled", 0) + 1
         log.info("1m projection for %s did not hold (%s) — no message", raw, reason)
         if cancel_message():
-            telegram.send_bot3(f"❌ <b>EARLY CANCELLED</b> — {early.get('side')}  {raw} "
-                               f"{early.get('name', '')} did not hold the {bar:%H:%M} close "
-                               f"(projected {early.get('at')} @ {early.get('price'):.2f})",
-                               dry_run=_dry())
+            price = early.get("price")
+            px = (closes or {}).get(raw)
+            move = ""
+            if px is not None and price:
+                pct = (px - price) / price * 100.0
+                if str(early.get("side") or "").upper() == "SELL":
+                    pct = -pct                    # "beyond" always means "in our favour"
+                move = f" · close {px:.2f} ({pct:+.2f}%)"
+            telegram.send_bot3(
+                f"❌ <b>EARLY CANCELLED</b> — {early.get('side')} {early.get('name') or raw} ({raw})\n"
+                f"projected {early.get('at')} @ {price:.2f}{move}\n"
+                f"the {bar:%H:%M} 5m close did not confirm it — no entry recorded",
+                dry_run=_dry())
 
 
 # ── optional OI parity with the 5m scan ──────────────────────────────────────
