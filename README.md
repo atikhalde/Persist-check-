@@ -224,6 +224,89 @@ prints every early alert next to its close (confirmed / cancelled / close-only),
 the confirmation rate and how far the close already was from the early price.
 Omit `--sector` for all sectors (≈30 s per stock).
 
+### 1-minute projected scan (second bot, up to 4 minutes earlier)
+
+The indicator can also run on a **1-minute chart**: the forming 5m candle is
+rebuilt from the 1m prints as they arrive, so a signal shows up to four minutes
+before that candle closes. That mode is a *separate* scan with its own bot:
+
+```bash
+python -m nse_scanner live-1m            # projected alerts + confirmed entries, bot 3
+python -m nse_scanner once-1m --dry-run  # one projected pass, prints instead of sending
+```
+
+```
+⚡ 🟢 EARLY BUY (1m projection) | BUY-EX17  PNB
+Sector PSUBK  |  Market BULL (74%)
+Price now 135.70  ·  5m bar 10:30–10:35 still forming
+3m 55s left — projected from 1m prints up to 10:31
+SL ≈ 135.02 (EMA9 so far)  |  Risk ≈ 0.68
+next pivot target: T1 R2 136.75 (2.0R, +0.77%) · …
+Score 82 Extreme Strong   base 21/21 cond22=0 score=82
+Rules: identical to the 5m scan · judged on minute 1/4 of the candle
+Confirmed entry follows at the 10:35 close if the candle holds
+```
+
+* **Rules are not forked.** Every minute of the candle the 1m prints rebuild the
+  forming 5m bar and the *unchanged* `stock.scan_stock` runs on
+  `[completed 5m bars] + [projected bar]` — the same 22 conditions, the same 32
+  codes, the same windows/locks/gap/wick/liquidity/score gates, the same market
+  pick, side, EMA9 stop and pivot targets. Only the timing differs: minute
+  `SCAN1M_FIRST_MINUTE` (1) instead of the close.
+* **Early and confirmed.** The projection is sent as soon as it appears; at the
+  candle's close the completed candle is judged again and the normal entry alert
+  follows on the same bot (with `✅ CONFIRMED — projected 10:31:05 @ 135.70` in
+  front when the projection held). A projection that does not hold is dropped
+  **silently** (`SCAN1M_CANCEL_MESSAGE=1` to report it instead).
+* **Own bot, own ledger.** `TELEGRAM_BOT_TOKEN_3` / `TELEGRAM_CHAT_ID_3` and
+  `state/scan1m_state.json`. It never calls the bots 1/2 sender and never reads
+  or writes `state/scan_state.json` (the 5m pick is only read when
+  `SCAN1M_MARKET_SOURCE=ledger`). The 5m scan keeps running exactly as before;
+  stop this command and nothing about it changes.
+* **The same honesty rules apply**: a frozen 1m feed (`SCAN1M_MAX_STALE_SECONDS`,
+  100) never produces a projection, a candle the feed has not reached the end of
+  is never confirmed, one projected alert per stock per session, and the entry is
+  still the candle close — the last minute can undo a projection, which is
+  exactly the 4 minutes you are buying.
+
+**Checked step by step against `pipeline.run_once` (2026-11-15).** The close pass of
+the 1m scan does what the 5m pass does, in the same order:
+
+| step | 5m scan (`pipeline.run_once`) | 1m scan (`scan1m.confirm_pass`) |
+|---|---|---|
+| name list | `_scan_list` — sector, follows, `SECTOR_EXTRA` | the same function |
+| frame | completed 5m bars, zero-volume bars repaired from 1m | same, from the merged 1m history (prior sessions fetched once) |
+| late candle | `_unsettled` + 45 s settle, `_warn_feed_behind` | `closed_frame` needs a print in the candle's last minute, then `_note_feed_behind` |
+| deadline | `_max_lag()` (180 s) after the close | the same `_within_lag` |
+| engine | `stock.scan_stock(raw, frame, daily, keep_all=True)` | the same call |
+| side filter | signals of the pick's side at that candle's time | the same |
+| rejects | opposite / earlier / no_stop / oi book | the same four, same keys, reported in the summary |
+| stop & OI | `build_plan` (entry, EMA9 stop, targets), `_oi_mode` gate | the same |
+| entry text | `format_stock(..., oi_line=...)` + `_target_text` | the same text, with the `✅ CONFIRMED` line in front |
+| once per name/session | `sent` + `positions` | the same two maps |
+| delivery | a failed send is retried while the candle is judgeable | the same — a failed bot-3 send is retried the next minute |
+| summary | candles, picks, sectors, rejects | the same, plus projected / confirmed / cancelled |
+
+The only additions are the ones this mode needs: the forming (projected) candle,
+the EARLY message, silent cancellation and bot 3. `state/scan_state.json`,
+`pipeline.py`, `stock.py`, `telegram.send()` and `live-scan.yml` are untouched.
+
+**Measure it before trusting it** — the same early-check harness works for the
+projection, and `--lead` is exactly "how early":
+
+```bash
+python -m nse_scanner early-check --date 2026-11-12 --sector PSUBK --lead 240
+python -m nse_scanner early-check --date 2026-11-12 --sector PSUBK --lead 60
+```
+
+The difference between the two rows is what four extra minutes of projection buy
+you (and what they cost in cancelled signals).
+
+Cost: one extra 1m batch download per minute for the picked sector, and the 5m
+history once per candle. Workflow: `.github/workflows/live-scan-1m.yml` (its own
+guard, cache prefix and secrets; it decides the market itself with
+`SCAN1M_MARKET_SOURCE=own`, so the two loops share nothing).
+
 **Always-on loop.** `python -m nse_scanner live` sleeps to `close − 60s` (early
 pass), then to `close + POLL_GRACE_SECONDS` (10) and polls Yahoo every 5 s for the
 closed candle. Every confirmed alert prints its own delay
@@ -444,6 +527,7 @@ nifty-live-scanner/
   nse_scanner/
     market.py      # VIX + Nifty dir + persist +/- + complementary pick
     stock.py       # 5m strength + windows + exception codes
+    scan1m.py      # 1m ➜ 5m projection, projected + confirmed alerts on bot 3
     pipeline.py    # one cycle + live loop
     data.py        # yfinance
     telegram.py    # one POST per alert

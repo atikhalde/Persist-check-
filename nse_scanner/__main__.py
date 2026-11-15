@@ -2,6 +2,8 @@
 
   python -m nse_scanner once
   python -m nse_scanner live
+  python -m nse_scanner live-1m          # 1m projected scan, Telegram bot 3
+  python -m nse_scanner once-1m          # one projected pass (diagnostic)
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
@@ -41,7 +43,7 @@ def _setup_log(level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
-    p.add_argument("cmd", choices=["once", "live", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow")
+    p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | once-1m | live-1m | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
@@ -118,6 +120,22 @@ def main(argv: list[str] | None = None) -> int:
 
         live_loop_sector_follow()
         return 0
+    if args.cmd == "once-1m":
+        from datetime import timedelta
+
+        from .scan1m import _bar_open, confirm_pass, run_minute
+        from .session import now_ist
+
+        now = now_ist()
+        bar = _bar_open(now)
+        minute = int((now - bar).total_seconds() // 60)
+        out = (confirm_pass(bar - timedelta(minutes=5), now=now) if minute == 0
+               else run_minute(bar, now=now))
+        kind = "confirmed" if minute == 0 else "projected"
+        print(f"{bar:%Y-%m-%d %H:%M}  minute {minute}  {kind} alerts={len(out)}")
+        for s in out:
+            print(f"  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
+        return 0
     if args.cmd == "early-check":
         from datetime import date as _date
         from .early_check import render, run
@@ -139,6 +157,17 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         print(f"\nSaved {outp}")
         return 0
+    if args.cmd == "live-1m":
+        from .scan1m import live_loop_1m
+
+        reason = live_loop_1m(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close)
+        print(f"1m live loop ended: {reason}")
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:  # same handover contract as `live`
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(f"handoff={'true' if reason == 'budget' else 'false'}\n")
+        return 0
+
     from .pipeline import live_loop
 
     reason = live_loop(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close)
@@ -169,6 +198,12 @@ def _doctor() -> int:
     else:
         secondary_status = "not configured"
     print("Telegram secondary:", secondary_status)
+    third_token, third_chat = telegram.third_config_from_env()
+    if third_token or third_chat:
+        print("Telegram bot 3 (1m scan):",
+              "set" if third_token and third_chat else "INCOMPLETE — set both _3 values")
+    else:
+        print("Telegram bot 3 (1m scan): not configured (live-1m prints instead of sending)")
     if token and chat:
         ok = telegram.send("NSE scanner doctor ping", dry_run=os.environ.get("DRY_RUN") == "1")
         print("Telegram send:", "ok" if ok else "FAILED")
