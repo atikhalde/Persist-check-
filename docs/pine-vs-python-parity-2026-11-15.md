@@ -173,7 +173,11 @@ Its close pass was audited line by line against `pipeline.run_once` on the same 
 frame repair, late-candle settle, 180 s deadline, engine call, side filter, the four reject
 books, EMA9 stop, OI gate, entry text, one-entry-per-name and delivery retry all match; the only
 additions are the projected candle, the EARLY message, silent cancellation and bot 3 (table in
-the README).
+the README). The alert set matches too: the market-change message, the once-per-session
+feed-delayed notice and the T1–T3 / SL / EMA9-exit tracker are the 5m scan's own code, with the
+sender and the ledger swapped for bot 3 and `state/scan1m_state.json`
+(`pipeline._track_positions` gained optional `send`/`save` arguments whose defaults keep bots 1/2
+byte-for-byte unchanged).
 
 ### D2 — Feed: Yahoo 5m vs TV NSE *(unavoidable)*
 Zero-volume 09:15 bars, missing 15:15–15:25 slots, delayed/unsettled prints, interior holes filled
