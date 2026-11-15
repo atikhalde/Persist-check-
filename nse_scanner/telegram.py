@@ -84,5 +84,36 @@ def send(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> bool:
     return True
 
 
+def third_config_from_env() -> tuple[str, str]:
+    """Return the 1-minute scan's own bot token and chat ID.
+
+    Bot 3 is a separate channel on purpose: the projected (pre-close) alerts of
+    ``scan1m`` must never be mixed into the close-confirmed stream of bots 1/2.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN_3", "").strip()
+    chat = os.environ.get("TELEGRAM_CHAT_ID_3", "").strip()
+    return token, chat
+
+
+def send_bot3(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> bool:
+    """Send ONLY to bot 3 — no mirroring in either direction.
+
+    ``send`` (bots 1 + 2) is left exactly as it is, and this function never
+    falls back to it: a missing bot-3 configuration must not leak early alerts
+    into the confirmed channel.
+    """
+    if dry_run or os.environ.get("DRY_RUN", "0") == "1":
+        log.info("DRY-RUN telegram (bot 3):\n%s", text)
+        print(text)
+        return True
+
+    token, chat = third_config_from_env()
+    if not token or not chat:
+        log.error("TELEGRAM_BOT_TOKEN_3 / TELEGRAM_CHAT_ID_3 missing — printing instead")
+        print(text)
+        return False
+    return _send_to(token, chat, text, parse_mode=parse_mode, label="bot3")
+
+
 def ping() -> bool:
     return send("NSE scanner online. Waiting for 5m bars.", dry_run=False)

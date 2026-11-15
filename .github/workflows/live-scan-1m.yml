@@ -1,0 +1,157 @@
+# NSE 1-minute projected scan — Telegram bot 3.
+#
+# The same 5m engine, evaluated on the STILL-FORMING 5m candle rebuilt from the
+# 1m prints (Pine's "1m ➜ 5m projection engine"). An alert can fire up to four
+# minutes before the candle closes; the confirmed entry follows at the close on
+# the same bot. The 5m scan (live-scan.yml, bots 1/2) is untouched and keeps
+# running exactly as before — this is a second, independent loop.
+#
+# Why one long job: a per-minute job would boot a runner (~20s) every minute and
+# could never be early. The loop below is already awake when each minute lands.
+#
+# Required secrets: TELEGRAM_BOT_TOKEN_3, TELEGRAM_CHAT_ID_3
+#
+# Its own ledger (state/scan1m_state.json) and its own cache prefix: it never
+# reads or writes the 5m scan's ledger, so the two loops cannot suppress or
+# duplicate each other's alerts.
+
+name: NSE 1m projected scan
+run-name: ${{ inputs.dry_run && 'DRY RUN - NSE 1m projected scan' || 'NSE 1m projected scan' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      handoff:
+        description: "Planned takeover from a run that reached its time budget"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print alerts to the log instead of sending them to Telegram"
+        type: boolean
+        default: false
+  schedule:
+    # Backup only (the scheduler is unreliable on this repo); the 5m workflow's
+    # triggers do not start this loop.
+    - cron: "32 3 * * 1-5"
+    - cron: "2,32 4-9 * * 1-5"
+
+permissions:
+  contents: read
+  actions: write   # list runs (guard) and dispatch the successor (handover)
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Is a 1m scanner loop already running?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          now=$(TZ=Asia/Kolkata date +%u%H%M)
+          dow=${now:0:1}; hm=$((10#${now:1}))
+          if [ "$dow" -gt 5 ] || [ "$hm" -lt 830 ] || [ "$hm" -ge 1533 ]; then
+            echo "outside NSE session (IST $now) - nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry run - starting next to any live loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          answered=false
+          for i in $(seq 1 24); do
+            busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/live-scan-1m.yml/runs?per_page=40" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID and ((.display_title // \"\") | startswith(\"DRY RUN\") | not))] | length" || true)
+            if [ "$busy" = "0" ]; then
+              echo "no other 1m run active - this run becomes the loop"
+              echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            if [ -n "$busy" ]; then answered=true; fi
+            sleep 5
+          done
+          if [ "$answered" = "false" ]; then
+            echo "could not list runs - starting; the concurrency group prevents a double loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "1m scanner loop already running ($busy older run active) - standing down"
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      group: nse-live-scan-1m${{ inputs.dry_run && '-dry' || '' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: IST date
+        id: ist
+        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Its own ledger only — the 5m scan's state file is never touched, so this
+      # loop cannot become the newest snapshot the 5m loop restores.
+      - name: Restore 1m scanner state
+        if: ${{ !inputs.dry_run }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state/scan1m_state.json
+          key: nse-1m-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nse-1m-scan-state-${{ steps.ist.outputs.day }}-
+            nse-1m-scan-state-
+
+      - name: Projected loop (every minute of each 5m candle, confirm at its close)
+        id: scan
+        env:
+          TELEGRAM_BOT_TOKEN_3: ${{ secrets.TELEGRAM_BOT_TOKEN_3 }}
+          TELEGRAM_CHAT_ID_3: ${{ secrets.TELEGRAM_CHAT_ID_3 }}
+          LOG_LEVEL: INFO
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # 1 = alert from the first minute of the candle (up to 4 min early).
+          SCAN1M_FIRST_MINUTE: "1"
+          SCAN1M_MAX_STALE_SECONDS: "100"
+          SCAN1M_GRACE_SECONDS: "6"
+          SCAN1M_EARLY_PER_DAY: "1"
+          # This loop decides the sector/side itself (same market engine); the
+          # 5m ledger is not available to it in this workflow.
+          SCAN1M_MARKET_SOURCE: own
+          SCAN1M_CANCEL_MESSAGE: "0"
+          SCAN1M_1M_PERIOD: "1d"
+          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}
+          SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}
+        run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170
+
+      - name: Validate 1m scanner state
+        id: validate
+        if: ${{ always() && !inputs.dry_run && hashFiles('state/scan1m_state.json') != '' }}
+        run: |
+          python -c 'import json,sys; json.load(open("state/scan1m_state.json"))'
+
+      - name: Save 1m scanner state
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: state/scan1m_state.json
+          key: nse-1m-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Hand over to a fresh run
+        if: ${{ steps.scan.outputs.handoff == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh workflow run live-scan-1m.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          -f handoff=true -f dry_run=${{ inputs.dry_run && 'true' || 'false' }}
