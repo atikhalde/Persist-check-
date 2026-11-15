@@ -176,7 +176,7 @@ _md_cache: dict[str, object] = {}       # decision-bar key -> market verdict (in
 _last_nifty_bar: datetime | None = None  # newest Nifty bar seen (holiday detection)
 
 
-def _own_market(decision_bar: datetime):
+def _own_market(decision_bar: datetime, force_sector: str | None = None):
     """The market engine's verdict on ``decision_bar`` — the 5m scan's own call."""
     uni = data.load_universe()
     period_5m = os.environ.get("YF_PERIOD_5M", "7d")
@@ -209,13 +209,20 @@ def _own_market(decision_bar: datetime):
     )
     if md.bar_time != decision_bar.strftime("%Y-%m-%d %H:%M"):
         return None
+    if force_sector:                      # ``--sector IT``: the 5m scan's override
+        forced = force_sector.upper()
+        if forced in uni["sectors"]:
+            md.pick_sector = forced
+            md.pick_side = md.dir_state if md.dir_state != 0 else 1
+            md.action = "SCAN LONG" if md.pick_side == 1 else "SCAN SHORT"
+            md.pick_reason = f"FORCED {forced}"
     _md_cache[md.bar_time] = md
     return md
 
 
-def _own_pick(decision_bar: datetime) -> dict | None:
+def _own_pick(decision_bar: datetime, force_sector: str | None = None) -> dict | None:
     """Compute the pick the same way the 5m scan does, on the decision bar."""
-    md = _own_market(decision_bar)
+    md = _own_market(decision_bar, force_sector)
     if md is None:
         return None
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
@@ -230,7 +237,7 @@ def _own_pick(decision_bar: datetime) -> dict | None:
     }
 
 
-def pick_for(bar: datetime, *, projection: bool) -> dict | None:
+def pick_for(bar: datetime, *, projection: bool, force_sector: str | None = None) -> dict | None:
     """Sector pick for the candle ``bar``.
 
     ``projection=True``: judging the still-forming candle ``bar``, so only the
@@ -247,7 +254,7 @@ def pick_for(bar: datetime, *, projection: bool) -> dict | None:
                    (bar - timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m-%d %H:%M")]
         decision = bar
 
-    key = f"{decision:%Y-%m-%d %H:%M}|{projection}"
+    key = f"{decision:%Y-%m-%d %H:%M}|{projection}|{(force_sector or '').upper()}"
     hit = _pick_cache.get(key)
     if hit:
         cached = hit[1]
@@ -273,7 +280,7 @@ def pick_for(bar: datetime, *, projection: bool) -> dict | None:
         _warn_ledger_once(decision)          # silent failure is the worst kind
     if found is None and source in ("own", "auto"):
         try:
-            found = _own_pick(decision)
+            found = _own_pick(decision, force_sector)
         except Exception:
             log.exception("market pick failed for %s", decision.strftime("%H:%M"))
             found = None
@@ -512,7 +519,8 @@ def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
     return prev.get("result") == "cancelled"
 
 
-def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> list[dict]:
+def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
+               force_sector: str | None = None) -> list[dict]:
     """Evaluate the forming candle ``bar`` from the 1m prints and alert bot 3.
 
     Returns the projected alerts sent (for the CLI and the tests). Nothing is
@@ -528,7 +536,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
         return []
 
     _track_once(bar - timedelta(minutes=BAR_MINUTES))   # last closed candle's hits
-    pick = pick_for(bar, projection=True)
+    pick = pick_for(bar, projection=True, force_sector=force_sector)
     if not pick or pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         log.info("1m %s: no current sector pick — nothing projected", bar.strftime("%H:%M"))
         return []
@@ -600,14 +608,15 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
         stats = st.setdefault("stats", {})
         stats["early"] = stats.get("early", 0) + 1
         save_ledger(st)
-        log.info("1m EARLY %s %s %s @ %.2f (minute %d, %.2f)", raw, best.side, best.name,
-                 plan.entry, minute, stamp.timestamp())
+        log.info("1m EARLY %s %s %s @ %.2f (minute %d, sent %s IST)", raw, best.side,
+                 best.name, plan.entry, minute, stamp.strftime("%H:%M:%S"))
         out.append({**best.__dict__, "early": True, "minute": minute})
     return out
 
 
 # ── the close: confirm (silent on failure by request) ────────────────────────
-def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) -> list[dict]:
+def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
+                 force_sector: str | None = None) -> list[dict]:
     """Judge the closed candle ``bar`` exactly as the 5m scan judges it.
 
     Same list of names, same engine call, same side filter, same EMA9 stop, same
@@ -626,7 +635,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
         return []
 
     st = load_ledger()
-    pick = pick_for(bar, projection=False)
+    pick = pick_for(bar, projection=False, force_sector=force_sector)
     if not pick:
         # The pick for this candle is not published yet: leave its projections
         # unresolved so the next minute retries instead of writing them off.
@@ -920,7 +929,8 @@ def _sleep_until(target: datetime) -> None:
         time.sleep(min(left, 30))
 
 
-def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = False) -> str:
+def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = False,
+                 force_sector: str | None = None) -> str:
     """Minute-aligned loop: project inside the candle, confirm at its close."""
     from .session import is_weekday
 
@@ -954,7 +964,7 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
                 try:
                     st = load_ledger()
                     stats = st.setdefault("stats", {})
-                    if not stats.get("reported") and (stats.get("early") or stats.get("confirmed")):
+                    if not stats.get("reported") and stats.get("candles"):   # same gate as bot 1
                         if telegram.send_bot3(format_summary(st), dry_run=_dry()):
                             stats["reported"] = True
                             save_ledger(st)
@@ -975,9 +985,10 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
                 # ``confirm``: the candle just closed. ``retry``: its feed
                 # published late — judged again, never a new entry (``sent`` and
                 # the lag deadline still apply).
-                confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now)
+                confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now,
+                             force_sector=force_sector)
             elif action == "project":
-                run_minute(bar, now=now)
+                run_minute(bar, now=now, force_sector=force_sector)
             # Holiday detection, exactly as the 5m loop does it: three candles in
             # a row with no NSE bar today and the day is treated as closed.
             if _session_closed(now):

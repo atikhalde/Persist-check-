@@ -11,7 +11,7 @@ import tempfile
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
-from nse_scanner import data, scan1m, state, stock, telegram
+from nse_scanner import data, pipeline, scan1m, state, stock, telegram
 from nse_scanner.trade import TradePlan
 
 import test_live_alerts as base
@@ -77,7 +77,8 @@ class Scan1mFixture(TestCase):
             patch.object(scan1m, "LEDGER", self.dir / "scan1m.json"),
             patch.object(state, "STATE_PATH", self.dir / "scan_state.json"),
             patch.object(scan1m, "now_ist", side_effect=lambda: self.now),
-            patch.object(scan1m, "pick_for", side_effect=lambda bar, projection: self.pick),
+            patch.object(scan1m, "pick_for",
+                         side_effect=lambda bar, projection, force_sector=None: self.pick),
             patch.object(scan1m.data, "load_universe", return_value=self.universe),
             patch.object(scan1m.data, "yahoo_stock", side_effect=lambda raw: raw + ".NS"),
             patch.object(scan1m.data, "fetch_many", side_effect=self.fetch),
@@ -479,6 +480,74 @@ class RetryTests(Scan1mFixture):
         self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         too_late = BAR + timedelta(minutes=4)                  # > 180 s after the close
         self.assertNotEqual(scan1m.tick(too_late), "retry")
+
+
+class ForceSectorTests(TestCase):
+    """``--sector IT`` behaves like ``run_once(force_sector=...)``."""
+
+    def setUp(self):
+        scan1m._pick_cache.clear()
+        scan1m._md_cache.clear()
+        self.now = BAR + timedelta(minutes=6)
+        md = SimpleNamespace(dir_state=-1, dir_label="BEAR", dir_conf=60, pick_sector="PSU",
+                             pick_side=-1, pick_reason="PERSIST + PSU", action="SCAN SHORT",
+                             regime="TREND", bar_time=BAR.strftime("%Y-%m-%d %H:%M"),
+                             extra_sectors=())
+        self.uni = {"nifty": "NIFTY", "vix": "VIX",
+                    "sectors": {"IT": {"index": "IDX"}, "PSU": {"index": "IDX2"}}}
+        self.patches = [
+            patch.object(pipeline, "now_ist", side_effect=lambda: self.now),
+            patch.object(scan1m, "now_ist", side_effect=lambda: self.now),
+            patch.object(scan1m.data, "load_universe", return_value=self.uni),
+            patch.object(scan1m.data, "fetch_symbol", side_effect=lambda *a: {
+                "m5": five_minute_history(), "d1": None}),
+            patch.object(scan1m.data, "fetch_many", side_effect=lambda t, p, i: {x: None for x in t}),
+            patch.object(scan1m.data, "fetch_daily", return_value={}),
+            patch.object(scan1m, "run_market", return_value=md),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_market_pick_is_used_without_a_forced_sector(self):
+        pick = scan1m._own_pick(BAR)
+        self.assertEqual((pick["sector"], pick["side"]), ("PSU", -1))
+
+    def test_a_forced_sector_overrides_it_like_run_once(self):
+        pick = scan1m._own_pick(BAR, "IT")
+        self.assertEqual((pick["sector"], pick["side"]), ("IT", -1))   # dir_state is BEAR
+        self.assertEqual(scan1m._md_cache[pick["bar"]].pick_reason, "FORCED IT")
+
+    def test_an_unknown_forced_sector_is_ignored(self):
+        self.assertEqual(scan1m._own_pick(BAR, "NOPE")["sector"], "PSU")
+
+
+class CliTests(TestCase):
+    def test_once_1m_passes_the_forced_sector(self):
+        import contextlib
+        import io
+
+        from nse_scanner import __main__ as cli, scan1m, session
+
+        now = BAR + timedelta(seconds=6)                 # minute 0: the close pass
+        with patch.object(session, "now_ist", return_value=now), \
+             patch.object(scan1m, "_bar_open", return_value=BAR), \
+             patch.object(scan1m, "confirm_pass", return_value=[]) as confirm, \
+             patch.object(scan1m, "run_minute") as project:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(["once-1m", "--dry-run", "--sector", "IT"]), 0)
+        confirm.assert_called_once_with(BAR - timedelta(minutes=5), now=now, force_sector="IT")
+        project.assert_not_called()
+        self.assertIn("minute 0", out.getvalue())
+
+    def test_backfill_is_refused_for_the_1m_scan(self):
+        from nse_scanner import __main__ as cli
+
+        with self.assertRaises(SystemExit):
+            cli.main(["once-1m", "--backfill", "--dry-run"])
+        with self.assertRaises(SystemExit):
+            cli.main(["live-1m", "--backfill", "--dry-run"])
 
 
 class HolidayTests(TestCase):
