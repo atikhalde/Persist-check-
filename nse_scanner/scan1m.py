@@ -386,7 +386,8 @@ def _bar_open(ts: datetime) -> datetime:
 
 
 def _in_session(bar: datetime) -> bool:
-    return clock_time(9, 15) <= bar.time() <= clock_time(15, 20)
+    """The candles the 5m scan judges: 09:15 … 15:25 (the 15:25 bar closes 15:30)."""
+    return clock_time(9, 15) <= bar.time() <= clock_time(15, 25)
 
 
 def projected_frame(df5: pd.DataFrame | None, df1m: pd.DataFrame | None,
@@ -637,8 +638,9 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     st = load_ledger()
     pick = pick_for(bar, projection=False, force_sector=force_sector)
     if not pick:
-        # The pick for this candle is not published yet: leave its projections
-        # unresolved so the next minute retries instead of writing them off.
+        # The market bar for this candle is not published yet (the 5m loop keeps
+        # polling in the same situation): leave it owed, and its projections
+        # unresolved, so the next minute tries again instead of writing them off.
         log.info("1m %s close: pick not available yet — will retry", bar.strftime("%H:%M"))
         return []
     stats = st.setdefault("stats", {})
@@ -646,6 +648,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     if pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         _count_candle(stats, pick)
         _settle(st, bar, set(), None, "market/sector pick was WAIT")
+        _mark_judged(st, bar)          # nothing to scan on this candle, as on bot 1
         save_ledger(st)
         return []
     _count_candle(stats, pick)
@@ -659,6 +662,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     positions = st.setdefault("positions", {})
     names = [raw for raw in sector_of if raw not in sent and raw not in positions]
     if not names:
+        _mark_judged(st, bar)          # every name is already in a trade today
         save_ledger(st)
         return []
 
@@ -744,8 +748,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         st["retry_bar"] = bar.isoformat()
         log.info("1m %s: %d of %d feeds had not published — will retry",
                  bar.strftime("%H:%M"), len(set(names) - checked), len(names))
-    elif st.get("retry_bar") == bar.isoformat():
-        st.pop("retry_bar", None)
+    else:
+        _mark_judged(st, bar)
     save_ledger(st)
     return out
 
@@ -862,9 +866,33 @@ def _within_lag(bar: datetime, now: datetime) -> bool:
 
 
 def _retry_pending(bar: datetime) -> bool:
-    """True when ``bar`` was left unfinished (a feed had not published)."""
+    """True when ``bar`` was already tried and left unfinished (a feed lagged)."""
     st = load_ledger()
     return (st.get("retry_bar") or "") == bar.isoformat()
+
+
+def _judged_bar() -> str:
+    return ((load_ledger().get("stats") or {}).get("judged_bar")) or ""
+
+
+def _mark_judged(st: dict, bar: datetime) -> None:
+    """This candle has had its close pass — never judge it again."""
+    st.setdefault("stats", {})["judged_bar"] = bar.isoformat()
+    if st.get("retry_bar") == bar.isoformat():
+        st.pop("retry_bar", None)
+
+
+def _needs_close(bar: datetime, now: datetime) -> bool:
+    """Is the candle ``bar`` still owed a close pass?
+
+    ``pipeline._run_until_ready`` keeps polling until the closed bar has been
+    judged; this is the same obligation, expressed per candle. It does *not*
+    depend on a projection existing: a signal that only appears at the close
+    must still be found.
+    """
+    if not _in_session(bar) or not _within_lag(bar, now):
+        return False
+    return _judged_bar() != bar.isoformat()
 
 
 def unresolved(bar: datetime) -> set[str]:
@@ -896,17 +924,20 @@ def _oi_line(reading) -> str:
 def tick(now: datetime) -> str:
     """What this minute is for: ``confirm`` | ``retry`` | ``project`` | ``idle``.
 
-    ``confirm`` — a 5m candle has just closed: judge the closed candle.
-    ``retry``   — that candle's feed was late: finish judging it.
-    ``project`` — inside a forming candle (minutes 1..4): project it from 1m.
+    ``confirm`` — the candle that just closed has not been judged yet.
+    ``retry``   — it was tried and a feed had not published: finish the job.
+    ``project`` — the close is settled and a forming candle is owed a projection.
+
+    The close always comes first: an entry that only appears at the close must
+    never be lost to a projection window, which the 5m scan cannot lose because
+    it polls ``run_once`` until the bar is judged.
     """
     bar = _bar_open(now)
     minute = int((now - bar).total_seconds() // 60)
-    prev = bar - timedelta(minutes=BAR_MINUTES)
-    if minute == 0:
-        return "confirm" if _in_session(prev) else "idle"
-    if _in_session(prev) and (unresolved(prev) or _retry_pending(prev)) and _within_lag(prev, now):
-        return "retry"
+    milestone = bar - timedelta(minutes=BAR_MINUTES)      # the candle that just closed
+    if _needs_close(milestone, now):
+        # "confirm" the first time, "retry" while a feed has not published yet.
+        return "retry" if _retry_pending(milestone) else "confirm"
     if first_minute() <= minute <= BAR_MINUTES - 1 and _in_session(bar):
         return "project"
     return "idle"
@@ -982,12 +1013,12 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
         try:
             action = tick(now)
             if action in ("confirm", "retry"):
-                # ``confirm``: the candle just closed. ``retry``: its feed
-                # published late — judged again, never a new entry (``sent`` and
-                # the lag deadline still apply).
+                # Judge the candle that just closed. A late feed is judged again
+                # next minute; a stock already sent is never re-sent.
                 confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now,
                              force_sector=force_sector)
-            elif action == "project":
+                action = tick(now)      # a healthy feed finishes this in seconds
+            if action == "project":
                 run_minute(bar, now=now, force_sector=force_sector)
             # Holiday detection, exactly as the 5m loop does it: three candles in
             # a row with no NSE bar today and the day is treated as closed.

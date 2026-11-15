@@ -181,7 +181,9 @@ defaults keep bots 1/2 byte-for-byte unchanged; the settle gate, the "is the row
 test, the reject book and the retry-until-deadline behaviour are the same functions, not copies).
 `tests/test_scan1m_parity.py` holds that claim to account mechanically: one synthetic session
 through both scanners, comparing the frame given to the engine, the plan and every message
-character for character.
+character for character. The scheduler follows the same obligation as `_run_until_ready`: a
+closed candle stays "owed" until its close pass has run (`stats.judged_bar`), so a candle with
+no projection is still judged — the bug the loop test caught before release.
 
 ### D2 — Feed: Yahoo 5m vs TV NSE *(unavoidable)*
 Zero-volume 09:15 bars, missing 15:15–15:25 slots, delayed/unsettled prints, interior holes filled

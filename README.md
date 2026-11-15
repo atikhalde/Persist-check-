@@ -336,7 +336,10 @@ same tracker instead of a copy.
 **The loop itself, too:** both park until 09:14, announce once per session (handovers stay
 silent), send the 15:33 summary once, treat three candles without an NSE bar as a holiday,
 stop at 15:33, hand over after 170 minutes, and retry an unfinished candle until the
-`MAX_ALERT_LAG_SECONDS` deadline instead of writing it off.
+`MAX_ALERT_LAG_SECONDS` deadline instead of writing it off. The same candles are judged
+(09:15 … 15:25, so the 15:25 bar that closes at 15:30 is not lost), and the close always
+comes first: the minute that judges a closed candle still projects the forming one
+afterwards, so an entry that only appears at the close is never traded for a projection.
 
 **The workflow is the same loop, too** (`live-scan-1m.yml` vs `live-scan.yml`):
 same guard (one live loop, older-run handshake, dry runs beside it), same 170-minute
