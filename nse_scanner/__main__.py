@@ -61,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--backfill requires --dry-run; old signals must never reach Telegram")
     if args.wait_for_bar and args.cmd != "once":
         p.error("--wait-for-bar is only valid with once")
+    if args.backfill and args.cmd in ("once-1m", "live-1m"):
+        p.error("--backfill replays a past 5m session; the 1m scan is live-only "
+                "(use: once --backfill --dry-run)")
     if args.wait_for_bar and args.backfill:
         p.error("--wait-for-bar cannot be combined with --backfill")
     _setup_log(args.log_level)
@@ -129,8 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         now = now_ist()
         bar = _bar_open(now)
         minute = int((now - bar).total_seconds() // 60)
-        out = (confirm_pass(bar - timedelta(minutes=5), now=now) if minute == 0
-               else run_minute(bar, now=now))
+        out = (confirm_pass(bar - timedelta(minutes=5), now=now, force_sector=args.sector)
+               if minute == 0 else run_minute(bar, now=now, force_sector=args.sector))
         kind = "confirmed" if minute == 0 else "projected"
         print(f"{bar:%Y-%m-%d %H:%M}  minute {minute}  {kind} alerts={len(out)}")
         for s in out:
@@ -160,7 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "live-1m":
         from .scan1m import live_loop_1m
 
-        reason = live_loop_1m(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close)
+        reason = live_loop_1m(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close,
+                              force_sector=args.sector)
         print(f"1m live loop ended: {reason}")
         out = os.environ.get("GITHUB_OUTPUT")
         if out:  # same handover contract as `live`

@@ -233,7 +233,13 @@ before that candle closes. That mode is a *separate* scan with its own bot:
 ```bash
 python -m nse_scanner live-1m            # projected alerts + confirmed entries, bot 3
 python -m nse_scanner once-1m --dry-run  # one projected pass, prints instead of sending
+python -m nse_scanner once-1m --sector IT --dry-run   # force a sector, as `once` does
 ```
+
+The 5m flags carry over: `--sector` forces the sector exactly like `once --sector`
+(same override block, same `FORCED …` reason), `--max-minutes` / `--exit-at-close`
+drive the handover, and `--backfill` is refused — replaying a past session is a 5m
+diagnostic (`once --backfill --dry-run`), never a 1m live loop.
 
 ```
 ⚡ 🟢 EARLY BUY (1m projection) | BUY-EX17  PNB
@@ -307,7 +313,11 @@ Positions are opened by the confirm pass exactly as `run_once` opens them
 on bot 3 is followed to its targets, its stop and its EMA9 exit — and an SL/EXIT
 also blocks a re-entry for the rest of the session, just like bot 1.
 
-**Prove it, don't claim it:** `tests/test_scan1m_parity.py` runs one synthetic
+**Prove it, don't claim it:** `tests/test_workflow_parity.py` also reads both workflow
+files and fails if either loses a rule input (`SECTOR_FOLLOW`, `SF_ALIGNED_SECTORS`,
+`OI_FILTER`, `MAX_ALERT_LAG_SECONDS`, `BAR_SETTLE_SECONDS`), the guard, the 170-minute
+budget, the handover step, the schema validation, the per-run cache or the separate
+concurrency group; and `tests/test_scan1m_parity.py` runs one synthetic
 session through *both* scanners and asserts (1) the frame handed to
 `stock.scan_stock` is identical (`assert_frame_equal`, same rows, same volume
 repair, `keep_all=True`), (2) the plan is built from the same bar, and (3) the
