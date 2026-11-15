@@ -1,6 +1,7 @@
 """The 1-minute projected scan (Telegram bot #3) — no network access."""
 import contextlib
 import io
+import inspect
 from datetime import timedelta
 from pathlib import Path
 from unittest import TestCase
@@ -12,6 +13,7 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from nse_scanner import data, pipeline, scan1m, state, stock, telegram
+from datetime import time as clock_time
 from nse_scanner.trade import TradePlan
 
 import test_live_alerts as base
@@ -422,6 +424,10 @@ class KnobTests(Scan1mFixture):
 
     def test_first_minute_4_moves_the_projection_to_the_last_minute(self):
         self.minutes = one_minute(0, 1, 2, 3, 4, 5)
+        settled = patch.object(scan1m, "_judged_bar",
+                               return_value=(BAR - timedelta(minutes=5)).isoformat())
+        settled.start()
+        self.addCleanup(settled.stop)
         with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "4"}):
             self.assertEqual(scan1m.tick(MIN1), "idle")           # too early to project
             self.assertEqual(scan1m.run_minute(BAR, now=MIN1), [])
@@ -535,8 +541,9 @@ class CliTests(TestCase):
              patch.object(scan1m, "confirm_pass", return_value=[]) as confirm, \
              patch.object(scan1m, "run_minute") as project:
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                self.assertEqual(cli.main(["once-1m", "--dry-run", "--sector", "IT"]), 0)
+            with patch.dict("os.environ"):        # main(--dry-run) sets DRY_RUN for the run
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(cli.main(["once-1m", "--dry-run", "--sector", "IT"]), 0)
         confirm.assert_called_once_with(BAR - timedelta(minutes=5), now=now, force_sector="IT")
         project.assert_not_called()
         self.assertIn("minute 0", out.getvalue())
@@ -544,10 +551,143 @@ class CliTests(TestCase):
     def test_backfill_is_refused_for_the_1m_scan(self):
         from nse_scanner import __main__ as cli
 
-        with self.assertRaises(SystemExit):
-            cli.main(["once-1m", "--backfill", "--dry-run"])
-        with self.assertRaises(SystemExit):
-            cli.main(["live-1m", "--backfill", "--dry-run"])
+        with patch.dict("os.environ"):
+            with self.assertRaises(SystemExit):
+                cli.main(["once-1m", "--backfill", "--dry-run"])
+            with self.assertRaises(SystemExit):
+                cli.main(["live-1m", "--backfill", "--dry-run"])
+
+
+class _Stop(Exception):
+    """Ends a fake loop run once the scripted iterations are done."""
+
+
+class LoopTests(TestCase):
+    """``live_loop_1m`` itself — the entry point production actually runs."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        scan1m._pick_cache.clear()
+        scan1m._one_cache.clear()
+        scan1m._five_cache.clear()
+        scan1m._md_cache.clear()
+        scan1m._last_nifty_bar = None
+        self.env = patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_SUMMARY": "1",
+                                             "SCAN1M_FIRST_MINUTE": "1"}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.patches = [
+            patch.object(scan1m, "LEDGER", self.dir / "scan1m.json"),
+            patch.object(state, "STATE_PATH", self.dir / "scan_state.json"),
+            patch.object(scan1m.data, "enable_daily_cache"),
+            patch.object(telegram, "send_bot3", return_value=True),
+        ]
+        self.mocks = [p.start() for p in self.patches]
+        for p in self.patches:
+            self.addCleanup(p.stop)
+        self.bot3 = self.mocks[3]
+
+    def run_loop(self, start, *, minutes=4, step_minutes=1, exit_at_close=False,
+                 max_minutes=None, force_sector=None):
+        """Run the real loop with a moving clock; stop it after ``minutes`` cycles."""
+        clock = SimpleNamespace(t=start)
+        ticks = {"n": 0}
+
+        def sleep_until(_target):
+            ticks["n"] += 1
+            if ticks["n"] > minutes:
+                raise _Stop
+            clock.t = clock.t + timedelta(minutes=step_minutes)
+
+        def fake_confirm(bar, *, now=None, force_sector=None):
+            st = scan1m.load_ledger()
+            scan1m._mark_judged(st, bar)        # what the real pass does when complete
+            scan1m.save_ledger(st)
+            return []
+
+        with patch.object(scan1m, "now_ist", side_effect=lambda: clock.t), \
+             patch.object(scan1m, "_sleep_until", side_effect=sleep_until), \
+             patch("nse_scanner.session.is_weekday", return_value=True), \
+             patch.object(scan1m, "_announce") as announce, \
+             patch.object(scan1m, "confirm_pass", side_effect=fake_confirm) as confirm, \
+             patch.object(scan1m, "run_minute", return_value=[]) as project:
+            try:
+                reason = scan1m.live_loop_1m(max_minutes=max_minutes,
+                                             exit_at_close=exit_at_close,
+                                             force_sector=force_sector)
+            except _Stop:
+                reason = "scripted"
+        return SimpleNamespace(reason=reason, announce=announce, confirm=confirm,
+                               project=project, clock=clock)
+
+    def test_the_loop_judges_the_close_then_projects_the_forming_candle(self):
+        run = self.run_loop(BAR + timedelta(minutes=0, seconds=6))      # 10:00:06
+        self.assertEqual(run.announce.call_count, 1)
+        # the 09:55 candle is owed a close pass before anything is projected
+        self.assertEqual(run.confirm.call_count, 1)
+        self.assertEqual(run.confirm.call_args.args[0], BAR - timedelta(minutes=5))
+        self.assertEqual([c.args[0] for c in run.project.call_args_list], [BAR] * 4)
+
+    def test_a_close_with_no_projection_still_runs_in_the_loop(self):
+        with patch.object(scan1m, "unresolved", return_value=set()):
+            run = self.run_loop(BAR + timedelta(minutes=5, seconds=6))  # 10:05:06
+        self.assertEqual(run.confirm.call_count, 1)
+        self.assertEqual(run.confirm.call_args.args[0], BAR)            # the 10:00 candle
+
+    def test_the_projection_survives_a_confirm_in_the_same_minute(self):
+        run = self.run_loop(BAR + timedelta(minutes=5, seconds=6))      # 10:05:06
+        self.assertEqual(run.confirm.call_count, 1)
+        self.assertEqual(run.project.call_count, 4)                     # not lost to the close
+        self.assertEqual(run.project.call_args_list[0].args[0], BAR + timedelta(minutes=5))
+
+    def test_the_forced_sector_reaches_both_passes(self):
+        run = self.run_loop(BAR + timedelta(minutes=5, seconds=6), minutes=1, force_sector="IT")
+        self.assertEqual(run.confirm.call_args.kwargs["force_sector"], "IT")
+        self.assertEqual(run.project.call_args.kwargs["force_sector"], "IT")
+
+    def test_the_session_summary_is_sent_once_and_remembered(self):
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {},
+                    "stats": {"candles": 3, "picks": 2}}, self.dir / "scan1m.json")
+        start = BAR + timedelta(hours=5, minutes=31, seconds=50)        # 15:31:50
+        run = self.run_loop(start, minutes=3, step_minutes=1, exit_at_close=True,
+                            max_minutes=None)
+        # Every cycle before 15:33 does nothing; the first one after it summarises
+        # and hands back "closed".
+        self.assertIn(run.reason, ("closed", "scripted"))
+        texts = [c.args[0] for c in self.bot3.call_args_list]
+        self.assertEqual(sum("1m projected scan" in t for t in texts), 1)
+        self.assertIn("Candles confirmed 3", texts[-1])
+        self.assertTrue(state.load(self.dir / "scan1m.json")["stats"]["reported"])
+
+    def test_the_budget_hands_over(self):
+        run = self.run_loop(BAR, minutes=3, step_minutes=1, max_minutes=1.0)
+        self.assertEqual(run.reason, "budget")
+
+
+class CliHandoffTests(TestCase):
+    def test_a_budget_exit_writes_the_handoff_marker(self):
+        import contextlib
+        import io
+
+        from nse_scanner import __main__ as cli, scan1m
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "gh_output"
+            with patch.object(scan1m, "live_loop_1m", return_value="budget"), \
+                 patch.dict("os.environ", {"GITHUB_OUTPUT": str(out)}), \
+                 patch.dict("os.environ"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cli.main(["live-1m", "--dry-run"]), 0)
+            self.assertIn("handoff=true", out.read_text())
+            out.unlink()
+            with patch.object(scan1m, "live_loop_1m", return_value="closed"), \
+                 patch.dict("os.environ", {"GITHUB_OUTPUT": str(out)}), \
+                 patch.dict("os.environ"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cli.main(["live-1m", "--dry-run"])
+            self.assertIn("handoff=false", out.read_text())
 
 
 class HolidayTests(TestCase):
@@ -632,38 +772,89 @@ class DoctorTests(TestCase):
 
 
 class SchedulerTests(TestCase):
-    """The minute router: project inside the candle, confirm at its close."""
+    """The minute router: the close first, then the projection."""
 
     def setUp(self):
         self.env = patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "1"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        for p in (patch.object(scan1m, "LEDGER", self.dir / "scan1m.json"),
+                  patch.object(scan1m, "now_ist", return_value=BAR + timedelta(minutes=1))):
+            p.start()
+            self.addCleanup(p.stop)
 
     def at(self, minutes, seconds=6):
         return BAR + timedelta(minutes=minutes, seconds=seconds)
 
-    def test_router(self):
-        with patch.object(scan1m, "unresolved", return_value=set()):
-            self.assertEqual(scan1m.tick(self.at(0)), "confirm")    # 10:00 close
-            self.assertEqual(scan1m.tick(self.at(1)), "project")    # T−4
-            self.assertEqual(scan1m.tick(self.at(4)), "project")    # T−1
-            self.assertEqual(scan1m.tick(self.at(5)), "confirm")    # 10:05 close
-            self.assertEqual(scan1m.tick(self.at(6)), "project")    # next candle
+    def judge(self, bar, retry=False):
+        """Pretend ``bar`` has been through the close pass (or is still owed)."""
+        st = {"session": str(bar.date()), "sent": {}, "stats": {}}
+        if retry:
+            st["retry_bar"] = bar.isoformat()      # tried, feed had not published
+        else:
+            st["stats"]["judged_bar"] = bar.isoformat()
+        state.save(st, self.dir / "scan1m.json")
 
-    def test_first_minute_is_respected(self):
-        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "3"}), \
-             patch.object(scan1m, "unresolved", return_value=set()):
+    def test_the_close_is_judged_before_anything_is_projected(self):
+        # 10:01:06: the 09:55 candle closed 66 s ago and has not been judged.
+        self.assertEqual(scan1m.tick(self.at(1)), "confirm")
+        self.judge(BAR - timedelta(minutes=5))
+        self.assertEqual(scan1m.tick(self.at(1)), "project")      # T−4
+        self.assertEqual(scan1m.tick(self.at(4)), "project")      # T−1
+
+    def test_a_close_with_no_projection_is_still_judged(self):
+        """The bug this scheduler had: no projection ⇒ no close pass at all."""
+        self.assertEqual(scan1m.unresolved(BAR - timedelta(minutes=5)), set())
+        self.assertEqual(scan1m.tick(self.at(1)), "confirm")
+
+    def test_a_judged_close_is_not_judged_again(self):
+        self.judge(BAR - timedelta(minutes=5))
+        self.assertNotIn(scan1m.tick(self.at(1)), ("confirm", "retry"))
+
+    def test_an_unfinished_close_is_retried(self):
+        self.judge(BAR - timedelta(minutes=5), retry=True)
+        self.assertEqual(scan1m.tick(self.at(1)), "retry")
+        self.assertEqual(scan1m.tick(self.at(2)), "retry")
+
+    def test_the_close_stops_being_owed_at_the_alert_deadline(self):
+        # 10:08:06 is 186 s after the 10:00 close: too late to judge it.
+        self.assertNotIn(scan1m.tick(self.at(3, seconds=6)), ("confirm", "retry"))
+
+    def test_first_minute_is_respected_once_the_close_is_settled(self):
+        self.judge(BAR - timedelta(minutes=5))
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "3"}):
             self.assertEqual(scan1m.tick(self.at(1)), "idle")
             self.assertEqual(scan1m.tick(self.at(3)), "project")
 
-    def test_a_late_candle_is_retried_before_the_next_projection(self):
-        with patch.object(scan1m, "unresolved", return_value={"ABC"}):
-            self.assertEqual(scan1m.tick(self.at(1)), "retry")
-
     def test_nothing_to_do_after_the_session(self):
         late = BAR.replace(hour=15, minute=40, second=6)
-        with patch.object(scan1m, "unresolved", return_value=set()):
-            self.assertEqual(scan1m.tick(late), "idle")
+        self.assertEqual(scan1m.tick(late), "idle")
+
+
+class SessionWindowTests(TestCase):
+    """The candles the 1m scan judges are the candles the 5m scan judges."""
+
+    def test_the_last_candle_of_the_day_is_not_dropped(self):
+        for minute, expected in ((14, False), (15, True), (30, True), (55, True)):
+            bar = BAR.replace(hour=9, minute=minute)
+            self.assertIs(scan1m._in_session(bar), expected, f"09:{minute:02d}")
+        for minute, expected in ((15, True), (20, True), (25, True), (30, False)):
+            bar = BAR.replace(hour=15, minute=minute)
+            self.assertIs(scan1m._in_session(bar), expected, f"15:{minute:02d}")
+
+    def test_the_same_window_as_the_5m_scan(self):
+        from nse_scanner import pipeline
+        for hh, mm in ((9, 15), (15, 20), (15, 25)):
+            bar = BAR.replace(hour=hh, minute=mm)
+            self.assertTrue(scan1m._in_session(bar))
+            self.assertTrue(clock_time(hh, mm) >= clock_time(9, 15)
+                            and clock_time(hh, mm) <= clock_time(15, 25))
+        self.assertFalse(scan1m._in_session(BAR.replace(hour=15, minute=30)))
+        # pipeline judges closed bars up to 15:25 (its ``_run_until_ready`` guard)
+        self.assertIn("clock_time(15, 25)", inspect.getsource(pipeline._run_until_ready))
 
 
 class ProjectionInvariantTests(TestCase):
