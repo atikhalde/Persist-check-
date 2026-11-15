@@ -313,8 +313,13 @@ class FiveMinuteParityTests(Scan1mTests):
         self.minutes = one_minute(0, 1, 2)                     # stops at minute 2
         later = BAR + timedelta(minutes=7)                     # 2 min past the close
         self.assertEqual(scan1m.confirm_pass(BAR, now=later), [])
-        self.bot3.assert_not_called()
-        self.assertEqual(self.ledger()["stats"]["feed_behind"], 1)
+        text = self.bot3.call_args.args[0]                     # the 5m scan's notice
+        self.assertIn("Yahoo feed is delayed", text)
+        self.assertIn("two minutes after the 10:05 close", text)
+        self.assertNotIn("BUY", text)
+        self.assertEqual(self.bot3.call_count, 1)              # once, not per stock
+        stats = self.ledger()["stats"]
+        self.assertEqual((stats["feed_behind"], stats["feed_warned"]), (1, True))
 
     def test_summary_reports_rejects_and_feed(self):
         st = {"session": "2026-11-09",
@@ -329,6 +334,73 @@ class FiveMinuteParityTests(Scan1mTests):
         self.assertIn("1 on the opposite side to the pick", text)
         self.assertIn("1 without a valid EMA9 stop", text)
         self.assertIn("feed lagged past the close on 1 candle", text)
+
+
+class AlertParityTests(Scan1mTests):
+    """Bot 3 gets the whole 5m alert set, not just entries."""
+
+    def open_trade(self, **over):
+        st = self.ledger() or {"session": str(BAR.date()), "sent": {}, "positions": {}}
+        pos = {"side": "BUY", "entry": 100.0, "sl": 99.0, "entry_ema9": 100.0,
+               "t1": None, "t2": None, "t3": None,
+               "entry_bar": (BAR - timedelta(minutes=10)).isoformat(),
+               "last_bar": (BAR - timedelta(minutes=10)).isoformat()}
+        pos.update(over)
+        st.setdefault("positions", {})["ABC"] = pos
+        st.setdefault("sent", {})
+        state.save(st, self.dir / "scan1m.json")
+        return st
+
+    def test_target_hit_goes_to_bot3_only(self):
+        self.open_trade(t1=100.008)                      # quiet bars touch 100.01
+        self.minutes = one_minute(*range(0, 6))          # feed is settled past the close
+        scan1m.track_positions(BAR)
+        text = self.bot3.call_args.args[0]
+        self.assertIn("TARGET HIT", text)
+        self.assertIn("T1 100.01", text)
+        self.bot1.assert_not_called()
+
+    def test_stop_hit_closes_the_trade_on_bot3(self):
+        self.open_trade(sl=99.995)                       # quiet bars dip to 99.99
+        self.minutes = one_minute(*range(0, 6))
+        scan1m.track_positions(BAR)
+        self.assertIn("SL", self.bot3.call_args.args[0])
+        st = self.ledger()
+        self.assertEqual(st["positions"], {})
+        self.assertEqual(st["sent"]["ABC"]["code"], "SL")     # no re-entry, as on bot 1
+        self.bot1.assert_not_called()
+
+    def test_no_positions_no_message(self):
+        self.assertEqual(scan1m.track_positions(BAR), [])
+        self.bot3.assert_not_called()
+
+    def test_hits_are_tracked_once_per_candle(self):
+        self.minutes = one_minute(0, 1, 2, 3, 4)
+        with patch.object(scan1m, "track_positions", return_value=[]) as track:
+            scan1m.confirm_pass(BAR, now=CLOSE)
+            scan1m.confirm_pass(BAR, now=CLOSE + timedelta(seconds=20))
+            scan1m.run_minute(BAR + timedelta(minutes=5), now=BAR + timedelta(minutes=6, seconds=5))
+        self.assertEqual([c.args[0] for c in track.call_args_list], [BAR])
+
+    def test_market_change_message_is_the_5m_one(self):
+        md = SimpleNamespace(
+            dir_state=1, dir_label="BULL", dir_conf=74, dir_tier="Strong", nifty=25000.0,
+            nifty_day_ret=0.6, nifty_intra=0.2, vix=13.2, vix_chg=-1.5, adx=27.0, mtf_bull=3,
+            breadth_adv=28, breadth_dec=12, regime="TREND", persist_plus=[("IT", 82.0)],
+            persist_minus=[("PSU", 12.0)], live_flow="BUY", live_flow_qualified=True,
+            live_flow_score=71.0, pick_sector="IT", pick_side=1, pick_reason="PERSIST + IT",
+            action="SCAN LONG", bar_time="2026-11-09 10:00")
+        scan1m._md_cache.clear()
+        scan1m._md_cache[md.bar_time] = md
+        st = {"session": str(BAR.date()), "sent": {}, "stats": {}}
+        self.assertTrue(scan1m.market_alert(st, {"bar": md.bar_time, "sector": "IT", "side": 1}))
+        text = self.bot3.call_args.args[0]
+        self.assertIn("MARKET BULL", text)
+        self.assertIn("SECTOR PICK: IT", text)
+        self.assertEqual(st["sector"]["name"], "IT")
+        self.bot3.reset_mock()
+        self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))   # unchanged: silent
+        self.bot3.assert_not_called()
 
 
 class KnobTests(Scan1mTests):

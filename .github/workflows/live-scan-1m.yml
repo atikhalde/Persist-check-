@@ -136,15 +136,20 @@ jobs:
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}
           SCAN1M_1M_PERIOD: ${{ vars.SCAN1M_1M_PERIOD || '1d' }}
+          # The same rule inputs the 5m workflow passes — one engine, one config.
           SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}
           SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}
+          OI_FILTER: ${{ vars.OI_FILTER }}                       # off | annotate | require
+          MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
+          BAR_SETTLE_SECONDS: "45"                              # used by the shared hit tracker
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170
 
+      # Same refusal as the 5m loop: a ledger that fails its schema check must
+      # not become another immutable cache snapshot (it would resend entries).
       - name: Validate 1m scanner state
         id: validate
         if: ${{ always() && !inputs.dry_run && hashFiles('state/scan1m_state.json') != '' }}
-        run: |
-          python -c 'import json,sys; json.load(open("state/scan1m_state.json"))'
+        run: python -c 'from nse_scanner.scan1m import LEDGER; from nse_scanner.state import load; load(LEDGER)'
 
       - name: Save 1m scanner state
         if: ${{ always() && steps.validate.outcome == 'success' }}

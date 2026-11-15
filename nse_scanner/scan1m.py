@@ -172,8 +172,11 @@ def _five_minute_scan() -> dict:
 
 
 # ── market / sector pick ─────────────────────────────────────────────────────
-def _own_pick(decision_bar: datetime) -> dict | None:
-    """Compute the pick the same way the 5m scan does, on the decision bar."""
+_md_cache: dict[str, object] = {}       # decision-bar key -> market verdict (in-process)
+
+
+def _own_market(decision_bar: datetime):
+    """The market engine's verdict on ``decision_bar`` — the 5m scan's own call."""
     uni = data.load_universe()
     period_5m = os.environ.get("YF_PERIOD_5M", "7d")
     period_1d = os.environ.get("YF_PERIOD_1D", "90d")
@@ -201,6 +204,15 @@ def _own_pick(decision_bar: datetime) -> dict | None:
         {name: d1.get(sym) for name, sym in index_map.items()},
     )
     if md.bar_time != decision_bar.strftime("%Y-%m-%d %H:%M"):
+        return None
+    _md_cache[md.bar_time] = md
+    return md
+
+
+def _own_pick(decision_bar: datetime) -> dict | None:
+    """Compute the pick the same way the 5m scan does, on the decision bar."""
+    md = _own_market(decision_bar)
+    if md is None:
         return None
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
     return {
@@ -263,6 +275,35 @@ def pick_for(bar: datetime, *, projection: bool) -> dict | None:
             found = None
     _pick_cache[key] = (time.time(), found)
     return found
+
+
+def market_alert(st: dict, pick: dict | None) -> bool:
+    """Bot 3's copy of the 5m scan's MARKET / SECTOR change message.
+
+    Same trigger as ``pipeline.run_once`` (the direction label or the picked
+    sector+side actually moved) and the same text (``pipeline.format_market``).
+    Only possible when this loop decided the market itself — with
+    ``SCAN1M_MARKET_SOURCE=ledger`` the 5m scan owns that message.
+    """
+    from .pipeline import format_market
+
+    md = _md_cache.get((pick or {}).get("bar") or "")
+    if md is None:
+        return False
+    prev_m = st.get("market") or {}
+    prev_s = st.get("sector") or {}
+    market_changed = prev_m.get("dir_state") != md.dir_state or prev_m.get("label") != md.dir_label
+    sector_changed = prev_s.get("name") != md.pick_sector or prev_s.get("side") != md.pick_side
+    if not (market_changed or sector_changed):
+        return False
+    if not telegram.send_bot3(format_market(md), dry_run=_dry()):
+        return False
+    st["market"] = {"dir_state": md.dir_state, "label": md.dir_label,
+                    "conf": md.dir_conf, "regime": md.regime}
+    st["sector"] = {"name": md.pick_sector, "side": md.pick_side, "reason": md.pick_reason}
+    save_ledger(st)
+    log.info("1m market alert: %s / %s %s", md.dir_label, md.pick_sector, md.pick_side)
+    return True
 
 
 def _scan_list(uni: dict, pick: dict) -> dict[str, str]:
@@ -484,6 +525,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
         log.debug("minute %s outside the projection window for %s", minute, bar)
         return []
 
+    _track_once(bar - timedelta(minutes=BAR_MINUTES))   # last closed candle's hits
     pick = pick_for(bar, projection=True)
     if not pick or pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         log.info("1m %s: no current sector pick — nothing projected", bar.strftime("%H:%M"))
@@ -491,6 +533,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
     session = str(bar.date())
     want = "BUY" if pick["side"] == 1 else "SELL"
     st = load_ledger()
+    market_alert(st, pick)           # same MARKET / SECTOR change message as bot 1
     uni = data.load_universe()
     sector_of = _scan_list(uni, pick)
     if not sector_of:
@@ -575,6 +618,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
                     bar.strftime("%H:%M"), (now - (bar + timedelta(minutes=BAR_MINUTES))).total_seconds())
         return []
 
+    _track_once(bar)                 # T1–T3 / SL / EMA9 exit, before the entry scan
     st = load_ledger()
     pick = pick_for(bar, projection=False)
     if not pick:
@@ -583,6 +627,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
         log.info("1m %s close: pick not available yet — will retry", bar.strftime("%H:%M"))
         return []
     stats = st.setdefault("stats", {})
+    market_alert(st, pick)
     if pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         _count_candle(stats, pick)
         _settle(st, bar, set(), None, "market/sector pick was WAIT")
@@ -662,6 +707,12 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
         sent[raw] = {"code": best.code, "name": best.name, "time": best.time,
                      "price": plan.entry, "sl": plan.sl,
                      "at": now_ist().strftime("%H:%M:%S")}
+        # Open the trade exactly as the 5m scan does, so the same
+        # T1–T3 / SL / EMA9-exit alerts follow it on bot 3.
+        positions[raw] = {"side": best.side, "entry": plan.entry, "sl": plan.sl,
+                          "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2,
+                          "t3": plan.t3, "entry_bar": bar.isoformat(),
+                          "last_bar": bar.isoformat()}
         if early:
             early["result"] = "confirmed"
         stats["confirmed"] = stats.get("confirmed", 0) + 1
@@ -672,6 +723,40 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
     _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes)
     save_ledger(st)
     return out
+
+
+def track_positions(bar: datetime) -> list[str]:
+    """T1–T3 / SL / EMA9-exit alerts for open trades — the 5m scan's own code.
+
+    Literally ``pipeline._track_positions``: same replay, same once-per-level
+    promises, same one-line texts. Only the sender (bot 3) and the ledger
+    (``state/scan1m_state.json``) differ, so the 5m scan's state is never
+    touched and neither loop can silence the other's alerts.
+    """
+    from .pipeline import _track_positions as track
+
+    st = load_ledger()
+    if not st.get("positions"):
+        return []
+    return track(st, bar, os.environ.get("YF_PERIOD_5M", "7d"),
+                 send=lambda text, dry_run=False: telegram.send_bot3(text, dry_run=dry_run),
+                 save=save_ledger)
+
+
+def _track_once(bar: datetime) -> None:
+    """Run the hit tracker once per closed candle (replays are idempotent anyway)."""
+    try:
+        st = load_ledger()
+        if (st.get("stats") or {}).get("tracked_bar") == bar.isoformat():
+            return
+        track_positions(bar)
+        st = load_ledger()
+        st.setdefault("stats", {})["tracked_bar"] = bar.isoformat()
+        save_ledger(st)
+    except state.InvalidStateError:
+        raise
+    except Exception:
+        log.exception("hit tracking failed for %s", bar.strftime("%H:%M"))
 
 
 def _count_candle(stats: dict, pick: dict | None) -> None:
@@ -701,11 +786,20 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
         return
     stats = st.setdefault("stats", {})
     stats["feed_behind"] = stats.get("feed_behind", 0) + 1
-    if not stats.get("feed_warned"):
+    if stats.get("feed_warned"):
+        return
+    age = (now - max(newest)).total_seconds()
+    log.warning("⚠ Yahoo 1m feed is behind: newest print %s, candle closed %s — "
+                "projections and confirmations are held back, not guessed",
+                max(newest), close_at.strftime("%H:%M"))
+    # Same notice the 5m scan puts on bot 1, once per session.
+    if telegram.send_bot3(
+            f"⚠ <b>Yahoo feed is delayed</b> — newest 1m bar is {max(newest):%H:%M} "
+            f"({age:.0f}s old) two minutes after the {close_at:%H:%M} close. Entry alerts are "
+            "held back rather than calculated on unfinished candles; if this continues, "
+            "few or no alerts will arrive today.", dry_run=_dry()):
         stats["feed_warned"] = True
-        log.warning("⚠ Yahoo 1m feed is behind: newest print %s, candle closed %s — "
-                    "projections and confirmations are held back, not guessed",
-                    max(newest), close_at.strftime("%H:%M"))
+        save_ledger(st)
 
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
@@ -850,11 +944,10 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
         bar = _bar_open(now)
         try:
             action = tick(now)
-            if action == "confirm":
-                confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now)
-            elif action == "retry":
-                # A candle whose feed published late is judged again (never a new
-                # entry: ``sent`` and the lag deadline still apply).
+            if action in ("confirm", "retry"):
+                # ``confirm``: the candle just closed. ``retry``: its feed
+                # published late — judged again, never a new entry (``sent`` and
+                # the lag deadline still apply).
                 confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now)
             elif action == "project":
                 run_minute(bar, now=now)

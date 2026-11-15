@@ -573,7 +573,8 @@ def _alert_key(raw: str, pos: dict, tag: str) -> str:
     return _alert_prefix(raw, pos) + tag
 
 
-def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
+def _track_positions(st: dict, bar: datetime, period_5m: str, *,
+                     send=None, save=None) -> list[str]:
     """One-line hit alerts for open trades, independent of market/sector state.
 
     Three events only, each on ONE line, each announced **once per level**:
@@ -595,7 +596,13 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
     (slow Yahoo, queued Actions run) still reports what happened, stamped with
     that candle's time. A failed Telegram POST stops the replay at that candle so
     the next cycle can retry it without resending what already went out.
+
+    ``send``/``save`` default to the 5m scan's own (``telegram.send`` and the 5m
+    ledger); the 1m scan passes bot 3 and its own ledger, so it emits the *same*
+    hit / stop / exit alerts on the same rules without touching the 5m state.
     """
+    send = send or telegram.send
+    save = save or _save
     positions = st.setdefault("positions", {})
     if not positions:
         return []
@@ -650,8 +657,8 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
                        if slot not in done and f"T{slot}" not in announced
                        and (row["High"] >= lvl if side == "BUY" else row["Low"] <= lvl)]
             if hit_now:
-                if not telegram.send(format_target_hit(raw, pos, to_ist(ts), hit_now),
-                                     dry_run=_dry()):
+                if not send(format_target_hit(raw, pos, to_ist(ts), hit_now),
+                            dry_run=_dry()):
                     pending.append(raw)
                     break
                 for slot, _ in hit_now:
@@ -660,7 +667,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
                 done.update(slot for slot, _ in hit_now)
                 pos["hit_targets"] = sorted(done)
                 changed = True
-                _save(st)                       # before the next send: never twice
+                save(st)                        # before the next send: never twice
                 log.info("TARGET HIT %s %s %s @ %s", raw, side,
                          ",".join(f"T{slot} {lvl}" for slot, lvl in hit_now), ts)
 
@@ -671,14 +678,14 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
                     changed = True
                     log.warning("SL for %s already announced; dropping stale position", raw)
                     break
-                if not telegram.send(format_sl_hit(raw, pos, to_ist(ts), sl), dry_run=_dry()):
+                if not send(format_sl_hit(raw, pos, to_ist(ts), sl), dry_run=_dry()):
                     pending.append(raw)
                     break
                 ledger[_alert_key(raw, pos, "SL")] = hhmm
                 del positions[raw]
                 st.setdefault("sent", {}).setdefault(raw, {"code": "SL", "time": hhmm})
                 changed = True
-                _save(st)
+                save(st)
                 log.info("SL HIT %s %s sl=%.2f @ %s", raw, side, sl, ts)
                 break
 
@@ -690,8 +697,8 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
                     changed = True
                     log.warning("EMA9 exit for %s already announced; dropping stale position", raw)
                     break
-                if not telegram.send(format_trail_exit(raw, pos, to_ist(ts), close, float(ema)),
-                                     dry_run=_dry()):
+                if not send(format_trail_exit(raw, pos, to_ist(ts), close, float(ema)),
+                            dry_run=_dry()):
                     pending.append(raw)
                     break
                 ledger[_alert_key(raw, pos, "EXIT")] = hhmm
@@ -699,14 +706,14 @@ def _track_positions(st: dict, bar: datetime, period_5m: str) -> list[str]:
                 # Block a new entry on the same IST session after an exit.
                 st.setdefault("sent", {}).setdefault(raw, {"code": "EXIT", "time": hhmm})
                 changed = True
-                _save(st)
+                save(st)
                 log.info("EMA9 EXIT %s %s close=%.2f ema9=%.4f @ %s", raw, side, close, ema, ts)
                 break
 
             pos["last_bar"] = ts.isoformat()
             changed = True
     if changed:
-        _save(st)
+        save(st)
     return pending
 
 

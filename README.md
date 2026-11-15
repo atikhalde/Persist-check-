@@ -287,9 +287,40 @@ the 1m scan does what the 5m pass does, in the same order:
 | delivery | a failed send is retried while the candle is judgeable | the same — a failed bot-3 send is retried the next minute |
 | summary | candles, picks, sectors, rejects | the same, plus projected / confirmed / cancelled |
 
-The only additions are the ones this mode needs: the forming (projected) candle,
-the EARLY message, silent cancellation and bot 3. `state/scan_state.json`,
-`pipeline.py`, `stock.py`, `telegram.send()` and `live-scan.yml` are untouched.
+**The same alert set, not just entries.** Every message the 5m scan sends has a
+bot-3 twin, produced by the same code:
+
+| message | 5m scan (bot 1/2) | 1m scan (bot 3) |
+|---|---|---|
+| start of session | `NSE live scanner started (5m …)` once | `1m projected scan started (bot 3 …)` once |
+| MARKET / SECTOR change | `format_market(md)` when direction or pick moves | the same text, when this loop decided the market (`own`/`auto`) |
+| projected entry | `EARLY` heads-up 60 s before the close | `⚡ EARLY … (1m projection)`, up to 4 min before |
+| entry | `format_stock` + OI line | the same text, with `✅ CONFIRMED` in front |
+| 🎯 TARGET HIT / 🛑 SL HIT / 🔔 EMA9 EXIT | `_track_positions` | **the same function** — `pipeline._track_positions(..., send=bot 3, save=1m ledger)` |
+| ⚠ feed delayed | one notice per session on bot 1 | the same notice on bot 3 |
+| ❌ early cancelled | only when `EARLY_…` reports it | only when `SCAN1M_CANCEL_MESSAGE=1` |
+| 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
+
+Positions are opened by the confirm pass exactly as `run_once` opens them
+(`side, entry, sl, entry_ema9, t1–t3, entry_bar, last_bar`), so a trade confirmed
+on bot 3 is followed to its targets, its stop and its EMA9 exit — and an SL/EXIT
+also blocks a re-entry for the rest of the session, just like bot 1.
+
+The only additions this mode needs are the forming (projected) candle, the EARLY
+and cancellation messages, and bot 3 itself. `state/scan_state.json`,
+`stock.py`, `telegram.send()` and `live-scan.yml` are untouched; `pipeline.py`
+gained two optional `send`/`save` arguments on `_track_positions` (defaults are
+the 5m behaviour, so bots 1/2 are unchanged) purely so the 1m loop can run the
+same tracker instead of a copy.
+
+**The workflow is the same loop, too** (`live-scan-1m.yml` vs `live-scan.yml`):
+same guard (one live loop, older-run handshake, dry runs beside it), same 170-minute
+budget and `--exit-at-close` handover with `actions: write`, same one-key-per-run
+immutable state cache (own prefix, so neither loop can restore the other's
+snapshot), same `state.load` schema validation before a snapshot may be saved, same
+`concurrency` belt-and-braces (its own group, `cancel-in-progress: false`) and the
+same `SECTOR_FOLLOW`, `SF_ALIGNED_SECTORS`, `OI_FILTER`, `MAX_ALERT_LAG_SECONDS`
+and `BAR_SETTLE_SECONDS` rule inputs.
 
 **The knobs an operator turns** (all optional, all read from the environment — in
 the workflow set them as repository *Variables*, no commit needed):
