@@ -275,14 +275,15 @@ the 1m scan does what the 5m pass does, in the same order:
 | step | 5m scan (`pipeline.run_once`) | 1m scan (`scan1m.confirm_pass`) |
 |---|---|---|
 | name list | `_scan_list` — sector, follows, `SECTOR_EXTRA` | the same function |
-| frame | completed 5m bars, zero-volume bars repaired from 1m | same, from the merged 1m history (prior sessions fetched once) |
-| late candle | `_unsettled` + 45 s settle, `_warn_feed_behind` | `closed_frame` needs a print in the candle's last minute, then `_note_feed_behind` |
+| frame | a stock is judged only if its 5m row is at the decision bar (`current`), zero-volume bars repaired from 1m | the same two tests and the same repair (prior days' 1m come from one 7d fetch per session) |
+| late candle | `_unsettled` + `BAR_SETTLE_SECONDS` settle, `_warn_feed_behind` | **the same two functions**, pointed at bot 3 and the 1m ledger |
+| unfinished candle | `_run_until_ready` retries until the 180 s deadline | the same (`tick()` → `retry`, `retry_bar` in the ledger) |
 | deadline | `_max_lag()` (180 s) after the close | the same `_within_lag` |
 | engine | `stock.scan_stock(raw, frame, daily, keep_all=True)` | the same call |
 | side filter | signals of the pick's side at that candle's time | the same |
 | rejects | opposite / earlier / no_stop / oi book | the same four, same keys, reported in the summary |
 | stop & OI | `build_plan` (entry, EMA9 stop, targets), `_oi_mode` gate | the same |
-| entry text | `format_stock(..., oi_line=...)` + `_target_text` | the same text, with the `✅ CONFIRMED` line in front |
+| entry text | `format_stock(..., oi_line=...)` + `_target_text` | **the same text, character for character**; `✅ CONFIRMED — projected …` is prepended only when this candle *was* projected, so a close-only entry reads exactly like bot 1's |
 | once per name/session | `sent` + `positions` | the same two maps |
 | delivery | a failed send is retried while the candle is judgeable | the same — a failed bot-3 send is retried the next minute |
 | summary | candles, picks, sectors, rejects | the same, plus projected / confirmed / cancelled |
@@ -306,12 +307,26 @@ Positions are opened by the confirm pass exactly as `run_once` opens them
 on bot 3 is followed to its targets, its stop and its EMA9 exit — and an SL/EXIT
 also blocks a re-entry for the rest of the session, just like bot 1.
 
+**Prove it, don't claim it:** `tests/test_scan1m_parity.py` runs one synthetic
+session through *both* scanners and asserts (1) the frame handed to
+`stock.scan_stock` is identical (`assert_frame_equal`, same rows, same volume
+repair, `keep_all=True`), (2) the plan is built from the same bar, and (3) the
+messages are identical character for character — on the happy path, on a wrong-side
+signal, on a missing EMA9 stop, on a WAIT pick, on a delayed feed and on a late run.
+The reject books (`stats.rejected`) are compared as dicts. If either scanner's rules
+drift, that file fails.
+
 The only additions this mode needs are the forming (projected) candle, the EARLY
 and cancellation messages, and bot 3 itself. `state/scan_state.json`,
 `stock.py`, `telegram.send()` and `live-scan.yml` are untouched; `pipeline.py`
 gained two optional `send`/`save` arguments on `_track_positions` (defaults are
 the 5m behaviour, so bots 1/2 are unchanged) purely so the 1m loop can run the
 same tracker instead of a copy.
+
+**The loop itself, too:** both park until 09:14, announce once per session (handovers stay
+silent), send the 15:33 summary once, treat three candles without an NSE bar as a holiday,
+stop at 15:33, hand over after 170 minutes, and retry an unfinished candle until the
+`MAX_ALERT_LAG_SECONDS` deadline instead of writing it off.
 
 **The workflow is the same loop, too** (`live-scan-1m.yml` vs `live-scan.yml`):
 same guard (one live loop, older-run handshake, dry runs beside it), same 170-minute
