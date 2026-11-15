@@ -36,7 +36,13 @@ def one_minute(*minutes, price=100.0):
                          "Close": price, "Volume": 250.0}, index=idx)
 
 
-class Scan1mTests(TestCase):
+class Scan1mFixture(TestCase):
+    """Patched world: one stock, one 5m candle, both bots recorded.
+
+    Only the fixture lives here, so the test classes below can share it without
+    running each other's tests again.
+    """
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -109,7 +115,8 @@ class Scan1mTests(TestCase):
     def ledger(self):
         return state.load(self.dir / "scan1m.json")
 
-    # ── the projection ──────────────────────────────────────────────────────
+# ── the projection ──────────────────────────────────────────────────────────
+class Scan1mTests(Scan1mFixture):
     def test_projects_on_minute_one_and_only_to_bot3(self):
         out = scan1m.run_minute(BAR, now=self.now)
         self.assertEqual(len(out), 1)
@@ -166,7 +173,7 @@ class Scan1mTests(TestCase):
     # ── the close ───────────────────────────────────────────────────────────
     def test_close_confirms_the_projection(self):
         scan1m.run_minute(BAR, now=MIN1)
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         out = scan1m.confirm_pass(BAR, now=CLOSE)
         self.assertEqual(len(out), 1)
         self.assertEqual(self.bot3.call_count, 2)
@@ -180,7 +187,7 @@ class Scan1mTests(TestCase):
 
     def test_projection_that_does_not_hold_is_silent(self):
         scan1m.run_minute(BAR, now=MIN1)
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         self.fires = False
         self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         self.assertEqual(self.bot3.call_count, 1)                  # the early alert only
@@ -190,7 +197,7 @@ class Scan1mTests(TestCase):
 
     def test_cancel_can_be_reported_when_enabled(self):
         scan1m.run_minute(BAR, now=MIN1)
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         self.fires = False
         with patch.dict("os.environ", {"SCAN1M_CANCEL_MESSAGE": "1"}):
             scan1m.confirm_pass(BAR, now=CLOSE)
@@ -198,10 +205,14 @@ class Scan1mTests(TestCase):
         self.assertIn("EARLY CANCELLED", self.bot3.call_args.args[0])
 
     def test_close_only_signal_is_still_sent(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        # No projection for this candle: the message is exactly the 5m entry text
+        # (the parity harness compares it character for character).
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         out = scan1m.confirm_pass(BAR, now=CLOSE)
         self.assertEqual(len(out), 1)
-        self.assertIn("CONFIRMED at close", self.bot3.call_args.args[0])
+        text = self.bot3.call_args.args[0]
+        self.assertTrue(text.startswith("🟢 <b>BUY</b> | <b>BUY-EX</b>  ABC"))
+        self.assertNotIn("CONFIRMED", text)
         self.assertEqual(self.ledger()["sent"]["ABC"]["time"], "10:00")
 
     def test_a_feed_that_has_not_reached_the_close_is_not_judged(self):
@@ -211,14 +222,15 @@ class Scan1mTests(TestCase):
         self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         self.bot3.assert_not_called()
 
-    def test_close_rebuilds_from_1m_when_the_5m_row_is_missing(self):
+    def test_close_waits_for_the_published_5m_row_like_the_5m_scan(self):
+        # run_once only judges a stock whose Yahoo 5m row is at the decision bar
+        # (its ``current`` test). The 1m scan does not invent that row from 1m
+        # prints: it waits, so both scans alert on the same candles.
         self.five = five_minute_history().iloc[:-1]        # the closed row is absent
-        self.minutes = one_minute(0, 1, 2, 3, 4)
-        out = scan1m.confirm_pass(BAR, now=CLOSE)
-        self.assertEqual(len(out), 1)
-        frame = self.engine.call_args.args[1]
-        self.assertEqual(frame.index[-1], BAR)
-        self.assertEqual(len(frame), len(self.five) + 1)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
+        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        self.engine.assert_not_called()
+        self.bot3.assert_not_called()
 
     def test_unpublished_candle_is_not_written_off(self):
         scan1m.run_minute(BAR, now=MIN1)
@@ -228,7 +240,7 @@ class Scan1mTests(TestCase):
         self.assertEqual(scan1m.unresolved(BAR), {"ABC"})
 
     def test_one_entry_per_stock_per_session(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         scan1m.confirm_pass(BAR, now=CLOSE)
         later = BAR + timedelta(minutes=5)
         self.fires = True
@@ -247,7 +259,7 @@ class Scan1mTests(TestCase):
             self.assertEqual(scan1m.ledger_path().name, "scan1m.dry.json")
 
 
-class FiveMinuteParityTests(Scan1mTests):
+class FiveMinuteParityTests(Scan1mFixture):
     """Everything the 5m scan does around the engine, the 1m scan does too."""
 
     def test_prior_day_volume_is_repaired_exactly_like_the_5m_scan(self):
@@ -274,7 +286,7 @@ class FiveMinuteParityTests(Scan1mTests):
                          data.apply_1m_volume(five, frames["ABC.NS"]).loc[frame.index[:-1], "Volume"].tolist())
 
     def test_confirmed_alert_carries_the_oi_line(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         reading = SimpleNamespace(oi_chg_pct=1.8, price_chg_pct=0.4, regime=SimpleNamespace(value="LONG_BUILDUP"))
         reader = SimpleNamespace(snapshot=lambda raw, bar: reading)
         with patch.object(scan1m, "_oi_reader", return_value=reader), \
@@ -284,7 +296,7 @@ class FiveMinuteParityTests(Scan1mTests):
         self.assertIn("OI <b>Long Build-up</b> · OI +1.80%", self.bot3.call_args.args[0])
 
     def test_opposite_side_and_missing_stop_are_recorded(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         with patch.object(scan1m, "scan_stock", side_effect=lambda r, f, d, keep_all=False: [base.signal()]), \
              patch.object(scan1m, "build_plan", return_value=None):
             self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])          # EMA9 stop missing
@@ -296,13 +308,13 @@ class FiveMinuteParityTests(Scan1mTests):
         self.bot3.assert_not_called()
 
     def test_a_candle_past_the_alert_deadline_is_never_confirmed(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         late = CLOSE + timedelta(seconds=400)          # MAX_ALERT_LAG_SECONDS = 180
         self.assertEqual(scan1m.confirm_pass(BAR, now=late), [])
         self.bot3.assert_not_called()
 
     def test_each_candle_is_counted_once(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         scan1m.confirm_pass(BAR, now=CLOSE)
         scan1m.confirm_pass(BAR, now=CLOSE + timedelta(seconds=20))
         stats = self.ledger()["stats"]
@@ -312,6 +324,7 @@ class FiveMinuteParityTests(Scan1mTests):
     def test_a_feed_that_lags_the_close_is_counted_not_guessed(self):
         self.minutes = one_minute(0, 1, 2)                     # stops at minute 2
         later = BAR + timedelta(minutes=7)                     # 2 min past the close
+        self.now = later                                       # both clocks agree
         self.assertEqual(scan1m.confirm_pass(BAR, now=later), [])
         text = self.bot3.call_args.args[0]                     # the 5m scan's notice
         self.assertIn("Yahoo feed is delayed", text)
@@ -336,7 +349,7 @@ class FiveMinuteParityTests(Scan1mTests):
         self.assertIn("feed lagged past the close on 1 candle", text)
 
 
-class AlertParityTests(Scan1mTests):
+class AlertParityTests(Scan1mFixture):
     """Bot 3 gets the whole 5m alert set, not just entries."""
 
     def open_trade(self, **over):
@@ -375,7 +388,7 @@ class AlertParityTests(Scan1mTests):
         self.bot3.assert_not_called()
 
     def test_hits_are_tracked_once_per_candle(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         with patch.object(scan1m, "track_positions", return_value=[]) as track:
             scan1m.confirm_pass(BAR, now=CLOSE)
             scan1m.confirm_pass(BAR, now=CLOSE + timedelta(seconds=20))
@@ -403,11 +416,11 @@ class AlertParityTests(Scan1mTests):
         self.bot3.assert_not_called()
 
 
-class KnobTests(Scan1mTests):
+class KnobTests(Scan1mFixture):
     """The three knobs an operator actually turns."""
 
     def test_first_minute_4_moves_the_projection_to_the_last_minute(self):
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "4"}):
             self.assertEqual(scan1m.tick(MIN1), "idle")           # too early to project
             self.assertEqual(scan1m.run_minute(BAR, now=MIN1), [])
@@ -428,7 +441,7 @@ class KnobTests(Scan1mTests):
     def test_cancel_message_reports_the_close_instead_of_silence(self):
         with patch.dict("os.environ", {"SCAN1M_CANCEL_MESSAGE": "1"}):
             self.assertEqual(len(scan1m.run_minute(BAR, now=MIN1)), 1)     # projected
-            self.minutes = one_minute(0, 1, 2, 3, 4)
+            self.minutes = one_minute(0, 1, 2, 3, 4, 5)
             self.fires = False                                             # close fails
             self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         text = self.bot3.call_args.args[0]
@@ -439,12 +452,46 @@ class KnobTests(Scan1mTests):
 
     def test_cancel_message_off_stays_silent(self):
         self.assertEqual(len(scan1m.run_minute(BAR, now=MIN1)), 1)
-        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         self.fires = False
         self.bot3.reset_mock()
         self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         self.bot3.assert_not_called()
         self.assertEqual(self.ledger()["early"]["ABC"]["result"], "cancelled")
+
+
+class RetryTests(Scan1mFixture):
+    """A candle the feed had not finished is retried until the deadline."""
+
+    def test_an_unfinished_candle_is_retried_even_without_a_projection(self):
+        self.minutes = one_minute(0, 1, 2)                     # newest print 10:02
+        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        self.assertEqual(self.ledger()["retry_bar"], BAR.isoformat())
+        self.assertEqual(scan1m.tick(BAR + timedelta(minutes=6)), "retry")   # tries again
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)            # feed caught up
+        later = BAR + timedelta(minutes=6, seconds=20)
+        self.now = later
+        self.assertEqual(len(scan1m.confirm_pass(BAR, now=later)), 1)
+        self.assertNotIn("retry_bar", self.ledger())
+
+    def test_the_retry_stops_at_the_alert_deadline(self):
+        self.minutes = one_minute(0, 1, 2)
+        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        too_late = BAR + timedelta(minutes=4)                  # > 180 s after the close
+        self.assertNotEqual(scan1m.tick(too_late), "retry")
+
+
+class HolidayTests(TestCase):
+    def tearDown(self):
+        scan1m._last_nifty_bar = None
+
+    def test_a_day_without_an_nse_bar_is_a_holiday(self):
+        scan1m._last_nifty_bar = BAR - timedelta(days=4)        # last bar was last week
+        self.assertTrue(scan1m._session_closed(BAR))
+        scan1m._last_nifty_bar = BAR                            # today's bar exists
+        self.assertFalse(scan1m._session_closed(BAR + timedelta(minutes=5)))
+        scan1m._last_nifty_bar = None                           # nothing seen yet
+        self.assertFalse(scan1m._session_closed(BAR))
 
 
 class MarketSourceTests(TestCase):
@@ -559,9 +606,9 @@ class ProjectionInvariantTests(TestCase):
         """
         five = five_minute_history()
         minutes = pd.DataFrame(
-            {"Open": [100.0] * 5, "High": [100.01] * 5, "Low": [99.99] * 5,
-             "Close": [99.995, 100.0, 100.005, 100.0, 100.0], "Volume": [200.0] * 5},
-            index=pd.DatetimeIndex([BAR + timedelta(minutes=m) for m in range(5)]),
+            {"Open": [100.0] * 6, "High": [100.01] * 6, "Low": [99.99] * 6,
+             "Close": [99.995, 100.0, 100.005, 100.0, 100.0, 100.0], "Volume": [200.0] * 6},
+            index=pd.DatetimeIndex([BAR + timedelta(minutes=m) for m in range(6)]),
         )
         projected = scan1m.projected_frame(five, minutes, BAR, BAR + timedelta(minutes=4, seconds=5))
         closed = scan1m.closed_frame(five, minutes, BAR)

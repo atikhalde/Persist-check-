@@ -530,8 +530,15 @@ def _unsettled(frames1m: dict, symbols, close_at: datetime) -> tuple[set, bool]:
     return waiting, behind
 
 
-def _warn_feed_behind(st: dict, close_at: datetime, frames1m: dict) -> None:
-    """Say once per session that alerts are being held back by a delayed feed."""
+def _warn_feed_behind(st: dict, close_at: datetime, frames1m: dict, *,
+                      send=None, save=None) -> None:
+    """Say once per session that alerts are being held back by a delayed feed.
+
+    ``send``/``save`` default to bot 1 and the 5m ledger; the 1m scan passes
+    bot 3 and its own ledger, so the notice is word-for-word the same.
+    """
+    send = send or telegram.send
+    save = save or _save
     stats = st.setdefault("stats", {})
     if stats.get("feed_warned") or (now_ist() - close_at).total_seconds() < 120:
         return
@@ -540,12 +547,12 @@ def _warn_feed_behind(st: dict, close_at: datetime, frames1m: dict) -> None:
     if newest is None:
         return
     behind = (pd.Timestamp(now_ist()) - newest).total_seconds()
-    if telegram.send(f"⚠ <b>Yahoo feed is delayed</b> — newest 1m bar is {newest:%H:%M} "
-                     f"({behind:.0f}s old) two minutes after the {close_at:%H:%M} close. Entry alerts are "
-                     "held back rather than calculated on unfinished candles; if this continues, "
-                     "few or no alerts will arrive today.", dry_run=_dry()):
+    if send(f"⚠ <b>Yahoo feed is delayed</b> — newest 1m bar is {newest:%H:%M} "
+            f"({behind:.0f}s old) two minutes after the {close_at:%H:%M} close. Entry alerts are "
+            "held back rather than calculated on unfinished candles; if this continues, "
+            "few or no alerts will arrive today.", dry_run=_dry()):
         stats["feed_warned"] = True
-        _save(st)
+        save(st)
 
 
 def _recent_bar(bar: datetime, now: datetime) -> bool:

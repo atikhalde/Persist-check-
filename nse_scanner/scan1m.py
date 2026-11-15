@@ -173,6 +173,7 @@ def _five_minute_scan() -> dict:
 
 # ── market / sector pick ─────────────────────────────────────────────────────
 _md_cache: dict[str, object] = {}       # decision-bar key -> market verdict (in-process)
+_last_nifty_bar: datetime | None = None  # newest Nifty bar seen (holiday detection)
 
 
 def _own_market(decision_bar: datetime):
@@ -187,6 +188,9 @@ def _own_market(decision_bar: datetime):
     if nifty_5 is None or nifty_5.empty:
         return None
     nifty_5 = nifty_5.loc[nifty_5.index <= decision_bar]
+    global _last_nifty_bar
+    if not nifty_5.empty:
+        _last_nifty_bar = to_ist(nifty_5.index[-1])
     if nifty_5.empty or to_ist(nifty_5.index[-1]) != decision_bar:
         return None
     idx_tickers = [uni["vix"]] + list(index_map.values())
@@ -391,35 +395,31 @@ def projected_frame(df5: pd.DataFrame | None, df1m: pd.DataFrame | None,
 
 def closed_frame(df5: pd.DataFrame | None, df1m: pd.DataFrame | None,
                  bar: datetime) -> pd.DataFrame | None:
-    """The candle ``bar`` as it closed — or ``None`` while the feed is behind.
+    """The candle ``bar`` as the 5m scan judges it — or ``None`` while it fills.
 
-    Yahoo publishes a 5m row while its candle is still forming, so "the row is
-    there" does not prove it is complete (the 5m scan waits for the same thing,
-    ``pipeline._unsettled``). The candle is judged only once the 1m feed shows a
-    print inside its last minute; the 5m row is then preferred — the exact input
-    the 5m scan uses — and the 1m prints are the fallback when it is missing.
+    Both halves are the 5m scan's own code, so the answer cannot drift:
+
+    * ``pipeline._unsettled`` decides whether the stock's feed has reached the
+      close (a print at/after it) or ``BAR_SETTLE_SECONDS`` have passed;
+    * the row must be published by Yahoo at ``bar`` (``pipeline.run_once``'s
+      ``current`` test), and its zero-volume bars are repaired from the 1m
+      prints by ``data.apply_1m_volume`` — exactly the frame bot 1 scans.
+
+    The only reason this exists here at all is that this loop asks every minute
+    and must know when to try again; the projection never uses it.
     """
+    from .pipeline import _unsettled
+
     if df5 is None or df5.empty:
         return None
-    end = bar + timedelta(minutes=BAR_MINUTES)
-    settled = False
-    if df1m is not None and not df1m.empty:
-        inside = df1m.loc[(df1m.index >= bar) & (df1m.index < end)]
-        if len(inside):
-            settled = to_ist(inside.index[-1]) >= end - timedelta(minutes=1)
-            if not settled:
-                return None                      # the feed has not reached the close
+    close_at = bar + timedelta(minutes=BAR_MINUTES)
+    waiting, _ = _unsettled({"_": df1m}, ["_"], close_at)
+    if "_" in waiting:
+        return None                      # still filling: retried, never guessed
     upto = df5.loc[df5.index <= bar]
-    if settled and len(upto) and to_ist(upto.index[-1]) == bar:
-        last = upto.iloc[-1]
-        if last["Close"] == last["Close"] and float(last.get("Volume") or 0) > 0:
-            return data.apply_1m_volume(upto, df1m)
-    if df1m is None or df1m.empty:
-        return None
-    rebuilt = data.provisional_5m(df5, df1m, bar, end, max_stale=10 ** 9)
-    if rebuilt is None:
-        return None
-    return data.apply_1m_volume(rebuilt, df1m)
+    if upto.empty or to_ist(upto.index[-1]) != bar:
+        return None                      # no published 5m row yet: the 5m scan waits
+    return data.apply_1m_volume(upto, df1m)
 
 
 def _note_reject(st: dict, kind: str, raw: str, detail: str, *, per_bar: str | None = None) -> None:
@@ -471,7 +471,9 @@ def format_confirmed(sig, scan: dict, plan, *, early: dict | None, sector: str,
         head = (f"✅ <b>CONFIRMED</b> — projected {early['at']} @ {early['price']:.2f}"
                 f" (close {pct:+.2f}% {'beyond' if diff >= 0 else 'back from'} it)\n")
     else:
-        head = "✅ <b>CONFIRMED at close</b> (no projected alert for this candle)\n"
+        # No projection for this candle: the entry is exactly the 5m text, so a
+        # stock that only fired at the close reads the same on both bots.
+        head = ""
     return head + text
 
 
@@ -570,6 +572,10 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None) -> l
         if not fresh:
             continue
         best = fresh[-1]
+        if not _within_lag(bar, now_ist()):
+            log.warning("1m scan finished too late for %s @ %s; dropping entry", raw, best.time)
+            _note_reject(st, "late", raw, f"{raw} {best.time}", per_bar=best.time)
+            continue
         plan = build_plan(best, frame, bar, sd1.get(ysym))
         if plan is None:
             log.info("1m %s %s: no valid EMA9 stop yet — not projected", raw, best.name)
@@ -613,12 +619,12 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
     bar = _bar_open(bar or (now - timedelta(minutes=BAR_MINUTES)))
     if bar.weekday() >= 5 or not _in_session(bar):
         return []
+    _track_once(bar)                 # T1–T3 / SL / EMA9 exit, before the entry scan
     if not _within_lag(bar, now):
         log.warning("1m %s close is %.0fs old — past the alert deadline; nothing confirmed",
                     bar.strftime("%H:%M"), (now - (bar + timedelta(minutes=BAR_MINUTES))).total_seconds())
         return []
 
-    _track_once(bar)                 # T1–T3 / SL / EMA9 exit, before the entry scan
     st = load_ledger()
     pick = pick_for(bar, projection=False)
     if not pick:
@@ -652,6 +658,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
     sm1 = one_minute_frames(tickers, bar)
     sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
     oi_reader = _oi_reader(session)
+    from .pipeline import _note_feed_age
+    _note_feed_age(st, "close", sm1)       # same statistic the 5m summary reports
     _note_feed_behind(st, sm1, bar, now)
 
     hhmm = bar.strftime("%H:%M")
@@ -721,6 +729,14 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None) ->
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
     _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes)
+    # A candle the feed had not finished is retried by ``tick`` until the alert
+    # deadline — ``_run_until_ready`` does the same for the 5m scan.
+    if checked != set(names):
+        st["retry_bar"] = bar.isoformat()
+        log.info("1m %s: %d of %d feeds had not published — will retry",
+                 bar.strftime("%H:%M"), len(set(names) - checked), len(names))
+    elif st.get("retry_bar") == bar.isoformat():
+        st.pop("retry_bar", None)
     save_ledger(st)
     return out
 
@@ -777,7 +793,13 @@ def _count_candle(stats: dict, pick: dict | None) -> None:
 
 
 def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) -> None:
-    """Count candles whose 1m feed had not reached the close (log once)."""
+    """Count a candle whose 1m feed had not reached the close; announce it once.
+
+    The notice itself is ``pipeline._warn_feed_behind`` (word-for-word what bot 1
+    gets), pointed at bot 3 and this ledger.
+    """
+    from .pipeline import _warn_feed_behind
+
     close_at = bar + timedelta(minutes=BAR_MINUTES)
     if (now - close_at).total_seconds() < 120:
         return
@@ -786,20 +808,9 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
         return
     stats = st.setdefault("stats", {})
     stats["feed_behind"] = stats.get("feed_behind", 0) + 1
-    if stats.get("feed_warned"):
-        return
-    age = (now - max(newest)).total_seconds()
-    log.warning("⚠ Yahoo 1m feed is behind: newest print %s, candle closed %s — "
-                "projections and confirmations are held back, not guessed",
-                max(newest), close_at.strftime("%H:%M"))
-    # Same notice the 5m scan puts on bot 1, once per session.
-    if telegram.send_bot3(
-            f"⚠ <b>Yahoo feed is delayed</b> — newest 1m bar is {max(newest):%H:%M} "
-            f"({age:.0f}s old) two minutes after the {close_at:%H:%M} close. Entry alerts are "
-            "held back rather than calculated on unfinished candles; if this continues, "
-            "few or no alerts will arrive today.", dry_run=_dry()):
-        stats["feed_warned"] = True
-        save_ledger(st)
+    _warn_feed_behind(st, close_at, frames1m,
+                      send=lambda text, dry_run=False: telegram.send_bot3(text, dry_run=dry_run),
+                      save=save_ledger)
 
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
@@ -841,6 +852,12 @@ def _within_lag(bar: datetime, now: datetime) -> bool:
     return (now - (bar + timedelta(minutes=BAR_MINUTES))).total_seconds() <= _max_lag()
 
 
+def _retry_pending(bar: datetime) -> bool:
+    """True when ``bar`` was left unfinished (a feed had not published)."""
+    st = load_ledger()
+    return (st.get("retry_bar") or "") == bar.isoformat()
+
+
 def unresolved(bar: datetime) -> set[str]:
     """Projected names of ``bar`` still waiting for a close verdict."""
     st = load_ledger()
@@ -879,11 +896,20 @@ def tick(now: datetime) -> str:
     prev = bar - timedelta(minutes=BAR_MINUTES)
     if minute == 0:
         return "confirm" if _in_session(prev) else "idle"
-    if _in_session(prev) and unresolved(prev) and _within_lag(prev, now):
+    if _in_session(prev) and (unresolved(prev) or _retry_pending(prev)) and _within_lag(prev, now):
         return "retry"
     if first_minute() <= minute <= BAR_MINUTES - 1 and _in_session(bar):
         return "project"
     return "idle"
+
+
+def _session_closed(now: datetime) -> bool:
+    """No NSE bar has been published today — ''nothing will alert'' (a holiday).
+
+    The 5m loop reaches the same conclusion from ``run_until_ready``'s ``CLOSED``
+    three candles in a row; this is the same test on the same Nifty feed.
+    """
+    return _last_nifty_bar is not None and _last_nifty_bar.date() < now.date()
 
 
 def _sleep_until(target: datetime) -> None:
@@ -910,6 +936,7 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
     _announce()
 
     holiday = None
+    closed_streak = 0
     while True:
         now = now_ist()
         if not is_weekday(now) or holiday == now.date():
@@ -951,6 +978,15 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
                 confirm_pass(bar - timedelta(minutes=BAR_MINUTES), now=now)
             elif action == "project":
                 run_minute(bar, now=now)
+            # Holiday detection, exactly as the 5m loop does it: three candles in
+            # a row with no NSE bar today and the day is treated as closed.
+            if _session_closed(now):
+                closed_streak += 1
+                if closed_streak >= 3 and now.time() >= clock_time(9, 30):
+                    holiday = now.date()
+                    log.info("no NSE bar published today — treating %s as a holiday", holiday)
+            else:
+                closed_streak = 0
         except state.InvalidStateError:
             raise
         except Exception:
