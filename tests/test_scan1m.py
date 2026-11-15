@@ -1,4 +1,6 @@
 """The 1-minute projected scan (Telegram bot #3) — no network access."""
+import contextlib
+import io
 from datetime import timedelta
 from pathlib import Path
 from unittest import TestCase
@@ -327,6 +329,118 @@ class FiveMinuteParityTests(Scan1mTests):
         self.assertIn("1 on the opposite side to the pick", text)
         self.assertIn("1 without a valid EMA9 stop", text)
         self.assertIn("feed lagged past the close on 1 candle", text)
+
+
+class KnobTests(Scan1mTests):
+    """The three knobs an operator actually turns."""
+
+    def test_first_minute_4_moves_the_projection_to_the_last_minute(self):
+        self.minutes = one_minute(0, 1, 2, 3, 4)
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "4"}):
+            self.assertEqual(scan1m.tick(MIN1), "idle")           # too early to project
+            self.assertEqual(scan1m.run_minute(BAR, now=MIN1), [])
+            self.bot3.assert_not_called()
+            late = BAR + timedelta(minutes=4, seconds=5)
+            self.assertEqual(scan1m.tick(late), "project")
+            self.assertEqual(len(scan1m.run_minute(BAR, now=late)), 1)
+        self.assertIn("0m 55s left", self.bot3.call_args.args[0])
+
+    def test_first_minute_is_clamped_to_the_candle(self):
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "0"}):
+            self.assertEqual(scan1m.first_minute(), 1)
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "9"}):
+            self.assertEqual(scan1m.first_minute(), 4)
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "junk"}):
+            self.assertEqual(scan1m.first_minute(), 1)
+
+    def test_cancel_message_reports_the_close_instead_of_silence(self):
+        with patch.dict("os.environ", {"SCAN1M_CANCEL_MESSAGE": "1"}):
+            self.assertEqual(len(scan1m.run_minute(BAR, now=MIN1)), 1)     # projected
+            self.minutes = one_minute(0, 1, 2, 3, 4)
+            self.fires = False                                             # close fails
+            self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        text = self.bot3.call_args.args[0]
+        self.assertIn("EARLY CANCELLED", text)
+        self.assertIn("projected 10:01:05 @ 100.00", text)
+        self.assertIn("close 100.00", text)
+        self.assertIn("no entry recorded", text)
+
+    def test_cancel_message_off_stays_silent(self):
+        self.assertEqual(len(scan1m.run_minute(BAR, now=MIN1)), 1)
+        self.minutes = one_minute(0, 1, 2, 3, 4)
+        self.fires = False
+        self.bot3.reset_mock()
+        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        self.bot3.assert_not_called()
+        self.assertEqual(self.ledger()["early"]["ABC"]["result"], "cancelled")
+
+
+class MarketSourceTests(TestCase):
+    """SCAN1M_MARKET_SOURCE=ledger vs own — with no market fetch in ledger mode."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        scan1m._pick_cache.clear()
+        scan1m._ledger_warned.clear()
+        self.env = patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_MARKET_SOURCE": "ledger"},
+                              clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for p in (patch.object(state, "STATE_PATH", self.dir / "scan_state.json"),
+                  patch.object(scan1m, "_own_pick",
+                               side_effect=AssertionError("own pick must not run in ledger mode"))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.scan5 = {"bar": (BAR - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M"),
+                      "sector": "IT", "side": 1, "label": "BULL", "conf": 74,
+                      "extra": [], "follow": False}
+
+    def test_ledger_pick_is_reused_for_the_projection(self):
+        state.save({"session": str(BAR.date()), "scan": self.scan5, "sent": {}}, state.STATE_PATH)
+        pick = scan1m.pick_for(BAR, projection=True)
+        self.assertEqual(pick["sector"], "IT")
+        self.assertEqual(pick["side"], 1)
+        self.assertEqual(pick["bar"], self.scan5["bar"])
+
+    def test_ledger_pick_of_another_candle_is_not_reused(self):
+        stale = {**self.scan5, "bar": (BAR - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M")}
+        state.save({"session": str(BAR.date()), "scan": stale, "sent": {}}, state.STATE_PATH)
+        with self.assertLogs("nse_scanner.scan1m", level="WARNING"):
+            self.assertIsNone(scan1m.pick_for(BAR, projection=True))
+
+    def test_missing_ledger_says_why_and_only_once_per_candle(self):
+        with self.assertLogs("nse_scanner.scan1m", level="WARNING") as logs:
+            self.assertIsNone(scan1m.pick_for(BAR, projection=True))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("does not exist", logs.output[0])
+        self.assertIn("SCAN1M_MARKET_SOURCE=own", logs.output[0])
+        with self.assertNoLogs("nse_scanner.scan1m", level="WARNING"):
+            scan1m._warn_ledger_once(BAR - timedelta(minutes=5))   # same candle: already said
+        with self.assertLogs("nse_scanner.scan1m", level="WARNING"):
+            scan1m._warn_ledger_once(BAR + timedelta(minutes=5))
+
+
+class DoctorTests(TestCase):
+    def test_doctor_shows_the_knobs_before_the_session_starts(self):
+        from nse_scanner import __main__ as cli
+
+        uni = {"nifty": "NIFTY", "vix": "VIX", "sectors": {}}
+        with patch.dict("os.environ", {"SCAN1M_FIRST_MINUTE": "2", "SCAN1M_MARKET_SOURCE": "ledger",
+                                       "SCAN1M_CANCEL_MESSAGE": "1"}, clear=False), \
+             patch.object(data, "load_universe", return_value=uni), \
+             patch.object(data, "fetch_symbol", return_value={"m5": pd.DataFrame()}), \
+             patch.object(telegram, "config_from_env", return_value=("", "")), \
+             patch.object(telegram, "secondary_config_from_env", return_value=("", "")), \
+             patch.object(telegram, "third_config_from_env", return_value=("", "")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cli._doctor()
+        text = out.getvalue()
+        self.assertIn("first minute 2 (up to 3 min early)", text)
+        self.assertIn("market source ledger", text)
+        self.assertIn("cancel messages on", text)
 
 
 class SchedulerTests(TestCase):

@@ -204,6 +204,11 @@ def _doctor() -> int:
               "set" if third_token and third_chat else "INCOMPLETE — set both _3 values")
     else:
         print("Telegram bot 3 (1m scan): not configured (live-1m prints instead of sending)")
+    from .scan1m import cancel_message, first_minute, market_source
+    fm = first_minute()
+    print(f"1m scan knobs: first minute {fm} (up to {5 - fm} min early) · "
+          f"market source {market_source()} · "
+          f"cancel messages {'on' if cancel_message() else 'off'}")
     if token and chat:
         ok = telegram.send("NSE scanner doctor ping", dry_run=os.environ.get("DRY_RUN") == "1")
         print("Telegram send:", "ok" if ok else "FAILED")

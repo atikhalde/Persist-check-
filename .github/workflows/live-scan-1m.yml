@@ -121,16 +121,21 @@ jobs:
           TELEGRAM_CHAT_ID_3: ${{ secrets.TELEGRAM_CHAT_ID_3 }}
           LOG_LEVEL: INFO
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # Knobs — change them in Settings → Secrets and variables → Actions →
+          # Variables (no commit needed); the values below are the defaults.
           # 1 = alert from the first minute of the candle (up to 4 min early).
-          SCAN1M_FIRST_MINUTE: "1"
-          SCAN1M_MAX_STALE_SECONDS: "100"
-          SCAN1M_GRACE_SECONDS: "6"
-          SCAN1M_EARLY_PER_DAY: "1"
-          # This loop decides the sector/side itself (same market engine); the
-          # 5m ledger is not available to it in this workflow.
-          SCAN1M_MARKET_SOURCE: own
-          SCAN1M_CANCEL_MESSAGE: "0"
-          SCAN1M_1M_PERIOD: "1d"
+          SCAN1M_FIRST_MINUTE: ${{ vars.SCAN1M_FIRST_MINUTE || '1' }}
+          SCAN1M_MAX_STALE_SECONDS: ${{ vars.SCAN1M_MAX_STALE_SECONDS || '100' }}
+          SCAN1M_GRACE_SECONDS: ${{ vars.SCAN1M_GRACE_SECONDS || '6' }}
+          SCAN1M_EARLY_PER_DAY: ${{ vars.SCAN1M_EARLY_PER_DAY || '1' }}
+          # own: this loop decides the sector/side itself (same market engine).
+          # ledger: reuse the 5m scan's pick from state/scan_state.json — only
+          # meaningful when that file is present on this runner.
+          SCAN1M_MARKET_SOURCE: ${{ vars.SCAN1M_MARKET_SOURCE || 'own' }}
+          # 1 = also report a projection that did not survive the close.
+          SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
+          SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}
+          SCAN1M_1M_PERIOD: ${{ vars.SCAN1M_1M_PERIOD || '1d' }}
           SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}
           SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170
