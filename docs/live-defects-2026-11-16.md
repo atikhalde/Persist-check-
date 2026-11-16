@@ -670,3 +670,76 @@ fires when the breadth finally turns is shorting into the low. Run it across the
 sessions you have: if the morning rows keep showing the sector lower by the close,
 the lane has evidence; if they oscillate around zero, it is a chop-day coin flip
 and stays off.
+
+---
+
+## Sixth pass — the summary block could not be audited
+
+The two blocks you pasted from bot 3 do not describe the same day the same way:
+
+```
+Early alerts 5: confirmed 3 · cancelled 2
+Projected alerts 5 · of which confirmed at the close 11 · did not hold 1
+Entries 11
+```
+
+A subset (**confirmed 11**) is larger than the set it is counted from (**projected
+5**). That is not a rounding difference; it means one of the counters is measuring
+something else.
+
+### The cause
+
+`_catchup_pass`'s confirm block bumped `stats["confirmed"]` for **every entry**,
+inside the entry loop but outside the `if early:` branch:
+
+```python
+early = cand["early"]
+if early:
+    early["result"] = "confirmed"
+stats["confirmed"] += 1          # ← ran for close-only entries too
+```
+
+and `stats["entries"]` was never written at all — so the `Entries` line printed
+`stats['confirmed']`, which is why the two lines carried the same number.
+The 16 Nov day therefore was: **5 projections, 3 of which survived their close,
+11 entries, 8 of them close-only.** The block named none of that.
+
+### The fix
+
+`confirmed` now counts projections that survived their close, exactly as on bot 1
+(`if early:` only), `entries` is its own counter, and both lines are built by
+named helpers so the arithmetic is visible in one place:
+
+```
+Projected alerts 5 · of which confirmed at the close 3 · did not hold 1 · still open 1
+Entries (close-confirmed, sent to this bot) 11 · with an early alert 3 · close-only 8
+```
+
+`still open N` is only printed when there is a residue — the projection is sent
+early and settled at the close, so a bar in flight is a real, nameable state, not
+a rounding error. `close-only` is the number bot 3 exists to drive to zero.
+
+### The second invisibility: `catch-ups 0` with nine leaders listed
+
+The 5m summary said nine signals fired before their sector was picked; the bot-3
+summary said `catch-ups 0` and stopped there. `catchup_candidate` refused with a
+bare `return None` in six different places, so "nothing qualified" and "the
+feature is broken" looked identical. Each refusal now names itself, and the line
+reads:
+
+```
+LATE LEADER catch-ups 0 (signal fired before its sector was picked) · not sent:
+stop taken since the fire 3 · already ran (chase) 2 · no earlier fire 9
+```
+
+in a fixed order (`stop`, `chased`, `old`, `bar`, `plan`, `none`) so two days can
+be compared by eye. A non-zero catch-up count is unchanged in wording.
+
+### Proof
+
+`pytest -q` → **374 passed**; `pyflakes` clean. New: an entry with no early alert
+leaves `confirmed` at 0 while `entries` reaches 1 (the 16 Nov arithmetic), the
+projected line under a residue and with none, the carried / close-only split, a
+zero catch-up line that explains itself, skips printing the LATE LEADER line
+even when `catchup` is 0, and each refusal code. The old ledgers stay readable:
+with no `entries` key the entry line falls back to `confirmed`.

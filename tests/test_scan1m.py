@@ -422,6 +422,14 @@ class FiveMinuteParityTests(Scan1mFixture):
         self.assertEqual((stats["candles"], stats["picks"]), (1, 1))
         self.assertEqual(stats["sectors"], {"IT long": 1})
 
+    def test_an_entry_without_a_projection_is_not_a_confirmed_projection(self):
+        # 16 Nov: "Projected alerts 5 · of which confirmed at the close 11".
+        # ``confirmed`` was bumped per entry, so a subset outgrew its parent set.
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)
+        self.assertEqual(len(scan1m.confirm_pass(BAR, now=CLOSE)), 1)   # an entry, no early alert
+        stats = self.ledger()["stats"]
+        self.assertEqual((stats.get("entries"), stats.get("confirmed", 0)), (1, 0))
+
     def test_a_feed_that_lags_the_close_is_counted_not_guessed(self):
         self.minutes = one_minute(0, 1, 2)                     # stops at minute 2
         later = BAR + timedelta(minutes=7)                     # 2 min past the close
@@ -448,6 +456,60 @@ class FiveMinuteParityTests(Scan1mFixture):
         self.assertIn("1 on the opposite side to the pick", text)
         self.assertIn("1 without a valid EMA9 stop", text)
         self.assertIn("feed lagged past the close on 1 candle", text)
+
+
+class SummaryCounterTests(TestCase):
+    """The summary block is the audit surface: its counters have to add up."""
+
+    def test_confirmed_is_never_larger_than_the_projections_it_comes_from(self):
+        line = scan1m._projected_line({"early": 5, "confirmed": 3, "cancelled": 1})
+        self.assertEqual(line, "Projected alerts 5 · of which confirmed at the close 3"
+                               " · did not hold 1 · still open 1")
+
+    def test_the_residue_is_named_only_when_there_is_one(self):
+        line = scan1m._projected_line({"early": 5, "confirmed": 3, "cancelled": 2})
+        self.assertNotIn("still open", line)                # 5 = 3 + 2, nothing left over
+
+    def test_entries_split_into_carried_and_close_only(self):
+        line = scan1m._entries_line({"entries": 11, "confirmed": 3})
+        self.assertEqual(line, "Entries (close-confirmed, sent to this bot) 11"
+                               " · with an early alert 3 · close-only 8")
+
+    def test_a_fully_carried_day_has_no_close_only_tail(self):
+        line = scan1m._entries_line({"entries": 2, "confirmed": 2})
+        self.assertEqual(line, "Entries (close-confirmed, sent to this bot) 2"
+                               " · with an early alert 2")
+
+    def test_a_zero_catch_up_line_says_why_it_was_zero(self):
+        st = {"session": "2026-11-16",
+              "stats": {"candles": 4, "picks": 1, "catchup": 0,
+                        "catchup_skip": {"stop": 3, "none": 9, "chased": 2}},
+              "sent": {}}
+        text = scan1m.format_summary(st)
+        self.assertIn("LATE LEADER catch-ups 0", text)
+        self.assertIn("not sent: stop taken since the fire 3 · already ran (chase) 2"
+                      " · no earlier fire 9", text)
+
+    def test_skips_alone_still_print_the_late_leader_line(self):
+        st = {"session": "2026-11-16", "stats": {"candles": 1, "picks": 1,
+                                                "catchup_skip": {"stop": 1}}, "sent": {}}
+        self.assertIn("LATE LEADER catch-ups 0 (signal fired before its sector was picked)"
+                      " · not sent: stop taken since the fire 1", scan1m.format_summary(st))
+
+    def test_a_refusal_names_its_reason(self):
+        signal = base.signal(time="09:30")
+        for frame, fires, want in ((None, [signal], "bar"),
+                                   (five_minute_history(), [], "bar"),
+                                   (five_minute_history(), [base.signal(side="SELL", time="09:30")],
+                                    "none")):
+            report = {}
+            self.assertIsNone(scan1m.catchup_candidate(frame, fires, "BUY", BAR, CLOSE,
+                                                       None, report=report))
+            self.assertEqual(report["why"], want)
+
+    def test_a_refusal_without_a_report_dict_still_refuses_quietly(self):
+        self.assertIsNone(scan1m.catchup_candidate(None, [base.signal(time="09:30")],
+                                                   "BUY", BAR, CLOSE, None))
 
 
 class AlertParityTests(Scan1mFixture):

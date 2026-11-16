@@ -758,6 +758,37 @@ _SKIP_LABEL = {
 }
 
 
+def _projected_line(stats: dict) -> str:
+    """Projected / confirmed / not held — and the remainder, named.
+
+    16 Nov read ``Projected alerts 5 · of which confirmed at the close 11 · did
+    not hold 1``: "confirmed" was counting every entry (the line below said
+    ``Entries 11`` too), so a subset came out larger than its parent set.
+    """
+    sent = int(stats.get("early") or 0)
+    ok = int(stats.get("confirmed") or 0)
+    gone = int(stats.get("cancelled") or 0)
+    open_n = max(0, sent - ok - gone)
+    return (f"Projected alerts {sent} · of which confirmed at the close {ok}"
+            f" · did not hold {gone}" + (f" · still open {open_n}" if open_n else ""))
+
+
+def _entries_line(stats: dict) -> str:
+    """Entries, split by whether a projection stood behind them.
+
+    The split is the point of bot 3: a close-only entry is the case the 1-minute
+    scan exists to prevent.
+    """
+    entries = int(stats.get("entries") or stats.get("confirmed") or 0)
+    with_lead = min(entries, int(stats.get("confirmed") or 0))
+    text = f"Entries (close-confirmed, sent to this bot) {entries}"
+    if entries:
+        text += f" · with an early alert {with_lead}"
+        if entries > with_lead:
+            text += f" · close-only {entries - with_lead}"
+    return text
+
+
 def format_summary(st: dict) -> str:
     from .pipeline import _summary_rejects, _summary_sectors
 
@@ -765,22 +796,24 @@ def format_summary(st: dict) -> str:
     lines = [f"📊 <b>1m projected scan {st.get('session', '')}</b>",
              f"Candles confirmed {stats.get('candles', 0)} · with a sector pick {stats.get('picks', 0)}",
              _summary_sectors(stats),
-             f"Projected alerts {stats.get('early', 0)} · of which confirmed at the close "
-             f"{stats.get('confirmed', 0)} · did not hold {stats.get('cancelled', 0)}"]
+             _projected_line(stats)]
     leads = stats.get("lead_n") or 0
     if leads:
         lines.append(f"Average lead {stats.get('lead_sum', 0) / leads:.1f} min before the 5m close "
                      f"(earliest {stats.get('lead_min', 0)} min)")
-    if stats.get("catchup"):
-        lines.append(f"LATE LEADER catch-ups {stats['catchup']} "
-                     f"(signal fired before its sector was picked)")
+    if stats.get("catchup") or stats.get("catchup_skip"):
+        skips = stats.get("catchup_skip") or {}
+        refused = " · ".join(f"{_CATCHUP_WHY.get(k, k)} {skips[k]}"
+                             for k in _CATCHUP_WHY_ORDER if skips.get(k))
+        lines.append(f"LATE LEADER catch-ups {stats.get('catchup', 0)} "
+                     f"(signal fired before its sector was picked)"
+                     + (f" · not sent: {refused}" if refused else ""))
     skips = stats.get("proj_skip") or {}
     if skips:
         bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]
         bits += [f"{k} {v}" for k, v in skips.items() if k not in _SKIP_LABEL]
         lines.append("Checked, not projected: " + " · ".join(bits))
-    lines += [f"Entries (close-confirmed, sent to this bot) {stats.get('confirmed', 0)}",
-              _summary_rejects(st)]
+    lines += [_entries_line(stats), _summary_rejects(st)]
     if stats.get("feed_behind"):
         lines.append(f"⚠ the 1m feed lagged past the close on {stats['feed_behind']} candle(s)")
     lines.append(f"Projected alerts fire {first_minute()}–4 minutes before the 5m close.")
@@ -826,8 +859,21 @@ def catchup_due(st: dict, pick: dict, bar: datetime) -> bool:
     return (bar - since) <= timedelta(minutes=_CATCHUP_WINDOW_MINUTES)
 
 
+_CATCHUP_WHY = {
+    "none": "no earlier fire",
+    "bar": "fire bar not on the tape",
+    "old": "older than the window",
+    "chased": "already ran (chase)",
+    "stop": "stop taken since the fire",
+    "plan": "no plan on the fire bar",
+}
+
+_CATCHUP_WHY_ORDER = ("stop", "chased", "old", "bar", "plan", "none")
+
+
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
-                      bar: datetime, now: datetime, daily=None) -> dict | None:
+                      bar: datetime, now: datetime, daily=None,
+                      report: dict | None = None) -> dict | None:
     """The name's day-first fire of this side, if a catch-up is still justified.
 
     Valid means all of: the fire is on an earlier candle of today's session, its
@@ -836,37 +882,43 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
     already beyond ``SCAN1M_LEADER_MAX_R`` (a leader that has run is no longer a
     catch-up — it is a chase).
     """
-    if frame is None or frame.empty or not fires:
+    def _no(code: str):
+        """Refuse, and (optionally) say why — "0 catch-ups" is not a diagnosis."""
+        if report is not None:
+            report["why"] = code
         return None
+
+    if frame is None or frame.empty or not fires:
+        return _no("bar")
     hhmm = bar.strftime("%H:%M")
     earlier = [s for s in fires if s.side == want and s.time < hhmm]
     if not earlier:
-        return None
+        return _no("none")
     sig = min(earlier, key=lambda s: s.time)          # the day's first fire of this side
     fire = _fire_bar(bar, sig.time)
     if fire is None:
-        return None
+        return _no("bar")
     age = (now - (fire + timedelta(minutes=BAR_MINUTES))).total_seconds() / 60.0
     if age < 0 or age > leader_max_minutes():
-        return None
+        return _no("old")
     upto = frame.loc[frame.index <= pd.Timestamp(fire)]
     if upto.empty or to_ist(upto.index[-1]) != to_ist(fire):
-        return None
+        return _no("bar")
     plan = build_plan(sig, upto, fire, daily)
     if plan is None:
-        return None
+        return _no("plan")
     after = frame.loc[frame.index > fire]
     if after.empty:
-        return None
+        return _no("bar")
     stopped = (bool((after["Low"] <= plan.sl).any()) if sig.side == "BUY"
                else bool((after["High"] >= plan.sl).any()))
     if stopped:
-        return None
+        return _no("stop")
     price = float(frame["Close"].iloc[-1])
     signed = (price - plan.entry) if sig.side == "BUY" else (plan.entry - price)
     r = signed / plan.risk if plan.risk else 0.0
     if r > leader_max_r():
-        return None
+        return _no("chased")
     return {"sig": sig, "plan": plan, "price": price, "r": r, "fire": fire, "age": age}
 
 
@@ -1101,9 +1153,13 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
         frame, fires_list = frames.get(raw), fires.get(raw)
         if frame is None or not fires_list:
             continue
+        why: dict = {}
         hit = catchup_candidate(frame, fires_list, "BUY" if pick.get("side") == 1 else "SELL",
-                                bar, now, daily.get(data.yahoo_stock(raw)))
+                                bar, now, daily.get(data.yahoo_stock(raw)), report=why)
         if hit is None:
+            if why.get("why"):
+                skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
+                skips[why["why"]] = skips.get(why["why"], 0) + 1
             continue
         if not telegram.send_bot3(format_catchup(raw, hit, pick, bar, now), dry_run=_dry()):
             continue
@@ -1271,7 +1327,12 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         early = cand["early"]
         if early:
             early["result"] = "confirmed"
-        stats["confirmed"] = stats.get("confirmed", 0) + 1
+            # ``confirmed`` counts *projections that survived their close*, as on
+            # bot 1 — it used to count every entry, so the summary read
+            # "Projected alerts 5 · of which confirmed 11 · Entries 11": a subset
+            # reported larger than the set it is counted from.
+            stats["confirmed"] = stats.get("confirmed", 0) + 1
+        stats["entries"] = stats.get("entries", 0) + 1
         save_ledger(st)
         log.info("1m CONFIRMED %s %s %s @ %.2f (sent %s IST)", raw, best.side, best.name,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
