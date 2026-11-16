@@ -471,6 +471,33 @@ Two decisions were taken with it:
 A weak BEAR still waits: the mirrored gates are not written, and a
 half-mirrored rule is worse than none.
 
+### "REALTY was top persistent — why was FMCG picked?"
+
+Because the two numbers are not on the same scale, and because the pick is
+direction-first. From a replay of the same two sectors, the only thing that
+changes between the two runs is the Nifty series:
+
+| sector | side | persist **+** | persist **−** | day | range pos |
+|---|---|---|---|---|---|
+| FMCG | +1 | **96.8** | 1.2 | +2.24% | 96 |
+| REALTY | −1 | 0.8 | **97.3** | −3.28% | 3 |
+
+* Nifty rising → `pick FMCG` (`PERSIST + FMCG qualified (score 97)`);
+* Nifty falling → `pick REALTY` (`PERSIST − REALTY qualified (score 97)`);
+* Nifty flat → `pick FMCG` (`SECTOR FOLLOW — Nifty NEUTRAL, FMCG leads`).
+
+REALTY's 91 is **bearish** persistence — its score on the bull metric is 0.8.
+Putting 91 next to FMCG's 93 compares a fall with a rise. The pools never rank
+against each other: `commit_side` chooses the pool, and only then does
+persistence order it. On a BULL bar REALTY is not second, it is **not a
+candidate**, and in the morning — before the concrete lock and conf ≥ 55 — the
+lane that runs is `SECTOR FOLLOW`, which is long-only by construction.
+
+On 16 Nov the index was `BULL` in both blocks, so **no version of the current
+rule picks REALTY that day**, at 11:55 or in the morning. What would is a
+divergence rule (index up, breadth 5▲/10▼ → allow a `PERSIST −` short with the
+mirrored gates) — a new rule, not a bug. Pinned by `DirectionFirstTests`.
+
 ### What it does not fix
 
 **REALTY 91 could not have been traded on this block either way.** It is the most
@@ -483,7 +510,7 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **328 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **332 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still

@@ -165,3 +165,59 @@ class PoolSideTests(TestCase):
         md = self.decide(0.0)
         self.assertEqual(md.persist_plus[0][0], "PHA")
         self.assertEqual(md.pick_sector, "PHA")
+
+
+class DirectionFirstTests(TestCase):
+    """The pick is chosen by the Nifty lock first, the persistence number second.
+
+    In the 16 Nov feed REALTY sat at the top of PERSIST − with 91 while FMCG took
+    the pick with 93. That is not a ranking between the two numbers — they are
+    different metrics on different sides — and it is the question the block keeps
+    raising, so it is pinned here: the same two sectors, the same numbers, and the
+    pick flips only because the index does.
+    """
+
+    @staticmethod
+    def nifty(step: float):
+        out, level = [], 25000.0
+        for d in DAYS:
+            seg = series(level, step)
+            out.append(bars(d, seg))
+            level = seg[-1]
+        return pd.concat(out)
+
+    def decide(self, step: float):
+        n5 = self.nifty(step)
+        sectors = {"FMCG": sector(0.00030), "REALTY": sector(-0.00045)}
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        with patch.dict("os.environ", {"SECTOR_FOLLOW": "1"}):
+            return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                              {k: daily(v) for k, v in sectors.items()})
+
+    def test_a_bull_index_picks_the_persistent_riser(self):
+        md = self.decide(0.00004)
+        self.assertEqual((md.pick_sector, md.pick_side), ("FMCG", 1))
+        self.assertTrue(md.pick_reason.startswith("PERSIST +"))
+
+    def test_a_bear_index_picks_the_persistent_faller(self):
+        md = self.decide(-0.00005)
+        self.assertEqual((md.pick_sector, md.pick_side), ("REALTY", -1))
+        self.assertTrue(md.pick_reason.startswith("PERSIST −"))
+
+    def test_the_two_numbers_are_not_comparable(self):
+        # REALTY is the more persistent of the two on its own side (97.3 vs FMCG's
+        # 96.8) and scores 0.8 on the bull metric: "top persistent" is per-side.
+        md = self.decide(0.00004)
+        fmcg, realty = md.sectors["FMCG"], md.sectors["REALTY"]
+        self.assertGreater(fmcg["persist_bull"], 90.0)
+        self.assertLess(realty["persist_bull"], 5.0)
+        self.assertGreater(realty["persist_bear"], fmcg["persist_bull"])   # 97.3 > 96.8
+        # each pool carries its own side's number, and the block shows both
+        self.assertAlmostEqual(dict(md.persist_plus)["FMCG"], fmcg["persist_bull"], delta=0.05)
+        self.assertAlmostEqual(dict(md.persist_minus)["REALTY"], realty["persist_bear"], delta=0.05)
+
+    def test_a_flat_index_follows_the_long_leader_only(self):
+        md = self.decide(0.0)
+        self.assertEqual((md.pick_sector, md.pick_side), ("FMCG", 1))
+        self.assertTrue(md.pick_reason.startswith("SECTOR FOLLOW"))
+        self.assertIn("Nifty NEUTRAL", md.pick_reason)
