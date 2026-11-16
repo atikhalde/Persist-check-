@@ -73,8 +73,34 @@ def save(state: dict, path: Path | None = None) -> None:
     tmp.replace(p)
 
 
+def position_session(pos: dict) -> str:
+    """IST session a trade belongs to: its entry candle, or its own ``session``."""
+    entry = pos.get("entry_bar") or pos.get("last_bar") or ""
+    if isinstance(entry, str) and len(entry) >= 10:
+        return entry[:10]
+    if pos.get("session"):
+        return str(pos["session"])
+    return ""
+
+
 def reset_if_new_day(state: dict, session: str) -> dict:
+    """Reset the per-session books; drop trades that belong to an older session.
+
+    A trade is intraday: one 5m candle, an EMA9 trail and a stop that is checked
+    on that session's candles. A position left over from an earlier session was
+    therefore still trailed — against the *wrong* day's bars. On 16 Nov that
+    produced ``TARGET HIT — BUY PNB · T1 136.75 · T2 141.02 · 5m 09:15 · entry
+    135.73`` for a trade signalled on 11 Nov: two targets of an eleven-day-old
+    entry "hit" by the 09:15 candle of a different day. Nothing about that
+    candle belonged to that trade.
+
+    Carrying positions across sessions existed only so a trade could survive a
+    process restart; the restart case is a same-session one, which this keeps.
+    """
     if state.get("session") != session:
+        carried = {raw: pos
+                   for raw, pos in (state.get("positions") or {}).items()
+                   if position_session(pos) == session}
         return {
             "session": session,
             "market": {},
@@ -83,7 +109,7 @@ def reset_if_new_day(state: dict, session: str) -> dict:
             "sent": {},
             "early": {},
             "scan": {},
-            "positions": state.get("positions", {}),  # trail until an exit, even across sessions
+            "positions": carried,
         }
     state.setdefault("positions", {})
     state.setdefault("alerts", {})
