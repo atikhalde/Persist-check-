@@ -75,9 +75,16 @@ class WorkflowParityTests(TestCase):
     def test_same_rule_inputs(self):
         five, one = scan_step(FIVE)["env"], scan_step(ONE)["env"]
         for key in ("SECTOR_FOLLOW", "SF_ALIGNED_SECTORS", "OI_FILTER",
-                    "MAX_ALERT_LAG_SECONDS", "BAR_SETTLE_SECONDS", "DRY_RUN", "LOG_LEVEL"):
+                    "MAX_ALERT_LAG_SECONDS", "BAR_SETTLE_SECONDS", "DRY_RUN", "LOG_LEVEL",
+                    # the exit/target rules are shared by both loops: bot 3 trails
+                    # the same positions, so a fork here would be a silent
+                    # difference in when a trade ends.
+                    "MIN_TARGET_R", "MIN_TARGET_PCT", "EXIT_EMA9_BUFFER_PCT",
+                    "EXIT_EMA9_BUFFER_R", "BREAKEVEN_AFTER_T1", "MARKET_CONF_DELTA"):
             self.assertIn(key, five, f"5m workflow lost {key}")
             self.assertIn(key, one, f"1m workflow lost {key} (a rule input)")
+        self.assertIn("MAX_ENTRIES_PER_PICK", five)      # entries are 5m-only
+        self.assertNotIn("MAX_ENTRIES_PER_PICK", one)
 
     def test_one_bot_three_on_the_second_loop(self):
         one = scan_step(ONE)["env"]

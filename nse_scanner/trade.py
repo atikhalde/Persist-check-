@@ -20,7 +20,8 @@ session happened to be a 5%-range reversal day.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from math import isfinite
@@ -46,6 +47,65 @@ MAX_BASIS_GAP_DAYS = 7      # stale feed: longest NSE holiday run is well under
 FEED_TOLERANCE = 0.005      # 0.5% max 5m-vs-daily disagreement on H/L/C
 
 LEVEL_NAMES = ("S3", "S2", "S1", "PP", "R1", "R2", "R3")
+
+
+# --- trade-quality gates (16 Nov 2026 feed) -----------------------------------
+# Three numbers decide when a 5m trade is worth announcing and when it is over.
+# They are knobs so a day can be compared with them on and off.
+
+def _env_float(name: str, default: float, lo: float = 0.0, hi: float = 10_000.0) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if lo <= value <= hi else default
+
+
+def min_target_r() -> float:
+    """A pivot closer than this many R is not a target (``MIN_TARGET_R``, 0.5).
+
+    GODREJCP on 16 Nov was entered at 877.25 with T1 at 878.00 — 75 paise, 0.2R,
+    +0.09%. Its "TARGET HIT +0.2R" was noise, and the entry was into immediate
+    resistance. Such a level is now skipped and disclosed, and the ladder moves
+    to the next pivot.
+    """
+    return _env_float("MIN_TARGET_R", 0.5)
+
+
+def min_target_pct() -> float:
+    """The same gate as a % of price (``MIN_TARGET_PCT``, 0.10), stop-independent."""
+    return _env_float("MIN_TARGET_PCT", 0.10)
+
+
+def exit_buffer(close: float, risk: float | None) -> float:
+    """Noise band around EMA9 before a close counts as a broken trail.
+
+    ``min(EXIT_EMA9_BUFFER_PCT% of price, EXIT_EMA9_BUFFER_R x risk)`` — the
+    smaller of a fixed band and one in units of the trade's own risk. 16 Nov:
+    AUROPHARMA was let go 24 paise past its EMA9 (1.6% of its stop) and VBL by 4
+    paise; nine of ten exits were breaches of 0.009–0.13%.
+    """
+    pct = _env_float("EXIT_EMA9_BUFFER_PCT", 0.10)
+    mult = _env_float("EXIT_EMA9_BUFFER_R", 0.25)
+    bands = [close * pct / 100.0]
+    if risk:
+        bands.append(float(risk) * mult)
+    band = min(bands)
+    return band if band > 0 else 0.0
+
+
+def breakeven_after_t1() -> bool:
+    """Move the stop to entry once T1 is touched (``BREAKEVEN_AFTER_T1``, on)."""
+    return os.environ.get("BREAKEVEN_AFTER_T1", "1") != "0"
+
+
+def breakeven_stop(side: str, entry: float, sl: float) -> float:
+    """The stop to carry after T1: at worst entry, never worse than it was."""
+    if side == "BUY":
+        return max(float(sl), float(entry))
+    if side == "SELL":
+        return min(float(sl), float(entry))
+    return float(sl)
 
 
 @dataclass(frozen=True)
@@ -100,6 +160,7 @@ class TradePlan:
     t3: float | None
     pivot_names: tuple[str | None, ...] = (None, None, None)
     basis: PivotBasis | None = None
+    skipped: tuple[str, ...] = field(default=())   # pivots too close to be targets
 
 
 def ema9_on_bar(df5: pd.DataFrame, bar) -> float | None:
@@ -213,10 +274,11 @@ def pivot_basis(df5: pd.DataFrame, bar, df1: pd.DataFrame | None = None) -> Pivo
     return basis
 
 
-def _next_levels(side: str, entry: float, basis: PivotBasis | None
-                 ) -> list[tuple[str | None, float | None]]:
+def _all_levels(side: str, entry: float, basis: PivotBasis | None
+                ) -> list[tuple[str, float]]:
+    """Every classic pivot beyond ``entry``, nearest first (no truncation)."""
     if basis is None:
-        return [(None, None)] * 3
+        return []
     h, l, c = basis.high, basis.low, basis.close
     pp = (h + l + c) / 3.0
     levels = [l - 2 * (h - pp), pp - (h - l), 2 * pp - h,
@@ -228,8 +290,38 @@ def _next_levels(side: str, entry: float, basis: PivotBasis | None
             rounded.setdefault(price, []).append(name)
     prices = sorted((v for v in rounded if v > entry)) if side == "BUY" else sorted(
         (v for v in rounded if v < entry), reverse=True)
-    targets = [("/".join(rounded[v]), v) for v in prices[:3]]
-    return (targets + [(None, None)] * 3)[:3]
+    return [("/".join(rounded[v]), v) for v in prices]
+
+
+def _keep_targets(side: str, entry: float, risk: float,
+                  levels: list[tuple[str, float]]
+                  ) -> tuple[list[tuple[str, float]], tuple[str, ...]]:
+    """Drop pivots too close to entry, and say which ones.
+
+    A level inside ``MIN_TARGET_R``/``MIN_TARGET_PCT`` of the entry is not a
+    trade target: it is the resistance the entry was made into. Announcing it as
+    "TARGET HIT +0.2R" is noise, so the ladder starts at the first level that is
+    far enough away and every skipped level is disclosed on the alert.
+    """
+    floor_r, floor_pct = min_target_r(), min_target_pct()
+    kept: list[tuple[str, float]] = []
+    skipped: list[str] = []
+    for name, value in levels:
+        delta = abs(value - entry)
+        r = delta / risk if risk else None
+        pct = delta / entry * 100.0 if entry else 0.0
+        if (r is not None and r < floor_r) or pct < floor_pct:
+            bits = ([f"{r:.1f}R"] if r is not None else []) + [f"{pct:+.2f}%"]
+            skipped.append(f"{name} {value:.2f} ({', '.join(bits)})")
+            continue
+        kept.append((name, value))
+    return kept, tuple(skipped)
+
+
+def _next_levels(side: str, entry: float, basis: PivotBasis | None
+                 ) -> list[tuple[str | None, float | None]]:
+    targets = _all_levels(side, entry, basis)[:3]
+    return (list(targets) + [(None, None)] * 3)[:3]
 
 
 def named_pivot_targets(side: str, entry: float, df5: pd.DataFrame, bar,
@@ -278,13 +370,24 @@ def build_plan(sig: StockSignal, df5: pd.DataFrame, bar,
     if risk <= 0:
         return None
     basis = pivot_basis(df5, bar, df1)
-    targets = _next_levels(sig.side, float(entry), basis)
+    kept, skipped = _keep_targets(sig.side, float(entry), float(risk),
+                                  _all_levels(sig.side, float(entry), basis))
+    targets = (kept[:3] + [(None, None)] * 3)[:3]
     return TradePlan(float(entry), ema, float(stop), float(risk),
                      *(price for _, price in targets),
                      pivot_names=tuple(name for name, _ in targets),
-                     basis=basis)
+                     basis=basis, skipped=skipped)
 
 
-def trail_broken(side: str, close: float, ema: float) -> bool:
-    """Only a completed candle CLOSE beyond EMA9 triggers an exit alert."""
-    return close < ema if side == "BUY" else close > ema if side == "SELL" else False
+def trail_broken(side: str, close: float, ema: float, risk: float | None = None) -> bool:
+    """A completed candle CLOSE beyond EMA9 **and** beyond the noise band.
+
+    The band is :func:`exit_buffer` — 0.10% of price or 0.25R, whichever is
+    smaller, so a 4-paise poke through the average (VBL, 16 Nov) no longer closes
+    a trade. ``EXIT_EMA9_BUFFER_PCT=0`` and ``EXIT_EMA9_BUFFER_R=0`` restore the
+    old bare comparison.
+    """
+    if side not in ("BUY", "SELL"):
+        return False
+    band = exit_buffer(close, risk)
+    return close < ema - band if side == "BUY" else close > ema + band

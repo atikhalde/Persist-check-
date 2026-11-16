@@ -197,8 +197,9 @@ class EarlyAlertTests(TestCase):
         self.assertEqual(out["signals"], [])
         cancel = self.texts()[-1]
         self.assertIn("EARLY CANCELLED", cancel)
-        self.assertIn("BUY  ABC", cancel)
-        self.assertIn("(10:05 close)", cancel)
+        self.assertIn("BUY ABC (BUY-EX)", cancel)          # name first, code in brackets
+        self.assertIn("did not hold at this close", cancel)
+        self.assertIn("10:05 close", cancel)
         self.assertNotIn("\n", cancel)
         st = state.load()
         self.assertEqual(st["early"]["ABC"]["result"], "cancelled")
@@ -219,6 +220,24 @@ class EarlyAlertTests(TestCase):
         out = pipeline.run_once()
         self.assertEqual(len(out["signals"]), 1)
         self.assertEqual(self.texts()[-1], "stock")               # plain entry, no early header
+
+    def test_a_sector_change_cancels_as_not_checked_not_as_a_failed_signal(self):
+        """16 Nov: DIVISLAB/BIOCON were never re-checked — the pick moved to FMCG.
+
+        The old text read "BUY DIVISLAB · BUY-EX6 is no longer in the scanned
+        sector/side", which reads as if the signal had failed and as if the
+        signal code were the thing that moved.
+        """
+        self.uni["sectors"]["FMCG"] = {"index": "INDEX2", "stocks": ["XYZ"]}
+        pipeline.run_early(BAR)
+        self.scan.return_value = []
+        self.md.pick_sector = "FMCG"
+        self.close()
+        cancel = next(t for t in self.texts() if "EARLY CANCELLED" in t)
+        self.assertIn("BUY ABC (BUY-EX)", cancel)
+        self.assertIn("not checked — the pick moved IT → FMCG", cancel)
+        self.assertIn("10:05 close", cancel)
+        self.assertNotIn("did not hold", cancel)
 
     def test_wait_at_the_close_cancels_the_early_alert(self):
         pipeline.run_early(BAR)

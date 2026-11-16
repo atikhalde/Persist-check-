@@ -205,12 +205,37 @@ channel is one message every two minutes.
 |---|---|
 | 1 — cross-session hit/exit | **fixed** — session gate in `_track_positions`, 2 tests written from this record |
 | 2 — heads-up invalidated by the very close it waits for | open — pick margin / projected pick |
-| 3 — cancellation wording | open — cosmetic |
-| 4 — no cap on entries per pick | open |
-| 5 — confidence collapse unreported | open |
-| 6 — sub-0.5R targets, unbuffered EMA9 exit, no breakeven after T1 | open |
+| 3 — cancellation wording | **fixed** — `not checked — the pick moved IT → FMCG`, name first, code in brackets |
+| 4 — no cap on entries per pick | **fixed** — `MAX_ENTRIES_PER_PICK` (3), best score first, the drop is counted and the name stays eligible |
+| 5 — confidence collapse unreported | **fixed** — `MARKET_CONF_DELTA` (10): the block goes out on a confidence move and says `(was 94%)` |
+| 6 — sub-0.5R targets, unbuffered EMA9 exit, no breakeven after T1 | **fixed** — `MIN_TARGET_R`/`_PCT`, `EXIT_EMA9_BUFFER_PCT`/`_R`, `BREAKEVEN_AFTER_T1` |
 | 7 — sequential burst, R computed on the close | open — informational |
 | 8 — stale VIX %, block-vs-alert reads | open — data integrity |
+
+## What the fixes do to *this* morning (measured, not estimated)
+
+Every row below is the feed's own numbers run through the shipped functions
+(`trade.trail_broken`, `trade.exit_buffer`, `trade.min_target_r`) at their
+defaults; the cap is applied to this feed's 10 entries.
+
+| change | on 16 Nov |
+|---|---|
+| **breakeven after T1** | LUPIN +1.3R and NESTLEIND +0.8R can no longer turn into +0.2R and −0.1R: the stop goes to entry (2001.00 / 1278.00) and the trade leaves at 0, not at a loss |
+| **EMA9 noise band** (min of 0.10%, 0.25R) | **5 of the 9 exits are held**: AUROPHARMA (0.24 breach vs 1.84 band), LUPIN (1.22/2.00), GLENMARK (2.15/2.67), HINDUNILVR (1.39/1.54), VBL (0.04/0.43). SUNPHARMA, TORNTPHARM, CIPLA and NESTLEIND still exit |
+| **minimum target** | GODREJCP's T1 moves from 878.00 (+0.2R) to 885.25 (+1.9R) and the alert says `skipped as too close to entry: R1 878.00 (0.2R, +0.09%)` |
+| **entry cap 3** | the six PHA entries become three (TORNTPHARM 82, GLENMARK 82, AUROPHARMA 77; −0.8R instead of −1.6R) and the four FMCG entries become three — **the name the cap drops is GODREJCP**, the only trade still open in profit. The morning goes from 10 entries / −3.2R to 6 entries / −2.4R |
+| **confidence block** | three more market messages would have gone out (100 → 94 at 10:20, 94 → 67 at 10:25, and the 99 → 100 step), the first of them *before* the GODREJCP entry rather than after it |
+| **cancellation text** | the two 09:45 lines become `❌ EARLY CANCELLED — BUY DIVISLAB (BUY-EX6) · not checked — the pick moved PHA → FMCG · 09:45 close · no confirmed entry` |
+
+The honest summary of the third and fourth rows: the exit changes keep trades alive
+that the old rule killed, and the cap removes a correlated cluster — but the cap is
+not a win-rate fix, and on this day it would also have removed the one position
+that was still working. Both are knobs for exactly that reason.
+
+Still open, and deliberately not fixed here: **finding 2** (an early heads-up whose
+validating close is the one that changes the pick) and **finding 7** (sequential
+fetch, R computed on the close). Both are design changes to the early pass and the
+fetch loop, not gates, and neither has a safe default.
 
 Defect 1 (duplicate/echo), defect 2 (missed leader) and defect 3 (cross-session hit)
 are all covered: the projection lead on the flip candle, the bot-3 catch-up, and the

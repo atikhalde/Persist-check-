@@ -371,9 +371,12 @@ class AlertParityTests(Scan1mFixture):
         self.open_trade(t1=100.008)                      # quiet bars touch 100.01
         self.minutes = one_minute(*range(0, 6))          # feed is settled past the close
         scan1m.track_positions(BAR)
-        text = self.bot3.call_args.args[0]
-        self.assertIn("TARGET HIT", text)
-        self.assertIn("T1 100.01", text)
+        texts = [c.args[0] for c in self.bot3.call_args_list]
+        hit = next(t for t in texts if "TARGET HIT" in t)
+        self.assertIn("T1 100.01", hit)
+        # T1 moves the stop to breakeven; the same fixture then trades back to
+        # entry and the trade closes there, on bot 3, in the same pass.
+        self.assertTrue(any("SL HIT" in t and "stop moved to breakeven" in t for t in texts))
         self.bot1.assert_not_called()
 
     def test_stop_hit_closes_the_trade_on_bot3(self):

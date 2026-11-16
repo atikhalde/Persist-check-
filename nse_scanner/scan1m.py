@@ -1134,7 +1134,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     market_alert(st, pick)
     if pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         _count_candle(stats, pick)
-        _settle(st, bar, set(), None, "market/sector pick was WAIT")
+        _settle(st, bar, set(), None, "not checked — the pick dropped to WAIT")
         _mark_judged(st, bar)          # nothing to scan on this candle, as on bot 1
         save_ledger(st)
         return []
@@ -1150,7 +1150,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     names = [raw for raw in sector_of if raw not in sent and raw not in positions]
     if not names:
         _mark_judged(st, bar)          # every name is already in a trade today
-        _settle(st, bar, set(), None, "no free name in the scanned sector", scanned=set())
+        _settle(st, bar, set(), None, "not checked — no free name in the scanned sector", scanned=set())
         save_ledger(st)
         return []
 
@@ -1229,7 +1229,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         log.info("1m CONFIRMED %s %s %s @ %.2f (sent %s IST)", raw, best.side, best.name,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
-    _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes,
+    _settle(st, bar, confirmed, checked, "did not hold", closes=closes,
             scanned=set(names))
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
@@ -1338,7 +1338,7 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
         if checked is not None and raw not in checked:
             if scanned is None or raw in scanned:
                 continue                 # the feed had not published: retried
-            why = "is no longer in the scanned sector/side"
+            why = "not checked — the close picked another sector"
         early["result"] = "cancelled"
         st.setdefault("stats", {})["cancelled"] = st.get("stats", {}).get("cancelled", 0) + 1
         log.info("1m projection for %s did not hold (%s) — no message", raw, why)
@@ -1351,10 +1351,12 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
                 if str(early.get("side") or "").upper() == "SELL":
                     pct = -pct                    # "beyond" always means "in our favour"
                 move = f" · close {px:.2f} ({pct:+.2f}%)"
+            code = early.get("name")
+            who = f"{early.get('side')} {raw}" + (f" ({code})" if code else "")
             telegram.send_bot3(
-                f"❌ <b>EARLY CANCELLED</b> — {early.get('side')} {early.get('name') or raw} ({raw})\n"
+                f"❌ <b>EARLY CANCELLED</b> — {who}\n"
                 f"projected {early.get('at')} @ {price:.2f}{move}\n"
-                f"the {bar:%H:%M} 5m close did not confirm it — no entry recorded",
+                f"{why} · {bar:%H:%M} close — no entry recorded",
                 dry_run=_dry())
 
 

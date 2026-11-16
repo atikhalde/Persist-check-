@@ -178,7 +178,7 @@ class GoldenParityTests(TestCase):
                                     "last_bar": (BAR - timedelta(minutes=10)).isoformat()}}}
         pipeline._track_positions(st, BAR, "7d")               # no kwargs
         self.assertEqual(self.bot3.call_count, 0)
-        self.assertIn("TARGET HIT", self.bot1.call_args.args[0])
+        self.assertTrue(any("TARGET HIT" in c.args[0] for c in self.bot1.call_args_list))
         self.bot1.reset_mock()
         with patch.object(pipeline, "now_ist", return_value=BAR + timedelta(minutes=7, seconds=30)):
             pipeline._warn_feed_behind({"session": "2026-11-09", "sent": {}, "stats": {}},
