@@ -1,6 +1,8 @@
 """Direction label vs committed side (the "Market NEUTRAL ... BUY" contradiction)."""
 from unittest import TestCase
 
+from unittest.mock import patch
+
 from nse_scanner.market import _complementary_pick, _direction_label
 
 
@@ -322,6 +324,34 @@ class WeakFollowTests(TestCase):
 
     def test_a_pick_is_never_overridden(self):
         self.assertIsNone(self.fallback("PHA", 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_weak_day_demands_more_persistence_than_a_flat_one(self):
+        # NEUTRAL follows at persist 55; a weak BULL only follows the exception (65).
+        mid = [self.snap("PHA", persist_bull=58.0, pos=70.0, rs=0.4)]
+        self.assertEqual(self.fallback(None, 0, 41, mid)["pick"], "PHA")
+        self.assertIsNone(self.fallback(None, 1, 41, mid, SECTOR_FOLLOW_ON_WEAK="1"))
+        strong = [self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6)]
+        self.assertEqual(self.fallback(None, 1, 41, strong, SECTOR_FOLLOW_ON_WEAK="1")["pick"],
+                         "FMCG")
+
+    def test_the_weak_floor_can_be_moved(self):
+        mid = [self.snap("PHA", persist_bull=58.0, pos=70.0, rs=0.4)]
+        out = self.fallback(None, 1, 41, mid, SECTOR_FOLLOW_ON_WEAK="1",
+                            SECTOR_FOLLOW_WEAK_MIN_PERSIST="55")
+        self.assertEqual(out["pick"], "PHA")
+
+    def test_the_pick_is_one_sided(self):
+        # Decided 16 Nov: no two-sided pick. On a committed BULL bar the top of
+        # PERSIST − (REALTY 91) is a reading, never a pick — even when the weak
+        # path is on and REALTY is the more persistent of the two.
+        plus = self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6)
+        bear = self.snap("REALTY", side=-1, persist_bear=95.0, persist_bull=5.0,
+                         pos=10.0, rs=-0.9, day_ret=-1.2)
+        from nse_scanner.market import _follow_leaders
+        self.assertEqual([x.name for x in _follow_leaders([bear, plus], 65)], ["FMCG"])
+        with patch.dict("os.environ", {"SECTOR_FOLLOW_ON_WEAK": "1"}):
+            out = self.fallback(None, 1, 41, [bear, plus])
+        self.assertEqual((out["pick"], out["side"]), ("FMCG", 1))
 
     def test_a_weak_day_still_needs_a_leading_sector(self):
         dull = [self.snap("FMCG", persist_bull=52.0, pos=45.0, rs=-0.2)]

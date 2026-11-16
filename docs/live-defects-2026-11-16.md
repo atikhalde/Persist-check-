@@ -455,8 +455,20 @@ says which market it is: `SECTOR FOLLOW — Nifty BULL weak (41%), FMCG leads
 
 It is **off by default** because the locked rule is `conf < 55 → WAIT`, and
 because 16 Nov is the day that rule was written for: six entries on a weak tape
-in 35 seconds. Turning it on trades the *strict* path, not the lax one. Longs
-only — a weak BEAR still waits, because the mirrored gates are not written and a
+in 35 seconds. Turning it on trades the *strict* path, not the lax one.
+
+Two decisions were taken with it:
+
+* **the weak path is stricter than the flat one** — `SECTOR_FOLLOW_WEAK_MIN_PERSIST`
+  (65) against the NEUTRAL case's 55. On a day where the index offers no help,
+  only the exception is worth following: FMCG 93 qualifies, a sector at 58 does
+  not;
+* **the pick stays one-sided.** Asked on 16 Nov, the answer was one side only: on
+  a `commit_side == 1` bar the top of `PERSIST −` is a reading on the block,
+  never a pick. `_follow_leaders` is long-only and a test now pins it —
+  REALTY 91 with `persist_bear 95` is refused even with the weak path on.
+
+A weak BEAR still waits: the mirrored gates are not written, and a
 half-mirrored rule is worse than none.
 
 ### What it does not fix
@@ -471,7 +483,7 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **325 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **328 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still

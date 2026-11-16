@@ -156,6 +156,7 @@ jobs:
           # 1 = a weak-but-directional BULL may still follow a plainly leading
           # sector (conf < 55). 0 = the locked rule: conf < 55 stands aside.
           SECTOR_FOLLOW_ON_WEAK: ${{ vars.SECTOR_FOLLOW_ON_WEAK || '0' }}
+          SECTOR_FOLLOW_WEAK_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_WEAK_MIN_PERSIST || '65' }}
           # Entries per pick: bot 3 confirms on the same ceiling as bot 1 (it used
           # to announce six names where bot 1 announced three).
           MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}

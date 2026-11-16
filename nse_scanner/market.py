@@ -804,7 +804,7 @@ def _is_leading(s, need: float) -> bool:
     )
 
 
-def _follow_leaders(plus) -> list:
+def _follow_leaders(plus, need: float | None = None) -> list:
     """Sectors to scan LONG while Nifty itself is NEUTRAL (no committed side).
 
     The complementary pick needs a committed Nifty direction, so on a flat index
@@ -821,16 +821,20 @@ def _follow_leaders(plus) -> list:
     then by persist score. The first is the pick; the rest are scanned with it,
     so a quiet leader does not hide an entry in the next one.
 
-    Longs only — a flat index gives no reason to short a weak sector.
+    Longs only — a flat index gives no reason to short a weak sector, and the
+    pick is one-sided by rule: on a committed BULL bar only PERSIST + is usable,
+    so the top of PERSIST − is a reading on the block, never a pick.
     ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (55) is
-    the score needed, ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
+    the score needed (``need`` overrides it — the weak-day path demands more),
+    ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
     """
     if os.environ.get("SECTOR_FOLLOW", "1") == "0" or not plus:
         return []
-    try:
-        need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
-    except ValueError:
-        need = 55.0
+    if need is None:
+        try:
+            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
+        except ValueError:
+            need = 55.0
     try:
         most = max(1, int(os.environ.get("SECTOR_FOLLOW_MAX") or 2))
     except ValueError:
@@ -869,12 +873,12 @@ def _follow_fallback(pick, commit_side, dir_conf, plus):
     if pick:
         return None
     if commit_side == 0:
-        note = "Nifty NEUTRAL"
+        note, need = "Nifty NEUTRAL", None
     elif follow_on_weak() and commit_side == 1 and dir_conf < PICK_MIN_CONF:
-        note = f"Nifty BULL weak ({dir_conf}%)"
+        note, need = f"Nifty BULL weak ({dir_conf}%)", weak_follow_min_persist()
     else:
         return None
-    leaders = _follow_leaders(plus)
+    leaders = _follow_leaders(plus, need)
     if not leaders:
         return None
     return {
@@ -1022,6 +1026,19 @@ def follow_on_weak() -> bool:
     ask for it. ``SECTOR_FOLLOW=0`` still turns both paths off.
     """
     return os.environ.get("SECTOR_FOLLOW_ON_WEAK", "0") != "0"
+
+
+def weak_follow_min_persist() -> float:
+    """Persistence a sector needs when the *index* is the thing that is unsure (65).
+
+    A weak day is followed only by the exception, not the marginal case: the
+    index is offering no help, so the sector has to be plainly persistent
+    (``SECTOR_FOLLOW_MIN_PERSIST`` is 55, the NEUTRAL-market floor).
+    """
+    try:
+        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
 
 
 def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
