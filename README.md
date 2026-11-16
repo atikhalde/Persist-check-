@@ -479,6 +479,27 @@ sector bot 1 would have refused — so they are shared, not forked.
 cancel`, `cancel messages on/off`, `leader catch-up`) next to the bot-3
 credentials, so a typo is visible before the session starts.
 
+**Did the variable actually arrive?** This is the failure that leaves no trace: a
+repository variable created as a *secret* (or in an environment the job does not
+attach, or in the other repository) resolves to an empty `vars.X`, the workflow
+supplies its default, and the session looks exactly like one where the knob had
+no effect. So every run now says what it is running with — `doctor` and both
+loops, once at startup:
+
+```
+pick knobs in force: PICK_CONF_SCALED_FLOOR=1 · PICK_MIN_PERSIST=50 · … · DIVERGENCE_SHORT=0
+pick knobs differing from default: PICK_CONF_SCALED_FLOOR=1
+```
+
+and each workflow prints the repository's own variables before the loop starts
+(`repository variables: {"PICK_CONF_SCALED_FLOOR":"1"}`, `{}` when none are set) —
+the one thing the process cannot know, because the workflow materialises the
+defaults. A knob whose recommendation differs from its default appears on the
+second line exactly when it arrived; `SECTOR_FOLLOW_ON_WEAK=0` and
+`DIVERGENCE_SHORT=0` need no proof, because `0` *is* the recommendation either way.
+An empty value is treated as absent, in the log and in the code, so `""` and
+"unset" can never be two different configurations.
+
 **Measure it before trusting it** — the same early-check harness works for the
 projection, and `--lead` is exactly "how early":
 

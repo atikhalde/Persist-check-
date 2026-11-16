@@ -1450,6 +1450,9 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
         state.use_scratch()   # full behaviour, real ledger untouched
     log.info("live loop IST: early pass %ss before each 5m close%s, confirm %ss after",
              lead, "" if lead else " (disabled)", grace)
+    from .knobs import describe
+    for line in describe():        # what this process is actually running with
+        log.info("%s", line)
     # Announce once per session: a planned handover between jobs is not news.
     # The flag is stored, so restarts (handover, watchdog, holiday re-checks)
     # stay silent for the rest of the session.

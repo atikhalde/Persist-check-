@@ -228,6 +228,9 @@ def _doctor() -> int:
                          follow_on_weak, lowconf_min_persist, weak_follow_min_persist)
     floor = (f"persist floor {pick_min_persist():.0f}->{lowconf_min_persist():.0f} as conf falls"
              if conf_scaled_floor() else f"persist floor {pick_min_persist():.0f}")
+    from .knobs import describe
+    for line in describe():
+        print(line)
     print(f"sector pick: rs margin {pick_rs_margin():.2f}pp · "
           f"{floor} · "
           f"hold the incumbent by {pick_sticky_margin():.0f} · "

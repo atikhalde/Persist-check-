@@ -1586,6 +1586,9 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
         return "closed"
     log.info("1m projected scan: alerts from minute %d of each 5m candle (up to %d min early); "
              "confirmed at the close; bot 3 only", first_minute(), BAR_MINUTES - first_minute())
+    from .knobs import describe
+    for line in describe():        # the same knobs, printed by this loop too
+        log.info("%s", line)
     _announce()
 
     holiday = None

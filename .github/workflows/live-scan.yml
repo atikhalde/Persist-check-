@@ -112,6 +112,18 @@ jobs:
       - name: Install
         run: pip install -r requirements.txt
 
+      # The one thing the process cannot see: which variables are set in the
+      # repository. `vars.*` is empty for a variable that was created as a
+      # *secret*, and the workflow then supplies its default — so a knob you set
+      # and a knob you did not look identical from inside the run. This prints
+      # the repo's own variables before the loop starts.
+      - name: Repository variables in force
+        env:
+          REPO_VARS: ${{ toJSON(vars) }}
+        run: |
+          echo "repository variables: ${REPO_VARS}"
+          [ -n "${REPO_VARS}" ] || echo "none are set — every knob is at its workflow default"
+
       - name: IST date
         id: ist
         run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
@@ -147,9 +159,17 @@ jobs:
           # and an "EARLY (unconfirmed)" alert may be sent. 0 = close-only.
           EARLY_ALERT_SECONDS: "60"
           # Optional repository variables (Settings → Secrets and variables → Actions → Variables).
-          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}              # "0" = NEUTRAL market always WAITs
+          # An unset variable is the empty string here, so every one that has a
+          # code default is given one explicitly: "" and "unset" must not be two
+          # different configurations. Both loops log the values they received.
+          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW || '1' }}       # "0" = NEUTRAL market always WAITs
           SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}    # e.g. PHA,ENE - scanned first
-          OI_FILTER: ${{ vars.OI_FILTER }}                      # off | annotate | require
+          OI_FILTER: ${{ vars.OI_FILTER || 'annotate' }}        # off | annotate | require
+          # The NEUTRAL-market follow fallback's two limits (README: 55 / 2).
+          SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '55' }}
+          SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
+          # An early print older than this is never shown as live (README: 100).
+          EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
           # Seconds after the close before the confirmed scan asks Yahoo.
           POLL_GRACE_SECONDS: "10"
           # Right after the close a candle is judged only once the stock's feed

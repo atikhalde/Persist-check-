@@ -98,6 +98,18 @@ jobs:
       - name: Install
         run: pip install -r requirements.txt
 
+      # The one thing the process cannot see: which variables are set in the
+      # repository. `vars.*` is empty for a variable that was created as a
+      # *secret*, and the workflow then supplies its default — so a knob you set
+      # and a knob you did not look identical from inside the run. This prints
+      # the repo's own variables before the loop starts.
+      - name: Repository variables in force
+        env:
+          REPO_VARS: ${{ toJSON(vars) }}
+        run: |
+          echo "repository variables: ${REPO_VARS}"
+          [ -n "${REPO_VARS}" ] || echo "none are set — every knob is at its workflow default"
+
       - name: IST date
         id: ist
         run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
@@ -183,9 +195,13 @@ jobs:
           SCAN1M_LEADER_MAX_R: ${{ vars.SCAN1M_LEADER_MAX_R || '2.0' }}
           SCAN1M_1M_PERIOD: ${{ vars.SCAN1M_1M_PERIOD || '1d' }}
           # The same rule inputs the 5m workflow passes — one engine, one config.
-          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}
+          # Explicit defaults: an unset variable arrives as the empty string, which
+          # must not mean something different from "at its default".
+          SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW || '1' }}
           SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}
-          OI_FILTER: ${{ vars.OI_FILTER }}                       # off | annotate | require
+          OI_FILTER: ${{ vars.OI_FILTER || 'annotate' }}         # off | annotate | require
+          SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '55' }}
+          SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
           BAR_SETTLE_SECONDS: "45"                              # used by the shared hit tracker
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170

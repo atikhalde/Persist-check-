@@ -743,3 +743,48 @@ projected line under a residue and with none, the carried / close-only split, a
 zero catch-up line that explains itself, skips printing the LATE LEADER line
 even when `catchup` is 0, and each refusal code. The old ledgers stay readable:
 with no `entries` key the entry line falls back to `confirmed`.
+
+---
+
+## Seventh pass — "I set the variables" was not observable
+
+Three of the recommended knobs are repository **variables** that only reach a run
+through `env: X: ${{ vars.X || 'default' }}`. That chain has two silent breaks:
+
+1. a variable created as a **secret** (or in an environment the job does not
+   attach) resolves to an empty `vars.X`, and the workflow supplies its default —
+   the session then looks *identical* to one where the knob had no effect;
+2. `${{ vars.X }}` with no `|| default` injects the empty string instead of
+   leaving the variable unset, so `""` and "unset" become two configurations.
+
+Freezing the settings does not reveal either one, so the run now reports what it
+received. Both loops and `doctor` print:
+
+```
+pick knobs in force: PICK_CONF_SCALED_FLOOR=1 · PICK_MIN_PERSIST=50 · … · DIVERGENCE_SHORT=0
+pick knobs differing from default: PICK_CONF_SCALED_FLOOR=1
+```
+
+and both workflows print the repository's own variables before the loop starts
+(`repository variables: {"PICK_CONF_SCALED_FLOOR":"1"}`, `{}` when none are set).
+`knobs.effective()` treats `""` as absent, matching the workflow's `||`, so the
+log cannot disagree with the code reading the same variable.
+
+### Two knobs nothing forwarded
+
+`SECTOR_FOLLOW_MIN_PERSIST` (55) and `SECTOR_FOLLOW_MAX` (2) — the NEUTRAL-market
+follow fallback's limits, both documented in the README — were read by
+`market._follow_leaders` and forwarded by **neither** workflow. Setting either as
+a repository variable did nothing at all. Both are forwarded now, as is
+`EARLY_MAX_STALE_SECONDS` (100), and every default is spelled out in the
+workflows rather than left to `vars.X` being empty.
+
+### Proof
+
+`pytest -q` → **382 passed** (48 subtests), `pyflakes` clean, workflows still
+parse as YAML. New: every audited knob is forwarded by both workflows with the
+same default as `knobs.AUDITED`; every variable the code reads reaches some
+workflow (or is runtime-only); both loops log `describe()`; the recommended set
+is named on the line; an empty variable is a default; and the shipped defaults
+still reproduce the old behaviour (`conf_scaled_floor`, `follow_on_weak` and
+`divergence_short` all false, flat floor 50).
