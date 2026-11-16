@@ -508,7 +508,8 @@ def run_market(
             reason = follow["reason"]
         else:
             diverge = _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec,
-                                        persist_minus, prev_pick)
+                                        persist_minus, prev_pick,
+                                        mtf_bull=mtf_bull, dir_conf=dir_conf)
             if diverge:
                 pick, pick_side, action = diverge["pick"], diverge["side"], diverge["action"]
                 reason = diverge["reason"]
@@ -1143,15 +1144,34 @@ def _is_breaking_down(s, need: float) -> bool:
     )
 
 
-def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus, prev=None):
-    """The persistent faller, when the index is up and the breadth is not.
+def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus,
+                      prev=None, mtf_bull: int = 3, dir_conf: int = 99):
+    """The persistent faller, when the index is up but is not a real uptrend.
+
+    ``commit_side == 1`` only says the index is on the up side; it does not say
+    the up-move is confirmed. Two things in this engine do:
+
+    * **the timeframes agree** — ``MTF 3/3``. 16 Nov was ``MTF 2/3`` at every bar
+      of the morning (09:15, 09:30, 09:35) and 3/3 only at 11:55;
+    * **the confidence is not marginal** — below ``PICK_CONF_GOOD`` (70) the
+      engine is itself unsure of the direction.
+
+    Either one failing is a *divergence day*: the index is up, but on evidence it
+    cannot back. The other pattern is the narrow market — ``5▲/10▼`` breadth with
+    the index up, i.e. a couple of names carrying it.
+
+    Requiring the breadth to be against the index (the first version) missed the
+    whole of 16 Nov's morning: breadth was 10▲/5▼ → 9▲/6▼ → 8▲/7▼ while REALTY
+    was the persistent faller (66 → 76 → 69) and nothing could be shorted.
 
     One pick per bar: this only runs when the long side has nothing, so the
     "one side only" rule is intact — the short replaces a WAIT, never a long.
     """
-    if not divergence_short() or commit_side != 1 or n_day_ret <= 0:
+    if not divergence_short() or commit_side != 1 or n_day_ret <= 0 or not minus:
         return None
-    if breadth_dec - breadth_adv < DIVERGE_SPREAD or not minus:
+    unconfirmed = mtf_bull < 3 or dir_conf < PICK_CONF_GOOD
+    narrow = breadth_dec - breadth_adv >= DIVERGE_SPREAD
+    if not (unconfirmed or narrow):
         return None
     need = diverge_min_persist()
     candles = [s for s in list(minus)[:3] if _is_breaking_down(s, need)]
@@ -1166,10 +1186,14 @@ def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus, p
         if keep is not None and keep in candles and \
                 keep.persist_bear + pick_sticky_margin() > best.persist_bear:
             best, held = keep, True
-    reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but breadth "
-              f"{breadth_adv}▲/{breadth_dec}▼; {best.name} is breaking down "
-              f"(persist {best.persist_bear:.0f}, day {best.day_ret:+.2f}%, "
-              f"range pos {best.pos:.0f}, flow {best.bear:.0f} bear)")
+    why = " · ".join(x for x in (
+        f"MTF {mtf_bull}/3" if mtf_bull < 3 else "",
+        f"conf {dir_conf}%" if dir_conf < PICK_CONF_GOOD else "",
+        f"breadth {breadth_adv}▲/{breadth_dec}▼" if narrow else "") if x)
+    reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but {why}; "
+              f"{best.name} is breaking down (persist {best.persist_bear:.0f}, "
+              f"day {best.day_ret:+.2f}%, range pos {best.pos:.0f}, "
+              f"flow {best.bear:.0f} bear)")
     if held:
         reason += f" · held over {candles[0].name} (within {pick_sticky_margin():.0f})"
     return {"pick": best.name, "side": -1, "action": "SCAN SHORT", "reason": reason,

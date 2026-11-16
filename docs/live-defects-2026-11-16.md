@@ -508,13 +508,27 @@ and no pick, because a BULL bar has no short pool. The rule, when
 | condition | value |
 |---|---|
 | index side | committed **BULL** and `nifty day > 0` |
-| breadth | `dec − adv ≥ 2` (`5▲/10▼` = 5) |
+| the up-move is not confirmed | **`MTF < 3`** or **`conf < 70`** or **breadth `dec − adv ≥ 2`** — any one |
 | sector | top of `PERSIST −`, `side == −1`, not stale |
 | persistence | `persist_bear ≥ DIVERGE_MIN_PERSIST` (65) |
 | trend | `day ≤ −0.20%`, `range pos ≤ 40`, `rs < 0` |
 | flow | bear flow ≥ 55, and `recent < +0.07` — **not bouncing** |
 | precedence | **one pick per bar, long side first**: the short only replaces a `WAIT`, never a long |
 | hysteresis | the incumbent faller is held unless a challenger is `PICK_STICKY_MARGIN` more persistent |
+
+**Why the first version was wrong.** It required the breadth to be against the
+index, and on 16 Nov the morning breadth was *positive* (10▲/5▼ → 9▲/6▼ →
+8▲/7▼) while REALTY was the persistent faller (66 → 76 → 69) — so the rule would
+have refused the whole morning and fired only at 11:55. The breadth was never the
+signal; the signal is that **the index is up on evidence it cannot back**: `MTF
+2/3` at every morning bar (only the 11:55 bar was 3/3) and a confidence stuck
+between 29 and 56. Breadth is now one of three ways to establish that, not the
+only one. Each alert names which one applied:
+
+```
+DIVERGENCE SHORT — index up (Nifty +0.48%) but MTF 2/3 · conf 35%; REALTY is
+breaking down (persist 76, day -1.20%, range pos 8, flow 85 bear)
+```
 
 It is a fallback, not a second pick: on a bar where a sector can be bought, the
 short does not exist. The block says which one it is —
@@ -550,7 +564,7 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **353 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **358 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still

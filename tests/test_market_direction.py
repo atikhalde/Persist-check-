@@ -375,11 +375,13 @@ class DivergenceShortTests(TestCase):
 
     snap = staticmethod(SectorFollowTests.snap)
 
-    def short(self, commit=1, day=0.44, adv=5, dec=10, minus=None, prev=None, **env):
+    def short(self, commit=1, day=0.44, adv=5, dec=10, minus=None, prev=None,
+              mtf=3, conf=99, **env):
         from nse_scanner.market import _divergence_short
         pool = minus if minus is not None else [self.faller()]
         with patch.dict("os.environ", {"DIVERGENCE_SHORT": "1", **env}):
-            return _divergence_short(commit, day, adv, dec, pool, prev)
+            return _divergence_short(commit, day, adv, dec, pool, prev,
+                                     mtf_bull=mtf, dir_conf=conf)
 
     def faller(self, name="REALTY", persist=91.0, **over):
         base = dict(side=-1, persist_bear=persist, day_ret=-1.20, pos=8.0, rs=-0.9,
@@ -387,9 +389,10 @@ class DivergenceShortTests(TestCase):
         return self.snap(name, **{**base, **over})
 
     def test_it_fires_on_the_16_nov_tape(self):
-        out = self.short()
+        out = self.short(mtf=3, conf=41)
         self.assertEqual((out["pick"], out["side"], out["action"]), ("REALTY", -1, "SCAN SHORT"))
-        self.assertIn("DIVERGENCE SHORT — index up (Nifty +0.44%) but breadth 5▲/10▼", out["reason"])
+        self.assertIn("DIVERGENCE SHORT — index up (Nifty +0.44%)", out["reason"])
+        self.assertIn("breadth 5▲/10▼", out["reason"])
         self.assertIn("persist 91", out["reason"])
 
     def test_it_is_off_by_default(self):
@@ -401,10 +404,34 @@ class DivergenceShortTests(TestCase):
         self.assertIsNone(self.short(day=-0.30))          # a falling index has a short pool
         self.assertIsNone(self.short(commit=-1, day=-0.30))
 
-    def test_the_breadth_has_to_be_against_it(self):
-        self.assertIsNone(self.short(adv=8, dec=7))       # 8▲/7▼ is not a divergence
-        self.assertIsNone(self.short(adv=7, dec=8))       # a 1-sector spread is noise
-        self.assertIsNotNone(self.short(adv=6, dec=9))    # 2 is the bar
+    def test_a_confirmed_uptrend_is_never_shorted(self):
+        # MTF 3/3, conf 85, breadth positive: the index is a real uptrend.
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=85))
+
+    def test_an_unconfirmed_uptrend_is_enough(self):
+        # 16 Nov 09:30: MTF 2/3, conf 35, breadth 9▲/6▼ -> REALTY 76 was the
+        # persistent faller and nothing could be shorted. This is that bar.
+        out = self.short(adv=9, dec=6, mtf=2, conf=35, minus=[self.faller(persist=76.0)])
+        self.assertEqual((out["pick"], out["side"]), ("REALTY", -1))
+        self.assertIn("MTF 2/3", out["reason"])
+        self.assertIn("conf 35%", out["reason"])
+        self.assertNotIn("breadth", out["reason"])        # breadth was not the reason
+
+    def test_a_marginal_confidence_alone_is_enough(self):
+        # 16 Nov 09:35: MTF 2/3, conf 56, breadth 8▲/7▼.
+        self.assertIsNotNone(self.short(adv=8, dec=7, mtf=3, conf=56))
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=70))
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=85))
+
+    def test_narrow_breadth_alone_is_enough(self):
+        # 16 Nov 11:55: MTF 3/3, conf 41, breadth 5▲/10▼.
+        out = self.short(adv=5, dec=10, mtf=3, conf=85)
+        self.assertIsNotNone(out)
+        self.assertIn("breadth 5▲/10▼", out["reason"])
+
+    def test_a_small_negative_spread_is_not_narrow_enough(self):
+        self.assertIsNone(self.short(adv=7, dec=8, mtf=3, conf=85))     # 1 is noise
+        self.assertIsNotNone(self.short(adv=6, dec=9, mtf=3, conf=85))  # 2 is the bar
 
     def test_a_marginal_faller_is_not_shorted(self):
         self.assertIsNone(self.short(minus=[self.faller(persist=58.0)]))

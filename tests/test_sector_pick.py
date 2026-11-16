@@ -272,6 +272,22 @@ class DivergenceWiringTests(TestCase):
         self.assertEqual((md.pick_side, md.action), (1, "SCAN LONG"))
         self.assertNotIn("DIVERGENCE", md.pick_reason)
 
+    def test_the_market_state_reaches_the_rule(self):
+        # The 16 Nov morning was MTF 2/3 at every bar: the unconfirmed-uptrend
+        # pattern has to see the real MTF and confidence, not defaults.
+        seen = {}
+        real = market._divergence_short
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        with patch.object(market, "_complementary_pick", return_value=(None, 0, "WAIT — test")), \
+                patch.object(market, "_divergence_short", side_effect=spy):
+            md = self.decide(DIVERGENCE_SHORT="1")()
+        self.assertEqual(seen["mtf_bull"], md.mtf_bull)
+        self.assertEqual(seen["dir_conf"], md.dir_conf)
+
     def test_the_short_names_the_divergence_on_the_block(self):
         with patch.object(market, "_complementary_pick", return_value=(None, 0, "WAIT — test")):
             md = self.decide(DIVERGENCE_SHORT="1")()
