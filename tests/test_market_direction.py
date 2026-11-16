@@ -32,7 +32,7 @@ class SectorFollowTests(TestCase):
     def snap(name="PHA", **over):
         from types import SimpleNamespace
         base = dict(name=name, side=1, persist_bull=72.0, day_ret=0.9, pos=85.0, rs=0.6,
-                    bull=70.0, recent=0.02, qualified=False)
+                    bull=70.0, recent=0.02, qualified=False, lag_bars=0, stale=False)
         return SimpleNamespace(**{**base, **over})
 
     def pick(self, plus, **env):
@@ -96,3 +96,72 @@ class SectorFollowTests(TestCase):
         self.assertEqual(_follow_tag(md, "ENE"), " (sector follow, flow aligned)")
         self.assertEqual(_follow_tag(SimpleNamespace(pick_reason="PERSIST + IT qualified",
                                                      pick_sector="IT")), "")
+
+
+class PassedOverTests(TestCase):
+    """A sector the pick walked past must be named, with the number that did it."""
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def pick(self, plus, **env):
+        from unittest.mock import patch
+        with patch.dict("os.environ", env):
+            return _complementary_pick(1, 80, "TREND UP", plus, [], 0.0, 0.5)
+
+    def test_a_leader_is_not_dropped_for_a_hair_thin_rs(self):
+        # persist 91 skipped because rs read -0.01 (1/100th of a percentage point)
+        # and the pick fell to the persist-60 sector, silently. This is the churn
+        # that moved the 16 Nov pick PHA -> FMCG one candle later.
+        plus = [self.snap("AUTO", persist_bull=91.0, rs=-0.01),
+                self.snap("FMCG", persist_bull=60.0, rs=0.40)]
+        name, side, reason = self.pick(plus)
+        self.assertEqual(name, "AUTO")
+        self.assertEqual(side, 1)
+        self.assertIn("score 91", reason)
+
+    def test_without_the_margin_the_leader_is_skipped_and_named(self):
+        plus = [self.snap("AUTO", persist_bull=91.0, rs=-0.01),
+                self.snap("FMCG", persist_bull=60.0, rs=0.40)]
+        name, _, reason = self.pick(plus, PICK_RS_MARGIN="0")
+        self.assertEqual(name, "FMCG")
+        self.assertIn("passed over AUTO (rs -0.01)", reason)
+
+    def test_a_genuinely_underperforming_leader_is_still_skipped(self):
+        plus = [self.snap("AUTO", persist_bull=91.0, rs=-0.60),
+                self.snap("FMCG", persist_bull=60.0, rs=0.40)]
+        name, _, reason = self.pick(plus)
+        self.assertEqual(name, "FMCG")
+        self.assertIn("passed over AUTO (rs -0.60)", reason)
+
+    def test_a_stale_sector_is_passed_over_and_named(self):
+        plus = [self.snap("AUTO", persist_bull=91.0, stale=True, lag_bars=6),
+                self.snap("FMCG", persist_bull=60.0, rs=0.40)]
+        name, _, reason = self.pick(plus)
+        self.assertEqual(name, "FMCG")
+        self.assertIn("passed over AUTO (index 6 bars behind)", reason)
+
+    def test_the_wait_reason_names_what_it_refused(self):
+        plus = [self.snap("AUTO", persist_bull=91.0, side=-1)]
+        name, side, reason = self.pick(plus)
+        self.assertIsNone(name)
+        self.assertEqual(side, 0)
+        self.assertIn("passed over AUTO (flow bearish)", reason)
+
+    def test_a_stale_sector_never_leads_a_follow_scan(self):
+        from nse_scanner.market import _follow_leaders
+        from unittest.mock import patch
+        plus = [self.snap("AUTO", stale=True, lag_bars=6),
+                self.snap("ENE", persist_bull=60)]
+        with patch.dict("os.environ", {}):
+            self.assertEqual([x.name for x in _follow_leaders(plus)], ["ENE"])
+
+    def test_lag_bars_counts_five_minute_candles(self):
+        import pandas as pd
+        from nse_scanner.market import _lag_bars
+        from nse_scanner.session import IST
+        bar = pd.Timestamp("2026-11-16 10:20", tz=IST)      # the decision bar
+        self.assertEqual(_lag_bars(bar, bar), 0)
+        self.assertEqual(_lag_bars(bar - pd.Timedelta(minutes=30), bar), 6)
+        self.assertEqual(_lag_bars(bar + pd.Timedelta(minutes=10), bar), 0)   # never negative
+        self.assertEqual(_lag_bars(None, bar), 0)
+        self.assertEqual(_lag_bars(bar, None), 0)

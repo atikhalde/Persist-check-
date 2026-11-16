@@ -122,6 +122,111 @@ class EntryCapTests(TestCase):
         self.assertEqual(state.load()["pick_entries"], {"IT long": 3})
 
 
+class SectorLeadRankingTests(TestCase):
+    """The cap must keep the name that is *moving inside its sector*.
+
+    ``score`` is absolute — its "rs" leg is ``close > previous close``, one bar
+    worth 15 of 100 — so ranking by it keeps the most extended chart, which on
+    16 Nov was how a pick could alert a follower ahead of the sector's leader.
+    """
+
+    SCORES = {"AAA": 82, "BBB": 62, "CCC": 77, "DDD": 62}
+    LAST = {"AAA": 100.4, "BBB": 103.0, "CCC": 100.6, "DDD": 100.2}  # +.4 / +3.0 / +.6 / +.2 %
+    SECTOR_INTRA = 1.0                                               # index +1.0% from its open
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ctx = patch.object(state, "STATE_PATH", Path(self.tmp.name) / "state.json")
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
+        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0"})
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
+        self.now = BAR + timedelta(minutes=6)
+        self.times = [BAR - timedelta(minutes=5 * i) for i in range(39, 0, -1)] + [BAR]
+        self.uni = {"nifty": "NIFTY", "vix": "VIX",
+                    "sectors": {"IT": {"index": "INDEX", "stocks": list(self.SCORES)}}}
+        self.md = SimpleNamespace(bar_time=BAR.strftime("%Y-%m-%d %H:%M"),
+                                  dir_state=1, dir_label="BULL", dir_conf=74,
+                                  pick_sector="IT", pick_side=1, nifty_intra=0.5,
+                                  sectors={"IT": {"intra_ret": self.SECTOR_INTRA, "rs": 0.5}},
+                                  pick_reason="test", action="SCAN LONG", regime="TREND")
+        self.contexts = [
+            patch.object(pipeline, "now_ist", side_effect=lambda: self.now),
+            patch.object(pipeline.data, "load_universe", return_value=self.uni),
+            patch.object(pipeline.data, "fetch_symbol", side_effect=lambda *args: {
+                "m5": bars(*self.times), "d1": bars(BAR - timedelta(days=1))}),
+            patch.object(pipeline.data, "fetch_many", side_effect=self.fetch),
+            patch.object(pipeline.data, "apply_1m_volume", side_effect=lambda df, _: df),
+            patch.object(pipeline, "run_market", side_effect=self.market_at_bar),
+            patch.object(pipeline, "format_market", return_value="market"),
+            patch.object(pipeline, "format_stock", side_effect=lambda sig, *a, **k: f"stock {sig.symbol}"),
+            patch.object(pipeline, "scan_stock", side_effect=self.scan),
+            patch.object(pipeline.telegram, "send", return_value=True),
+            patch.object(pipeline, "_unsettled", return_value=(set(), False)),
+        ]
+        self.mocks = [p.start() for p in self.contexts]
+        for p in self.contexts:
+            self.addCleanup(p.stop)
+        self.send = self.mocks[9]
+
+    def fetch(self, tickers, period, interval):
+        out = {}
+        for t in tickers:
+            if t.endswith(".NS"):
+                c = self.LAST[t[:-3]]
+                out[t] = pd.DataFrame({"Open": [100.0] * len(self.times),
+                                       "High": [max(100.0, c)] * len(self.times),
+                                       "Low": [min(100.0, c)] * len(self.times),
+                                       "Close": [c] * len(self.times),
+                                       "Volume": [1000] * len(self.times)},
+                                      index=pd.DatetimeIndex(self.times))
+            else:
+                out[t] = bars(*self.times)
+        return out
+
+    def market_at_bar(self, df, *args):
+        self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
+        return self.md
+
+    def scan(self, symbol, frame, daily, keep_all=False):
+        c = self.LAST[symbol]
+        return [StockSignal(symbol, 101, "BUY-EX", "BUY", BAR.strftime("%H:%M"),
+                            c, self.SCORES[symbol], "Strong", 20, 1, "test", c - 1.0)]
+
+    def stock_texts(self):
+        return [c.args[0] for c in self.send.call_args_list if c.args[0].startswith("stock")]
+
+    def test_the_leader_is_alerted_first_even_with_the_lowest_score(self):
+        pipeline.run_once()
+        # BBB scored 62 (joint lowest) but is +2.0pp ahead of its sector; AAA (82) lags it.
+        self.assertEqual(self.stock_texts(), ["stock BBB", "stock CCC", "stock AAA"])
+        self.assertIn("DDD@10:00", state.load()["stats"]["rejected"]["cap"])
+
+    def test_the_leader_takes_the_only_slot_when_one_is_allowed(self):
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
+            pipeline.run_once()
+        self.assertEqual(self.stock_texts(), ["stock BBB"])
+        self.assertIn("AAA@10:00", state.load()["stats"]["rejected"]["cap"])
+
+    def test_the_old_score_order_can_be_restored(self):
+        with patch.dict("os.environ", {"RANK_BY_SECTOR_LEAD": "0"}):
+            pipeline.run_once()
+        self.assertEqual(self.stock_texts(), ["stock AAA", "stock CCC", "stock BBB"])
+
+    def test_the_alert_shows_how_far_ahead_of_its_sector_it_is(self):
+        text = ORIGINAL_FORMAT_STOCK(
+            signal(), self.md, TradePlan(100.0, 99.5, 99.0, 1.0, 102.0, 104.0, 106.0),
+            sector="IT", lead=2.4)
+        self.assertIn("Market BULL (74%)  ·  lead +2.4pp vs sector", text)
+
+    def test_no_lead_means_no_claim(self):
+        text = ORIGINAL_FORMAT_STOCK(
+            signal(), self.md, TradePlan(100.0, 99.5, 99.0, 1.0, 102.0, 104.0, 106.0), sector="IT")
+        self.assertNotIn("lead", text)
+
+
 def market_decision(**over):
     """A complete MarketDecision, for the block formatter (see market.MarketDecision)."""
     base = dict(session="2026-11-16", bar_time="2026-11-16 10:20", nifty=25270.8,
@@ -129,7 +234,8 @@ def market_decision(**over):
                 adx=41, mtf_bull=3, dir_state=1, dir_label="BULL", dir_conf=94,
                 dir_tier="BUILDING", breadth_adv=7, breadth_dec=8, regime="TRANSITION",
                 persist_plus=[("FMCG", 79), ("BANK", 56)], persist_minus=[("REALTY", 91)],
-                live_flow="REALTY", live_flow_qualified=True, live_flow_score=85,
+                live_flow="REALTY", live_flow_side=-1, live_flow_score=85,
+                live_flow_qualified=True,
                 pick_sector="FMCG", pick_side=1, pick_reason="PERSIST + FMCG qualified",
                 action="SCAN LONG")
     base.update(over)
@@ -153,6 +259,22 @@ class MarketBlockTests(TestCase):
         with patch.dict("os.environ", {"MARKET_CONF_DELTA": "0"}):
             text = REAL_FORMAT_MARKET(market_decision(dir_conf=10), 99)
         self.assertNotIn("(was", text)
+
+    def test_the_flow_score_shows_its_side(self):
+        # 16 Nov printed "REALTY Q (85)" in a BULL block while REALTY was the
+        # top of PERSIST minus: the number read as bullish flow and was not.
+        down = REAL_FORMAT_MARKET(market_decision(live_flow="REALTY", live_flow_side=-1))
+        up = REAL_FORMAT_MARKET(market_decision(live_flow="PHA", live_flow_side=1))
+        self.assertIn("Live flow  REALTY▼ Q (85)", down)
+        self.assertIn("Live flow  PHA▲ Q (85)", up)
+        self.assertIn("PERSIST −  REALTY 91", down)      # the contradiction, now visible
+
+    def test_a_stale_index_is_named_on_the_block(self):
+        text = REAL_FORMAT_MARKET(market_decision(stale_sectors=[("FMCG", 6)]))
+        self.assertIn("⚠ stale index  FMCG 6 bars behind", text)
+
+    def test_a_fresh_scan_has_no_stale_line(self):
+        self.assertNotIn("stale index", REAL_FORMAT_MARKET(market_decision()))
 
 
 class LiveAlertTests(TestCase):
