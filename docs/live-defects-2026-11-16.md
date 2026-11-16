@@ -498,6 +498,46 @@ rule picks REALTY that day**, at 11:55 or in the morning. What would is a
 divergence rule (index up, breadth 5▲/10▼ → allow a `PERSIST −` short with the
 mirrored gates) — a new rule, not a bug. Pinned by `DirectionFirstTests`.
 
+### The divergence rule — `DIVERGENCE_SHORT` (off, for testing)
+
+The one tape the one-sided rule cannot trade: **index up, breadth against it.** On
+16 Nov 11:55 that was `Nifty +0.44%`, breadth `5▲/10▼`, `PERSIST − REALTY 91` —
+and no pick, because a BULL bar has no short pool. The rule, when
+`DIVERGENCE_SHORT=1`:
+
+| condition | value |
+|---|---|
+| index side | committed **BULL** and `nifty day > 0` |
+| breadth | `dec − adv ≥ 2` (`5▲/10▼` = 5) |
+| sector | top of `PERSIST −`, `side == −1`, not stale |
+| persistence | `persist_bear ≥ DIVERGE_MIN_PERSIST` (65) |
+| trend | `day ≤ −0.20%`, `range pos ≤ 40`, `rs < 0` |
+| flow | bear flow ≥ 55, and `recent < +0.07` — **not bouncing** |
+| precedence | **one pick per bar, long side first**: the short only replaces a `WAIT`, never a long |
+| hysteresis | the incumbent faller is held unless a challenger is `PICK_STICKY_MARGIN` more persistent |
+
+It is a fallback, not a second pick: on a bar where a sector can be bought, the
+short does not exist. The block says which one it is —
+`MARKET BULL conf 41% WEAK  ·  short on divergence` over `SECTOR PICK: REALTY
+BEAR`, with the reason spelled out:
+
+```
+DIVERGENCE SHORT — index up (Nifty +0.44%) but breadth 5▲/10▼; REALTY is breaking
+down (persist 91, day -1.20%, range pos 3, flow 85 bear)
+```
+
+Downstream it is an ordinary short: `pick_cap_key` is `REALTY short`, the cap and
+the lead ranking apply, bot 3 scans the same sector, and the stock ranked first is
+the one falling *fastest relative to its sector* (the short-side `lead`).
+
+**Why it is off.** It shorts into a rising index. The tape it targets — index held
+up by two or three names, everything else offered — can grind up for hours while
+the breadth stays red, and then the fade never comes. It is a rule to test, not a
+rule to switch on and forget. To A/B it: set `DIVERGENCE_SHORT=1` for a session
+(the block and the log then name every divergence short it would take), and on a
+day it is off, the same information is still on the block as
+`No pick · persistent movers  FMCG long 93 · REALTY short 91`.
+
 ### What it does not fix
 
 **REALTY 91 could not have been traded on this block either way.** It is the most
@@ -510,7 +550,7 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **332 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **346 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still

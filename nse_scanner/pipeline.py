@@ -188,6 +188,11 @@ def format_market(md, prev_conf: int | None = None) -> str:
         head = f"<b>MARKET STAND ASIDE</b>  {lean}conf {md.dir_conf}% {md.dir_tier}{moved}"
     else:
         head = f"<b>MARKET {md.dir_label}</b>  conf {md.dir_conf}% {md.dir_tier}{moved}"
+        # A pick that goes against the lock must say so: "MARKET BULL" over
+        # "SECTOR PICK: REALTY BEAR" is only readable if the divergence is named.
+        commit = getattr(md, "commit_side", getattr(md, "dir_state", 0))
+        if commit in (1, -1) and md.pick_side != commit:
+            head += ("  ·  short on divergence" if md.pick_side == -1 else "  ·  long on divergence")
     # The day's persistent movers on each side, even when nothing is traded:
     # that is the question the block was silent on — "which sectors are moving?"
     watch = ""

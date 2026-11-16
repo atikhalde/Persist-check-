@@ -72,6 +72,9 @@ VIX_SPIKE = 4.0
 # the block says WAIT — and, by the locked rule, nothing is scanned. It was a
 # literal 55 in three places; a WAIT block could not say what it waits for.
 PICK_MIN_CONF = 55
+# A divergence day: the index is up but the sectors are not (16 Nov 11:55 was
+# Nifty +0.44% with 5 advancing sectors against 10 falling).
+DIVERGE_SPREAD = 2
 CONCRETE_COMMIT = 2
 CONCRETE_MIN_CONF = 65
 CONCRETE_WARMUP = 3
@@ -174,6 +177,7 @@ class MarketDecision:
     dir_label: str
     dir_conf: int
     dir_tier: str
+    commit_side: int
     breadth_adv: int
     breadth_dec: int
     regime: str
@@ -489,11 +493,20 @@ def run_market(
         action = "SCAN SHORT"
     extra_sectors: list[str] = []
     flow_aligned: list[str] = []
-    follow = _follow_fallback(pick, commit_side, dir_conf, persist_plus)
-    if follow:
-        pick, pick_side, action = follow["pick"], follow["side"], follow["action"]
-        extra_sectors, flow_aligned = follow["extra"], follow["aligned"]
-        reason = follow["reason"]
+    # One pick per bar, and the long side comes first: the divergence short may
+    # only replace a WAIT, never a pick that already exists.
+    if not pick:
+        follow = _follow_fallback(pick, commit_side, dir_conf, persist_plus)
+        if follow:
+            pick, pick_side, action = follow["pick"], follow["side"], follow["action"]
+            extra_sectors, flow_aligned = follow["extra"], follow["aligned"]
+            reason = follow["reason"]
+        else:
+            diverge = _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec,
+                                        persist_minus, prev_pick)
+            if diverge:
+                pick, pick_side, action = diverge["pick"], diverge["side"], diverge["action"]
+                reason = diverge["reason"]
 
     return MarketDecision(
         session=str(sid),
@@ -509,6 +522,7 @@ def run_market(
         dir_label=dir_label,
         dir_conf=int(dir_conf),
         dir_tier=dir_tier,
+        commit_side=commit_side,
         breadth_adv=breadth_adv,
         breadth_dec=breadth_dec,
         regime=regime,
@@ -1039,6 +1053,79 @@ def weak_follow_min_persist() -> float:
         return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "65"))
     except ValueError:
         return 65.0
+
+
+def divergence_short() -> bool:
+    """May a PERSIST − short be taken while the index itself is up (``0``)?
+
+    The complementary rule is one-sided on purpose: the pick must agree with
+    Nifty. That leaves one tape untradeable — the index held up by a few names
+    while most sectors fall (16 Nov 11:55: Nifty +0.44%, breadth 5▲/10▼, REALTY
+    the persistent faller at 91). Nothing there is a *bug*: a BULL bar has no
+    short pool. This is the rule that would trade it, and it is deliberately
+    narrow — index up, breadth clearly against it, and the sector has to be
+    breaking down on every mirrored gate.
+
+    Default ``0``: the rule is untested live and it shorts into a rising index.
+    ``DIVERGE_MIN_PERSIST`` (65) is the persistence it demands.
+    """
+    return os.environ.get("DIVERGENCE_SHORT", "0") != "0"
+
+
+def diverge_min_persist() -> float:
+    """Persistence a PERSIST − sector needs for a divergence short (65)."""
+    try:
+        return float(os.environ.get("DIVERGE_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
+
+
+def _is_breaking_down(s, need: float) -> bool:
+    """Mirror of ``_is_leading`` for the short side.
+
+    Down on the day, in the lower part of its range, negative RS, bearish flow,
+    and not currently bouncing back (``recent`` below the same threshold the long
+    side uses for "rolling over", with the sign flipped).
+    """
+    return bool(
+        s.side == -1 and s.persist_bear >= need
+        and not getattr(s, "stale", False)
+        and s.day_ret <= -BULL_MIN_DAY and s.pos <= BEAR_MAX_POS and s.rs < 0
+        and s.bear >= FLOW_MIN and s.recent < RECENT_MOVE_MIN
+    )
+
+
+def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus, prev=None):
+    """The persistent faller, when the index is up and the breadth is not.
+
+    One pick per bar: this only runs when the long side has nothing, so the
+    "one side only" rule is intact — the short replaces a WAIT, never a long.
+    """
+    if not divergence_short() or commit_side != 1 or n_day_ret <= 0:
+        return None
+    if breadth_dec - breadth_adv < DIVERGE_SPREAD or not minus:
+        return None
+    need = diverge_min_persist()
+    candles = [s for s in list(minus)[:3] if _is_breaking_down(s, need)]
+    if not candles:
+        return None
+    best = candles[0]
+    held = False
+    if prev and prev.get("side") == -1:
+        # same hysteresis as the pick: two persistent fallers must not trade the
+        # short back and forth
+        keep = next((s for s in minus if s.name == prev.get("name")), None)
+        if keep is not None and keep in candles and \
+                keep.persist_bear + pick_sticky_margin() > best.persist_bear:
+            best, held = keep, True
+    reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but breadth "
+              f"{breadth_adv}▲/{breadth_dec}▼; {best.name} is breaking down "
+              f"(persist {best.persist_bear:.0f}, day {best.day_ret:+.2f}%, "
+              f"range pos {best.pos:.0f}, flow {best.bear:.0f} bear)")
+    if held:
+        reason += f" · held over {candles[0].name} (within {pick_sticky_margin():.0f})"
+    return {"pick": best.name, "side": -1, "action": "SCAN SHORT", "reason": reason,
+            "extra": [], "aligned": []}
 
 
 def _find_sector(name: str, want_side: int, plus, minus, snaps=None):

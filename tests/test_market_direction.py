@@ -364,3 +364,83 @@ class WeakFollowTests(TestCase):
     def test_follow_switch_still_turns_everything_off(self):
         self.assertIsNone(self.fallback(None, 0, 41, self.leaders(), SECTOR_FOLLOW="0",
                                         SECTOR_FOLLOW_ON_WEAK="1"))
+
+
+class DivergenceShortTests(TestCase):
+    """Index up, breadth down — the one tape the one-sided rule cannot trade.
+
+    16 Nov 11:55: Nifty +0.44%, breadth 5▲/10▼, PERSIST − REALTY 91. A BULL bar
+    has no short pool, so nothing was picked. This is the rule that would.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def short(self, commit=1, day=0.44, adv=5, dec=10, minus=None, prev=None, **env):
+        from nse_scanner.market import _divergence_short
+        pool = minus if minus is not None else [self.faller()]
+        with patch.dict("os.environ", {"DIVERGENCE_SHORT": "1", **env}):
+            return _divergence_short(commit, day, adv, dec, pool, prev)
+
+    def faller(self, name="REALTY", persist=91.0, **over):
+        base = dict(side=-1, persist_bear=persist, day_ret=-1.20, pos=8.0, rs=-0.9,
+                    bear=85.0, recent=-0.02, stale=False)
+        return self.snap(name, **{**base, **over})
+
+    def test_it_fires_on_the_16_nov_tape(self):
+        out = self.short()
+        self.assertEqual((out["pick"], out["side"], out["action"]), ("REALTY", -1, "SCAN SHORT"))
+        self.assertIn("DIVERGENCE SHORT — index up (Nifty +0.44%) but breadth 5▲/10▼", out["reason"])
+        self.assertIn("persist 91", out["reason"])
+
+    def test_it_is_off_by_default(self):
+        with patch.dict("os.environ", {"DIVERGENCE_SHORT": "0"}):
+            from nse_scanner.market import _divergence_short
+            self.assertIsNone(_divergence_short(1, 0.44, 5, 10, [self.faller()]))
+
+    def test_the_index_has_to_be_up(self):
+        self.assertIsNone(self.short(day=-0.30))          # a falling index has a short pool
+        self.assertIsNone(self.short(commit=-1, day=-0.30))
+
+    def test_the_breadth_has_to_be_against_it(self):
+        self.assertIsNone(self.short(adv=8, dec=7))       # 8▲/7▼ is not a divergence
+        self.assertIsNone(self.short(adv=7, dec=8))       # a 1-sector spread is noise
+        self.assertIsNotNone(self.short(adv=6, dec=9))    # 2 is the bar
+
+    def test_a_marginal_faller_is_not_shorted(self):
+        self.assertIsNone(self.short(minus=[self.faller(persist=58.0)]))
+        self.assertIsNotNone(self.short(minus=[self.faller(persist=65.0)]))
+
+    def test_every_mirrored_gate_matters(self):
+        for bad in (dict(side=1),                  # not a short sector
+                    dict(day_ret=+0.10),           # not down enough
+                    dict(pos=55.0),                # middle of its range
+                    dict(rs=+0.10),                # ahead of Nifty
+                    dict(bear=40.0),               # flow not bearish
+                    dict(recent=+0.12),            # bouncing
+                    dict(stale=True)):             # index not printing
+            self.assertIsNone(self.short(minus=[self.faller(**bad)]), bad)
+
+    def test_the_floor_can_be_moved(self):
+        self.assertIsNone(self.short(minus=[self.faller(persist=58.0)]))
+        self.assertIsNotNone(self.short(minus=[self.faller(persist=58.0)],
+                                        DIVERGE_MIN_PERSIST="55"))
+
+    def test_the_incumbent_faller_is_held_within_the_margin(self):
+        # Two persistent fallers must not trade the short back and forth.
+        best = self.faller("REALTY", persist=91.0)
+        near = self.faller("DEF", persist=88.0)
+        out = self.short(minus=[best, near], prev={"name": "DEF", "side": -1})
+        self.assertEqual(out["pick"], "DEF")
+        self.assertIn("held over REALTY", out["reason"])
+        far = self.faller("DEF", persist=80.0)
+        self.assertEqual(self.short(minus=[best, far], prev={"name": "DEF", "side": -1})["pick"],
+                         "REALTY")
+
+    def test_a_recovered_incumbent_is_not_held(self):
+        best = self.faller("REALTY", persist=91.0)
+        back = self.faller("DEF", persist=88.0, recent=+0.20)     # bouncing: not a short
+        self.assertEqual(self.short(minus=[best, back], prev={"name": "DEF", "side": -1})["pick"],
+                         "REALTY")
+
+    def test_no_bear_pool_is_no_trade(self):
+        self.assertIsNone(self.short(minus=[]))

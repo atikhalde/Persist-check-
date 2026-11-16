@@ -157,6 +157,10 @@ jobs:
           # sector (conf < 55). 0 = the locked rule: conf < 55 stands aside.
           SECTOR_FOLLOW_ON_WEAK: ${{ vars.SECTOR_FOLLOW_ON_WEAK || '0' }}
           SECTOR_FOLLOW_WEAK_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_WEAK_MIN_PERSIST || '65' }}
+          # 1 = index up but breadth against it: the persistent faller may be
+          # shorted (mirrored gates). 0 = the pick must agree with Nifty.
+          DIVERGENCE_SHORT: ${{ vars.DIVERGENCE_SHORT || '0' }}
+          DIVERGE_MIN_PERSIST: ${{ vars.DIVERGE_MIN_PERSIST || '65' }}
           # Entries per pick: bot 3 confirms on the same ceiling as bot 1 (it used
           # to announce six names where bot 1 announced three).
           MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}

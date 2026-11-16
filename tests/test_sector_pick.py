@@ -13,6 +13,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from nse_scanner import market
 from nse_scanner.market import run_market
 from nse_scanner.session import IST
 
@@ -221,3 +222,61 @@ class DirectionFirstTests(TestCase):
         self.assertEqual((md.pick_sector, md.pick_side), ("FMCG", 1))
         self.assertTrue(md.pick_reason.startswith("SECTOR FOLLOW"))
         self.assertIn("Nifty NEUTRAL", md.pick_reason)
+
+
+class DivergenceWiringTests(TestCase):
+    """The divergence short only replaces a WAIT; it never sits next to a long."""
+
+    # the real SECTOR_ORDER codes: a made-up name is dropped by run_market
+    NAMES = ["AUTO", "FIN", "IT", "MET", "DEF", "ENE", "FMCG", "OIL", "PHA", "PSE",
+             "PSUBK", "BANK", "REALTY", "CDUR", "MEDIA"]
+
+    def world(self):
+        """Index rising, five sectors up and the rest falling: 16 Nov, in miniature."""
+        sectors = {n: (sector(0.00030) if i < 5 else sector(-0.00010 * (1 + i % 3)))
+                   for i, n in enumerate(self.NAMES)}      # 5 up, 10 down
+        out, level = [], 25000.0
+        for d in DAYS:
+            seg = series(level, 0.00004)
+            out.append(bars(d, seg))
+            level = seg[-1]
+        n5 = pd.concat(out)
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        return n5, vix, sectors
+
+    def decide(self, **env):
+        """A thunk: the env has to be patched while ``run_market`` runs, not before."""
+        def go():
+            n5, vix, sectors = self.world()
+            with patch.dict("os.environ", {"SECTOR_FOLLOW": "1", **env}):
+                return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                                  {k: daily(v) for k, v in sectors.items()})
+        return go
+
+    def test_a_divergence_day_is_still_waited_out_by_default(self):
+        with patch.object(market, "_complementary_pick", return_value=(None, 0, "WAIT — test")):
+            md = self.decide()()
+        self.assertEqual((md.pick_sector, md.pick_side, md.action), ("WAIT", 0, "WAIT"))
+
+    def test_the_short_fills_the_wait_when_asked(self):
+        with patch.object(market, "_complementary_pick", return_value=(None, 0, "WAIT — test")):
+            md = self.decide(DIVERGENCE_SHORT="1")()
+        self.assertEqual((md.pick_side, md.action), (-1, "SCAN SHORT"))
+        self.assertIn("DIVERGENCE SHORT", md.pick_reason)
+        self.assertEqual(md.pick_sector, md.persist_minus[0][0])     # the persistent faller
+        self.assertEqual(md.commit_side, 1)                          # against a BULL lock
+
+    def test_a_long_pick_still_wins_the_bar(self):
+        # One side only: with a sector to buy, the divergence short stays off the tape.
+        md = self.decide(DIVERGENCE_SHORT="1")()
+        self.assertEqual((md.pick_side, md.action), (1, "SCAN LONG"))
+        self.assertNotIn("DIVERGENCE", md.pick_reason)
+
+    def test_the_short_names_the_divergence_on_the_block(self):
+        with patch.object(market, "_complementary_pick", return_value=(None, 0, "WAIT — test")):
+            md = self.decide(DIVERGENCE_SHORT="1")()
+        from nse_scanner.pipeline import format_market
+        text = format_market(md)
+        self.assertIn("short on divergence", text)
+        self.assertIn("SECTOR PICK:", text)
+        self.assertIn("BEAR", text)
