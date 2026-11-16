@@ -128,6 +128,11 @@ jobs:
           SCAN1M_MAX_STALE_SECONDS: ${{ vars.SCAN1M_MAX_STALE_SECONDS || '100' }}
           SCAN1M_GRACE_SECONDS: ${{ vars.SCAN1M_GRACE_SECONDS || '6' }}
           SCAN1M_EARLY_PER_DAY: ${{ vars.SCAN1M_EARLY_PER_DAY || '1' }}
+          # 2 = a projection that did not survive its close may be re-projected
+          # on a later candle of the same session (the day's cap alone used to
+          # silence the name, and its later alerts were same-second duplicates
+          # of bot 1). 0 restores the old one-shot behaviour.
+          SCAN1M_EARLY_RETRIES: ${{ vars.SCAN1M_EARLY_RETRIES || '2' }}
           # own: this loop decides the sector/side itself (same market engine)
           # and projects the forming candle's pick, which is what gives bot 3
           # its lead. ledger: reuse the 5m scan's pick from state/scan_state.json

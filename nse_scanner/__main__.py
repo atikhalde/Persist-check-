@@ -213,11 +213,12 @@ def _doctor() -> int:
     source = market_source()
     lead = ("(pick projected from the forming candle)" if source != "ledger"
             else "(no projection — the ledger holds closed candles only)")
-    from .scan1m import leader_catchup, leader_max_minutes, leader_max_r
+    from .scan1m import early_retries, leader_catchup, leader_max_minutes, leader_max_r
     catchup = (f"on (max {leader_max_minutes()} min old, <= {leader_max_r():.1f}R)"
                if leader_catchup() else "off")
     print(f"1m scan knobs: first minute {fm} (up to {5 - fm} min early) · "
           f"market source {source} {lead} · "
+          f"re-projection after a cancel: up to {early_retries()} more per name · "
           f"cancel messages {'on' if cancel_message() else 'off'} · "
           f"leader catch-up {catchup}")
     if token and chat:

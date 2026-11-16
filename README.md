@@ -243,7 +243,7 @@ diagnostic (`once --backfill --dry-run`), never a 1m live loop.
 
 ```
 ⚡ 🟢 EARLY BUY (1m projection) | BUY-EX17  PNB
-Sector PSUBK  |  Market BULL (74%)
+Sector PSUBK  |  Market BULL (74%)  ·  pick projected from the forming candle
 Price now 135.70  ·  5m bar 10:30–10:35 still forming
 3m 55s left — projected from 1m prints up to 10:31
 SL ≈ 135.02 (EMA9 so far)  |  Risk ≈ 0.68
@@ -396,15 +396,17 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_FIRST_MINUTE` | `1` | first minute of the 5m candle that may alert: `1` = up to 4 min early, `4` = 1 min early. Later minutes project fewer, better candles (clamped to 1–4) |
 | `SCAN1M_CANCEL_MESSAGE` | `0` | `1` = send `❌ EARLY CANCELLED — BUY ABC · projected 10:31:05 @ 135.70 · close 135.20 (−0.37%)` instead of dropping the projection silently |
 | `SCAN1M_MARKET_SOURCE` | `auto` | `ledger` = reuse the 5m scan's pick from `state/scan_state.json` (same sector and side, no market fetch — needs that file on this machine); `own` = decide the market here with the same engine (what the workflow uses); `auto` = ledger first, own as fallback. In `ledger` mode a missing or stale 5m ledger says so in the log, once per candle, instead of doing nothing |
-| `SCAN1M_EARLY_PER_DAY` | `1` | projected alerts per stock per session (a projection that failed its close may be retried on a later candle) |
+| `SCAN1M_EARLY_PER_DAY` | `1` | projected alerts per stock per session. A projection that did **not** survive its close is not spent: it may be retried on a later candle of the same session |
+| `SCAN1M_EARLY_RETRIES` | `2` | how many of those re-projections a name gets after a cancellation. `0` restores the old one-shot rule (one bad candle silenced the name for the day, and its later alerts were same-second duplicates of bot 1) |
 | `SCAN1M_MAX_STALE_SECONDS` | `100` | skip a stock whose newest 1m print is older than this |
 | `SCAN1M_GRACE_SECONDS` | `6` | seconds after a minute boundary before asking Yahoo |
 | `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 summary |
 | `SCAN1M_1M_PERIOD` | `1d` | 1m history window fetched every minute (prior sessions come from one 7d fetch per day) |
 
-`python -m nse_scanner doctor` prints the three that change behaviour most
-(`first minute → up to N min early`, `market source`, `cancel messages on/off`)
-next to the bot-3 credentials, so a typo is visible before the session starts.
+`python -m nse_scanner doctor` prints the ones that change behaviour most
+(`first minute → up to N min early`, `market source`, `re-projections after a
+cancel`, `cancel messages on/off`, `leader catch-up`) next to the bot-3
+credentials, so a typo is visible before the session starts.
 
 **Measure it before trusting it** — the same early-check harness works for the
 projection, and `--lead` is exactly "how early":
