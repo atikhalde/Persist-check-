@@ -55,6 +55,7 @@ Configuration (environment):
 ``SCAN1M_MAX_STALE_SECONDS``  skip a stock whose newest 1m print is older (100)
 ``SCAN1M_GRACE_SECONDS``     seconds after a minute boundary before acting (6)
 ``SCAN1M_EARLY_PER_DAY``     projected alerts per stock per session (1)
+``SCAN1M_EARLY_RETRIES``     re-projections after a cancelled one (2)
 ``SCAN1M_MARKET_SOURCE``     ``ledger`` | ``own`` | ``auto`` (auto)
 ``SCAN1M_CANCEL_MESSAGE``    ``1`` also report a projection that failed (0)
 ``SCAN1M_SUMMARY``           ``1`` send a session summary at 15:33 (1)
@@ -157,6 +158,11 @@ def leader_catchup() -> bool:
 def leader_max_minutes() -> int:
     """How old a pre-pick fire may be and still be worth a catch-up (30 min)."""
     return _env_int("SCAN1M_LEADER_MAX_MINUTES", 30, 5, 120)
+
+
+def early_retries() -> int:
+    """Extra projections a name gets after one did not survive its close (2)."""
+    return _env_int("SCAN1M_EARLY_RETRIES", 2, 0, 10)
 
 
 def leader_max_r() -> float:
@@ -314,7 +320,8 @@ def _index_universe() -> tuple[dict, dict]:
     return uni, index_map
 
 
-def projected_market(bar: datetime, now: datetime, force_sector: str | None = None):
+def projected_market(bar: datetime, now: datetime, force_sector: str | None = None,
+                     why: list | None = None):
     """``run_market`` on the STILL-FORMING candle ``bar`` — Nifty, VIX, sectors.
 
     The 5m scan decides the pick from a candle's close, so while a candle is
@@ -355,8 +362,15 @@ def projected_market(bar: datetime, now: datetime, force_sector: str | None = No
             built = df5.loc[df5.index <= pd.Timestamp(bar)]
         return built if built is not None and not built.empty else None
 
+    def _why(reason: str) -> None:
+        if why is not None:
+            why.append(reason)
+
     nifty_5 = frame(nifty)
     if nifty_5 is None:
+        missing = [sym for sym in (nifty, vix, *index_map.values()) if not frame(sym)]
+        _why(f"no forming bar for {', '.join(missing[:4])}" + (" …" if len(missing) > 4 else "")
+             if missing else "no forming Nifty bar")
         return None
     md = run_market(
         nifty_5,
@@ -367,6 +381,7 @@ def projected_market(bar: datetime, now: datetime, force_sector: str | None = No
         {name: d1.get(sym) for name, sym in index_map.items()},
     )
     if md.bar_time != bar.strftime("%Y-%m-%d %H:%M"):
+        _why(f"the market engine kept the {md.bar_time} bar")
         return None                  # sanitation moved the bar: not this candle
     if force_sector:                 # ``--sector IT``: the 5m scan's override
         forced = force_sector.upper()
@@ -378,17 +393,43 @@ def projected_market(bar: datetime, now: datetime, force_sector: str | None = No
     return md
 
 
+_pick_notes: set[str] = set()
+
+
+def _note_pick_fallback(bar: datetime, why: str) -> None:
+    """Say *once per candle* why the pick had to come from the last close.
+
+    Without this the fallback is invisible: the projections still fire, they just
+    carry the previous candle's label and confidence (16 Nov: "Market BULL (56%)"
+    at 09:43 and "(63%)" at 09:47 were the 09:35 and 09:40 closes, not the
+    forming candle's verdict). If the projected pick never works on the runner,
+    that is now one INFO line per candle instead of guesswork.
+    """
+    key = f"{bar:%Y-%m-%d %H:%M}"
+    if key in _pick_notes:
+        return
+    _pick_notes.add(key)
+    log.info("1m %s: pick projected? NO (%s) — projecting on the last close's pick",
+             bar.strftime("%H:%M"), why)
+
+
 def _projection_pick(bar: datetime, now: datetime,
                      force_sector: str | None = None) -> dict | None:
     """The forming candle's own pick — projected, never guessed."""
     if market_source() == "ledger":
+        _note_pick_fallback(bar, "SCAN1M_MARKET_SOURCE=ledger holds closed candles only")
         return None                  # nothing to project from: closed bars only
+    why: list[str] = []
     try:
-        md = projected_market(bar, now, force_sector)
-    except Exception:
+        md = projected_market(bar, now, force_sector, why=why)
+    except Exception as exc:
         log.exception("projected market failed for %s", bar.strftime("%H:%M"))
+        _note_pick_fallback(bar, f"{type(exc).__name__}: {exc}")
         return None
-    return _pick_dict(md, projected=True) if md is not None else None
+    if md is None:
+        _note_pick_fallback(bar, why[0] if why else "the forming candle could not be built")
+        return None
+    return _pick_dict(md, projected=True)
 
 
 def pick_for(bar: datetime, *, projection: bool, force_sector: str | None = None,
@@ -644,13 +685,25 @@ def _targets(plan) -> str:
     return _target_text(plan)
 
 
+def _pick_source(scan: dict) -> str:
+    """Which pick the projection judged — visible on every EARLY alert.
+
+    ``pick projected`` means the forming candle decided the sector itself (the
+    lead is real); ``pick: last close`` means the fallback was used, so the
+    numbers are the previous candle's and the lead is shorter than it looks.
+    """
+    return "pick projected from the forming candle" if scan.get("projected") \
+        else "pick: last close (no projection this minute)"
+
+
 def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close = bar + timedelta(minutes=BAR_MINUTES)
     left = max(0, int((close - now).total_seconds()))
     return (
         f"⚡ {arrow} <b>EARLY {sig.side}</b> (1m projection) | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{scan.get('sector')}</b>  |  Market {scan.get('label')} ({scan.get('conf')}%)\n"
+        f"Sector <b>{scan.get('sector')}</b>  |  Market {scan.get('label')} ({scan.get('conf')}%)"
+        f"  ·  {_pick_source(scan)}\n"
         f"Price now <b>{plan.entry:.2f}</b>  ·  5m bar {bar:%H:%M}–{close:%H:%M} still forming\n"
         f"<b>{left // 60}m {left % 60:02d}s left</b> — projected from 1m prints up to {now:%H:%M}\n"
         f"SL ≈ {plan.sl:.2f} (EMA9 so far)  |  Risk ≈ {plan.risk:.2f}\n"
@@ -839,10 +892,16 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
 
 # ── one minute of the projection ─────────────────────────────────────────────
 def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
-    """One projection per candle; ``SCAN1M_EARLY_PER_DAY`` caps the session.
+    """One projection per candle; the session budget is per *name*.
 
     A projection that did not survive its close may be retried on a **later**
-    candle of the same session, because the engine's own state moved on.
+    candle of the same session, because the engine's own state moved on. That
+    retry has its own budget (``SCAN1M_EARLY_RETRIES``, 2): the cap used to be
+    applied before the retry test, so with the default
+    ``SCAN1M_EARLY_PER_DAY=1`` a single cancellation silenced the name for the
+    rest of the day — every later alert it produced was a same-second duplicate
+    of bot 1 (HINDUNILVR, 16 Nov: projected at 09:48, cancelled at the 09:50
+    close, then entered at 10:00 with no lead at all).
     """
     if not prev:
         return True
@@ -850,9 +909,11 @@ def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
         return True
     if prev.get("bar") == bar.isoformat():
         return False
-    if int(prev.get("n") or 1) >= max(1, early_per_day()):
-        return False
-    return prev.get("result") == "cancelled"
+    tries = int(prev.get("n") or 1)
+    budget = max(1, early_per_day())
+    if prev.get("result") == "cancelled":
+        return tries < budget + max(0, early_retries())
+    return tries < budget
 
 
 def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
@@ -1089,6 +1150,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     names = [raw for raw in sector_of if raw not in sent and raw not in positions]
     if not names:
         _mark_judged(st, bar)          # every name is already in a trade today
+        _settle(st, bar, set(), None, "no free name in the scanned sector", scanned=set())
         save_ledger(st)
         return []
 
@@ -1167,7 +1229,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         log.info("1m CONFIRMED %s %s %s @ %.2f (sent %s IST)", raw, best.side, best.name,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
-    _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes)
+    _settle(st, bar, confirmed, checked, "did not hold at the close", closes=closes,
+            scanned=set(names))
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
     if checked != set(names):
@@ -1253,20 +1316,32 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
 
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
-            reason: str = "", closes: dict[str, float] | None = None) -> None:
+            reason: str = "", closes: dict[str, float] | None = None,
+            scanned: set[str] | None = None) -> None:
     """Resolve projected alerts of ``bar`` that the close did not confirm.
 
-    ``checked`` limits this to the stocks the close scan could actually judge:
-    a candle whose feed has not published yet must be retried, not written off.
+    ``checked`` limits this to the stocks the close scan could actually judge: a
+    candle whose feed has not published yet must be retried, not written off.
+
+    ``scanned`` is the list this candle *did* scan (``names``). A projection for
+    a name that is not on it can never be resolved by a retry — the sector or the
+    side moved before the close — so it is written off here instead of being
+    left ``result: null`` for the rest of the day. 16 Nov: DIVISLAB and BIOCON
+    were projected on the 09:40 candle as PHA; that candle's close picked FMCG,
+    so they were never checked, never resolved, never counted — and their
+    ``n`` stood at the day's cap, which blocked them from ever projecting again.
     """
     for raw, early in list((st.get("early") or {}).items()):
         if early.get("result") or early.get("bar") != bar.isoformat() or raw in confirmed:
             continue
+        why = reason
         if checked is not None and raw not in checked:
-            continue
+            if scanned is None or raw in scanned:
+                continue                 # the feed had not published: retried
+            why = "is no longer in the scanned sector/side"
         early["result"] = "cancelled"
         st.setdefault("stats", {})["cancelled"] = st.get("stats", {}).get("cancelled", 0) + 1
-        log.info("1m projection for %s did not hold (%s) — no message", raw, reason)
+        log.info("1m projection for %s did not hold (%s) — no message", raw, why)
         if cancel_message():
             price = early.get("price")
             px = (closes or {}).get(raw)

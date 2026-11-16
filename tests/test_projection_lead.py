@@ -363,6 +363,59 @@ class LeaderAlertTests(LeaderFixture):
             **st, "stats": {**st["stats"], "rejected": {"earlier": {"ITC": "ITC 09:20"}}}}))
 
 
+class RepeatProjectionTests(LeaderFixture):
+    """Defect 1 in the live feed: a name that was cancelled never led again.
+
+    HINDUNILVR, 16 Nov: projected 09:48, cancelled at the 09:50 close, then
+    entered at 10:00 — the same second bot 1 sent it, with no lead at all. The
+    day's cap (``SCAN1M_EARLY_PER_DAY=1``) was tested *before* the retry rule, so
+    one cancellation silenced the name until the next session.
+    """
+
+    def _second_candle(self):
+        """Rebase the fixture on 10:05–10:10 and let ITC fire again."""
+        bar = BAR + timedelta(minutes=5)
+        now = bar + timedelta(minutes=1, seconds=6)
+        for cache in (scan1m._five_cache, scan1m._one_cache, scan1m._pick_cache):
+            cache.clear()
+        self.prints = {s: frame_1m(5, 6, 7, 8) for s in self.prints}
+        self.history = {s: frame_5m(*[bar - timedelta(minutes=5 * i) for i in range(25, 0, -1)])
+                        for s in self.history}
+        self.fires = {"ITC"}
+        self.fire_time = "10:05"
+        return bar, now
+
+    def _cancel_on_close(self, bar=BAR):
+        st = scan1m.load_ledger()
+        scan1m._settle(st, bar, set(), checked={"ITC", "DABUR"},
+                       reason="did not hold at the close", scanned={"ITC", "DABUR"})
+        scan1m.save_ledger(st)
+        return st
+
+    def test_the_name_still_gets_an_early_alert_after_a_cancelled_projection(self):
+        scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual(len(self.bot3), 1)
+        self._cancel_on_close()
+        bar, now = self._second_candle()
+        with patch.object(scan1m, "now_ist", return_value=now):
+            out = scan1m.run_minute(bar, now=now)
+        self.assertEqual(len(self.bot3), 2, "a cancelled projection must not silence the name")
+        self.assertIn("EARLY BUY", self.bot3[1])
+        self.assertIn("ITC", self.bot3[1])
+        self.assertEqual(out[0]["minute"], 1)
+        self.assertEqual(scan1m.load_ledger()["early"]["ITC"]["n"], 2)
+
+    def test_a_confirmed_projection_still_spends_the_name_for_the_day(self):
+        scan1m.run_minute(BAR, now=MIN1)
+        st = scan1m.load_ledger()
+        st["early"]["ITC"]["result"] = "confirmed"
+        scan1m.save_ledger(st)
+        bar, now = self._second_candle()
+        with patch.object(scan1m, "now_ist", return_value=now):
+            scan1m.run_minute(bar, now=now)
+        self.assertEqual(len(self.bot3), 1)               # no second projection for ITC
+
+
 class LeaderCatchupTests(LeaderFixture):
     """Turned on by request: the leader that fired BEFORE its sector was picked.
 
@@ -461,6 +514,92 @@ class LeaderCatchupTests(LeaderFixture):
         self.assertTrue(scan1m.catchup_due(st, pick, BAR + timedelta(minutes=3)))
         self.assertFalse(scan1m.catchup_due(st, pick, BAR + timedelta(minutes=15)))
         self.assertTrue(scan1m.catchup_due(st, {"sector": "IT", "side": 1}, BAR))  # new pick
+
+
+class RetryAndSettleTests(TestCase):
+    """What the 16 Nov feed exposed, in units.
+
+    * a projection that did not hold used to silence the name for the rest of the
+      day, because the per-day cap was tested before the retry rule — so every
+      later alert for that name was a same-second duplicate of bot 1
+      (HINDUNILVR: projected 09:48, cancelled 09:50, entered 10:00 with no lead);
+    * a projection whose candle picked a different sector was never resolved:
+      not counted as cancelled, and its ``n`` still at the cap.
+    """
+
+    # --- a cancelled projection gets its own retry budget -------------------
+    def _prev(self, *, n=1, result="cancelled", bar="2026-11-16T09:45:00+05:30"):
+        return {"bar": bar, "session": "2026-11-16", "n": n, "result": result}
+
+    def test_a_cancelled_projection_may_be_retried(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_PER_DAY": "1",
+                                       "SCAN1M_EARLY_RETRIES": "2"}, clear=False):
+            self.assertTrue(scan1m._early_allowed(self._prev(n=1), "2026-11-16", BAR))
+            self.assertTrue(scan1m._early_allowed(self._prev(n=2), "2026-11-16", BAR))
+            self.assertFalse(scan1m._early_allowed(self._prev(n=3), "2026-11-16", BAR))
+
+    def test_the_retry_budget_can_be_switched_off(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_PER_DAY": "1",
+                                       "SCAN1M_EARLY_RETRIES": "0"}, clear=False):
+            self.assertFalse(scan1m._early_allowed(self._prev(n=1), "2026-11-16", BAR))
+
+    def test_a_confirmed_projection_still_spends_the_day(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_PER_DAY": "1",
+                                       "SCAN1M_EARLY_RETRIES": "2"}, clear=False):
+            self.assertFalse(scan1m._early_allowed(self._prev(n=1, result=None),
+                                                   "2026-11-16", BAR))
+            self.assertFalse(scan1m._early_allowed(self._prev(n=1, result="confirmed"),
+                                                   "2026-11-16", BAR))
+
+    def test_one_projection_per_candle_even_after_a_cancel(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_RETRIES": "2"}, clear=False):
+            prev = self._prev(bar=BAR.isoformat())
+            self.assertFalse(scan1m._early_allowed(prev, "2026-11-16", BAR))
+
+    # --- a projection whose sector moved is resolved, not left dangling -----
+    def _st(self):
+        return {"session": "2026-11-16", "sent": {}, "positions": {}, "stats": {},
+                "early": {"DIVISLAB": {"bar": BAR.isoformat(), "side": "BUY", "price": 100.0,
+                                       "at": "09:43:00", "name": "BUY-EX6", "n": 1,
+                                       "result": None},
+                          "SUNPHARMA": {"bar": BAR.isoformat(), "side": "BUY", "price": 100.0,
+                                        "at": "09:36:00", "name": "BUY-EX7", "n": 1,
+                                        "result": None}}}
+
+    def test_a_name_the_close_no_longer_scans_is_written_off(self):
+        st = self._st()
+        scan1m._settle(st, BAR, set(), checked={"ITC"}, reason="did not hold",
+                       scanned={"ITC"})
+        self.assertEqual(st["early"]["DIVISLAB"]["result"], "cancelled")
+        self.assertEqual(st["early"]["SUNPHARMA"]["result"], "cancelled")
+        self.assertEqual(st["stats"]["cancelled"], 2)
+
+    def test_a_name_whose_feed_had_not_published_is_still_retried(self):
+        st = self._st()
+        scan1m._settle(st, BAR, set(), checked=set(), reason="did not hold",
+                       scanned={"DIVISLAB", "SUNPHARMA"})
+        self.assertIsNone(st["early"]["DIVISLAB"]["result"])
+        self.assertNotIn("cancelled", st["stats"])
+
+    # --- the alert says which pick it judged -------------------------------
+    def test_the_early_alert_names_the_pick_it_used(self):
+        text = scan1m.format_projected(signal(), {"sector": "FMCG", "label": "BULL",
+                                                  "conf": 63, "projected": True},
+                                       PLAN, BAR, MIN1, minute=1)
+        self.assertIn("pick projected from the forming candle", text)
+        fallback = scan1m.format_projected(signal(), {"sector": "FMCG", "label": "BULL",
+                                                      "conf": 63, "projected": False},
+                                           PLAN, BAR, MIN1, minute=1)
+        self.assertIn("pick: last close (no projection this minute)", fallback)
+
+    def test_the_fallback_is_logged_once_per_candle(self):
+        scan1m._pick_notes.clear()
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            scan1m._note_pick_fallback(BAR, "no forming bar for ^NSEI")
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("no forming bar for ^NSEI", logs.output[0])
+        with self.assertNoLogs("nse_scanner.scan1m", level="INFO"):
+            scan1m._note_pick_fallback(BAR, "no forming bar for ^NSEI")   # same candle
 
 
 class RealMarketEngineTests(TestCase):

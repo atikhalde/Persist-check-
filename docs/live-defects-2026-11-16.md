@@ -243,11 +243,30 @@ its sector was picked" without the log. The message says exactly which of those
 happened, carries the fire's own stop and R, and states in the text that bot 1
 has no alert for it.
 
-## Still open (not touched)
+## Second pass — after the feed was read end to end
 
-* **The alert-by-alert audit of the 16 Nov feed** — waiting for the export: the
-  messages from both bots with timestamps, and the day's bars from the runner
-  (this sandbox has no route to Yahoo, so price moves must come from there).
-  For each alert the audit answers: which candle's pick was in force, did the
-  name fire on that candle or an earlier one, and how many minutes separated
-  bot 3 from bot 1.
+The alert-by-alert audit of the 16 Nov feed is in
+[`docs/audit-2026-11-16-alerts.md`](audit-2026-11-16-alerts.md). It confirmed the
+projection fix on the candle that matters — DIVISLAB and BIOCON were projected at
+09:43:07 for a 09:45 close, a real 1m53s lead — and found three further causes of
+"bot 3 has nothing to say, so bot 1 says it":
+
+| # | what the feed showed | cause | fix |
+|---|---|---|---|
+| 1 | HINDUNILVR projected 09:48, cancelled at the 09:50 close, then entered at 10:00:08 with **no lead** | `_early_allowed` tested the day's cap (`SCAN1M_EARLY_PER_DAY=1`) *before* the retry rule, so `n=1` blocked every later candle — the retry could never run under the default cap | the retry has its own budget, `SCAN1M_EARLY_RETRIES` (default **2**); a confirmed projection still spends the name for the day |
+| 2 | DIVISLAB / BIOCON projected on the 09:40 candle, never confirmed, never cancelled, never counted | `_settle` only resolved names the close scan could judge; the next candle picked FMCG, so both left `sent`/`positions` and their projections dangled with `n` at the cap | `_settle(..., scanned=names)` writes off a projection that is no longer on the scanned list (`is no longer in the scanned sector/side`) and still retries one whose feed had not published |
+| 3 | `Market BULL (56%)` at 09:43 and `(63%)` at 09:47 — the 09:35 and 09:40 closes, not the forming candle's verdict, with nothing saying so | the projection fell back to the last close's pick silently, so neither the alert nor the log could show whether the lead was real | every `⚡` carries `·  pick projected from the forming candle` or `·  pick: last close (no projection this minute)`, and `_projection_pick` logs one `pick projected? NO (<reason>)` line per candle |
+
+Findings 1 and 2 are the same failure in two places: **a projection could be spent
+without ever being resolved**, and an unresolved projection is a name that is
+silent for the rest of the session. Both now end in `cancelled`, which is counted
+in the summary and does not consume the budget.
+
+Two things in the feed are reported and deliberately **not** changed:
+
+* **the market score saturates** — `STRONG BULL 99` / `conf 100%` on a breadth that
+  went 10▲/5▼ → 7▲/8▼ with ADX 41. It changes nothing about which names alert, but
+  "Market 100%" is not a strength reading and should not be read as one;
+* **the pharma leaders were all given up within 40 minutes** by their 5m EMA9
+  exits while 09:35–10:20 was the day's high. That is the strategy, not the
+  plumbing — the projection did its job and the entries still lost.
