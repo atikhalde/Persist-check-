@@ -280,6 +280,17 @@ Confirmed entry follows at the 10:35 close if the candle holds
   60 — no projection until the candle was nearly over. `data.project_volume`
   scales the forming bar by `5 / minutes covered`, which is exactly 1.0 at the
   close: the confirmed frame is the one bot 1 judged, unchanged.
+* **The leader that fired too early is announced, labelled.** A sector's leader
+  usually fires *before* its sector is picked, so the scan rejects it as
+  `earlier` — correct (it is not a new signal on the candle being scanned) but
+  it used to mean silence, while the followers that fired later got their
+  alerts: the reported "missed the leader, late on the followers". Bot 3 now
+  sends one `⏰ LATE LEADER` message per name per session when the sector is
+  picked and the trade is still valid: the fire's own stop untouched since, no
+  older than `SCAN1M_LEADER_MAX_MINUTES` (30), move within
+  `SCAN1M_LEADER_MAX_R` (2.0R). It is **not** an entry — `sent`/`positions` are
+  untouched, and the message says so. `SCAN1M_LEADER_CATCHUP=0` turns it off;
+  bot 1 never sends it.
 * **Own bot, own ledger.** `TELEGRAM_BOT_TOKEN_3` / `TELEGRAM_CHAT_ID_3` and
   `state/scan1m_state.json`. It never calls the bots 1/2 sender and never reads
   or writes `state/scan_state.json` (the 5m pick is only read when
@@ -321,6 +332,7 @@ bot-3 twin, produced by the same code:
 | entry | `format_stock` + OI line | the same text, with `✅ CONFIRMED` in front |
 | 🎯 TARGET HIT / 🛑 SL HIT / 🔔 EMA9 EXIT | `_track_positions` | **the same function** — `pipeline._track_positions(..., send=bot 3, save=1m ledger)` |
 | ⚠ feed delayed | one notice per session on bot 1 | the same notice on bot 3 |
+| ⏰ LATE LEADER | never | the sector's leader fired before its sector was picked: once, labelled, bounded (`SCAN1M_LEADER_CATCHUP`) |
 | ❌ early cancelled | only when `EARLY_…` reports it | only when `SCAN1M_CANCEL_MESSAGE=1` |
 | 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
 

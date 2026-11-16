@@ -241,8 +241,8 @@ class ProjectedMarketTests(TestCase):
         self.assertIsNone(scan1m.projected_market(BAR, MIN1))
 
 
-class LeaderAlertTests(TestCase):
-    """A leader firing on the flip candle is projected; the followers are not."""
+class LeaderFixture(TestCase):
+    """One sector flipping to FMCG with ITC inside it — the shared world."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -269,6 +269,7 @@ class LeaderAlertTests(TestCase):
         self.prints = {s: frame_1m(0, 1, 2, 3) for s in ("NIFTY", "VIX", "CNXFMCG", "CNXIT")}
         self.scanned: list[str] = []
         self.fires = {"ITC"}
+        self.fire_time = BAR.strftime("%H:%M")
         self.patches = [
             patch.object(scan1m, "LEDGER", self.dir / "scan1m.json"),
             patch.object(state, "STATE_PATH", self.dir / "scan_state.json"),
@@ -309,14 +310,19 @@ class LeaderAlertTests(TestCase):
 
     def _scan(self, symbol, frame, daily, keep_all=False):
         if symbol in self.fires:                # default: the leader, on the flip candle
-            return [signal(symbol=symbol, time=BAR.strftime("%H:%M"))]
+            return [signal(symbol=symbol, time=self.fire_time)]
         return []
 
     def _send_bot3(self, text, dry_run=False):
         self.bot3.append(text)
         return True
 
-    # --- tests ---------------------------------------------------------------
+    def _send_texts(self) -> list[str]:
+        return self.bot3
+
+
+class LeaderAlertTests(LeaderFixture):
+    """A leader firing on the flip candle is projected; the followers are not."""
     def test_the_leader_of_the_new_sector_is_projected_before_the_close(self):
         out = scan1m.run_minute(BAR, now=MIN1)
         self.assertEqual(self.scanned, ["FMCG"])          # the projected pick, not IT
@@ -355,6 +361,106 @@ class LeaderAlertTests(TestCase):
         self.assertIn("no signal on the forming candle", text)
         self.assertIn("fired before their sector was picked", scan1m.format_summary({
             **st, "stats": {**st["stats"], "rejected": {"earlier": {"ITC": "ITC 09:20"}}}}))
+
+
+class LeaderCatchupTests(LeaderFixture):
+    """Turned on by request: the leader that fired BEFORE its sector was picked.
+
+    The scan rejects such a signal as ``earlier`` — correctly, it is not a new
+    signal on the candle being scanned — and before this it stayed silent while
+    the followers, which fire on the later candles, got their alerts. Bot 3 now
+    announces it once, labelled, bounded and only while the trade is still worth
+    taking. It is never an entry: ``sent`` and ``positions`` stay untouched.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.fire_time = "09:40"                  # fired before the 10:00 pick
+        self.five = {s: frame_5m(*[BAR - timedelta(minutes=5 * i) for i in range(25, 0, -1)],
+                                 close=100.0) for s in ("NIFTY", "VIX", "CNXFMCG", "CNXIT")}
+        for df in self.five.values():
+            df["High"] = 100.02
+            df["Low"] = 99.99                     # the stop (99.98) is never touched
+        self.history = self.five
+        self.prints = {s: frame_1m(0, 1) for s in ("NIFTY", "VIX", "CNXFMCG", "CNXIT")}
+        for df in self.prints.values():
+            df["Low"] = 99.99                     # the 1m prints must not touch the stop
+
+    def test_the_missed_leader_is_announced_once_when_its_sector_is_picked(self):
+        out = scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual(len(self.bot3), 1)
+        text = self.bot3[0]
+        self.assertIn("LATE LEADER BUY", text)
+        self.assertIn("fired before its sector was picked", text)
+        self.assertIn("ITC", text)
+        self.assertIn("09:40", text)
+        self.assertIn("Not an entry alert", text)
+        self.assertEqual([m["symbol"] for m in out], ["ITC"])
+        self.assertTrue(out[0]["catchup"])
+        ledger = scan1m.load_ledger()
+        self.assertEqual(ledger["stats"]["catchup"], 1)
+        self.assertNotIn("ITC", ledger["sent"])        # not an entry
+        self.assertNotIn("ITC", ledger["positions"])   # no trade opened
+        scan1m.run_minute(BAR, now=MIN3)               # the loop's next minute
+        self.assertEqual(len(self.bot3), 1)            # once per name per session
+
+    def test_the_knob_turns_it_off(self):
+        with patch.dict("os.environ", {"SCAN1M_LEADER_CATCHUP": "0"}, clear=False):
+            self.assertEqual(scan1m.run_minute(BAR, now=MIN1), [])
+        self.assertEqual(self.bot3, [])
+
+    def test_a_name_projected_on_this_candle_is_not_also_caught_up(self):
+        """One message per name per minute: the projection wins."""
+        self.fire_time = BAR.strftime("%H:%M")         # ITC also fires on the 10:00 candle
+        self.history = {s: frame_5m(*[BAR - timedelta(minutes=5 * i) for i in range(25, 0, -1)])
+                        for s in self.five}
+        out = scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual(len(self.bot3), 1)
+        self.assertIn("EARLY BUY", self.bot3[0])
+        self.assertNotIn("LATE LEADER", self.bot3[0])
+        self.assertTrue(out[0]["early"])
+
+    def test_the_summary_reports_the_catch_up(self):
+        scan1m.run_minute(BAR, now=MIN1)
+        self.assertIn("LATE LEADER catch-ups 1", scan1m.format_summary(scan1m.load_ledger()))
+
+    # --- what "still valid" means -------------------------------------------
+    def _candidate(self, *, fire_time="09:40", lows=99.99, highs=100.02, now=MIN1,
+                   price_now=100.0, env=None):
+        times = [BAR - timedelta(minutes=5 * i) for i in range(25, 0, -1)]
+        frame = frame_5m(*times, close=100.0)
+        frame["Low"], frame["High"] = lows, highs
+        forming = frame_1m(0, price=price_now)         # the 10:00 candle so far
+        forming["Low"] = min(99.99, price_now - 0.001)   # stays above the 99.98 stop
+        projected = data.provisional_5m(frame, forming, BAR, now, 100)
+        fires = [signal(time=fire_time, symbol="ITC")]
+        with patch.dict("os.environ", env or {}, clear=False):
+            return scan1m.catchup_candidate(projected, fires, "BUY", BAR, now)
+
+    def test_a_fire_from_this_candle_is_not_a_catch_up(self):
+        self.assertIsNone(self._candidate(fire_time=BAR.strftime("%H:%M")))
+
+    def test_the_reported_stop_cancels_the_catch_up(self):
+        self.assertIsNone(self._candidate(lows=99.50))          # traded through 99.98
+
+    def test_a_fire_older_than_the_window_is_dropped(self):
+        self.assertIsNone(self._candidate(env={"SCAN1M_LEADER_MAX_MINUTES": "10"}))
+        hit = self._candidate(env={"SCAN1M_LEADER_MAX_MINUTES": "60"})
+        self.assertIsNotNone(hit)
+        self.assertAlmostEqual(hit["age"], 16.0, places=0)      # 09:40 close 09:45 → 10:01
+
+    def test_a_leader_that_already_ran_is_not_chased(self):
+        moved = {"price_now": 100.03}                  # +1.5R from the fire (risk 0.02)
+        self.assertIsNone(self._candidate(**moved, env={"SCAN1M_LEADER_MAX_R": "0.5"}))
+        self.assertIsNotNone(self._candidate(**moved, env={"SCAN1M_LEADER_MAX_R": "2.0"}))
+
+    def test_the_catch_up_is_evaluated_around_the_pick_change_only(self):
+        st: dict = {}
+        pick = {"sector": "FMCG", "side": 1}
+        self.assertTrue(scan1m.catchup_due(st, pick, BAR))               # first sight
+        self.assertTrue(scan1m.catchup_due(st, pick, BAR + timedelta(minutes=3)))
+        self.assertFalse(scan1m.catchup_due(st, pick, BAR + timedelta(minutes=15)))
+        self.assertTrue(scan1m.catchup_due(st, {"sector": "IT", "side": 1}, BAR))  # new pick
 
 
 class RealMarketEngineTests(TestCase):

@@ -137,6 +137,15 @@ jobs:
           # 1 = also report a projection that did not survive the close.
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}
+          # A sector's leader usually fires BEFORE its sector is picked, so the
+          # scan rejects it as "earlier" and it stays silent while the followers
+          # get their alerts. 1 = announce it once, labelled LATE LEADER, when
+          # the sector is picked and the trade is still valid (stop untouched,
+          # fire no older than SCAN1M_LEADER_MAX_MINUTES, move <= MAX_R).
+          # Bot 3 only; bot 1 never sends it.
+          SCAN1M_LEADER_CATCHUP: ${{ vars.SCAN1M_LEADER_CATCHUP || '1' }}
+          SCAN1M_LEADER_MAX_MINUTES: ${{ vars.SCAN1M_LEADER_MAX_MINUTES || '30' }}
+          SCAN1M_LEADER_MAX_R: ${{ vars.SCAN1M_LEADER_MAX_R || '2.0' }}
           SCAN1M_1M_PERIOD: ${{ vars.SCAN1M_1M_PERIOD || '1d' }}
           # The same rule inputs the 5m workflow passes — one engine, one config.
           SECTOR_FOLLOW: ${{ vars.SECTOR_FOLLOW }}

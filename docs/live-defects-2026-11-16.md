@@ -204,24 +204,50 @@ many minutes separated bot 3 from bot 1 — and the result is a table like the
 one above, per alert, with the price move added from the runner (the bot has
 the 5m bars; this sandbox does not).
 
-## Open question (needs your call)
+## The catch-up (decided: bot 3 only, bounded)
 
-A leader whose exception fired **before** its sector became the pick is still
-silent by design (`stats.rejected.earlier`). Nothing alerts it, on either
-scanner, because it is not a *new* signal on the candle being scanned.
+A leader whose signal fired **before** its sector was picked is still not a new
+signal on the candle being scanned — the `earlier` reject is correct — so it
+gets its own labelled message instead of being squeezed into the entry stream:
 
-Options:
+```
+⏰ 🟢 LATE LEADER BUY — fired before its sector was picked
+ITC · sector FMCG  |  Market BULL (74%)
+Fired 09:40 as ENTRY BUY @ 100.00 · sector picked 10:00 · 16 min ago
+Price now 100.03 (+1.5R from the fire) · SL 99.98 (the fire candle's EMA9 stop, untouched since)
+Risk if taken now ≈ 0.05 (0.05%)  |  next pivot target: T1 R1 100.02 (1.0R, +0.02%) …
+Score 65 Strong   base 20/21 cond22=1 score=65
+5m bar 10:00–10:05 forming · 3m 54s left
+Not an entry alert — no signal fired on this candle; bot 1 has none for this name
+either. Check the stop yourself before acting.
+```
 
-1. **Leave it** — "no catch-up trades"; the leader is missed but the stream
-   stays clean. (Current behaviour, and why 2b/1 matter: the projected pick
-   makes the flip candle itself scannable, so most leaders are caught.)
-2. **Leader catch-up alert** on bot 3 only: if a name of the *newly picked*
-   sector fired earlier in the same session and the trade is still valid (stop
-   not touched since, price still on the right side of the pick's side), send a
-   clearly labelled `⏰ LATE LEADER — fired 09:20, sector picked 10:35, entry now`
-   on bot 3, once per name per session. Bot 1 stays silent.
-3. Same as 2, but only within a window (`SCAN1M_LEADER_MAX_MINUTES`, e.g. 30).
+Rules, all of them explicit:
 
-My recommendation is 3 (bounded, bot-3 only, labelled), if the log shows leaders
-firing before their sector was picked. It needs a rule decision — what counts as
-"still valid" — so it is not in this change.
+| gate | value |
+|---|---|
+| where | bot 3 only; bot 1 never sends it, and `sent` / `positions` are **not** written (it is not an entry, so the normal entry flow still applies to that name) |
+| how often | once per name per session (`st["catchup"]`); the scan runs only around a pick change (`catchup_due`, 10 minutes) so the extra fetch is bounded |
+| age | the fire must be within `SCAN1M_LEADER_MAX_MINUTES` (default **30**) of the current minute |
+| still valid | no candle since the fire has touched the stop that fire defined (`plan.sl` from the fire candle's EMA9) |
+| not a chase | the move from the fire entry must be ≤ `SCAN1M_LEADER_MAX_R` (default **2.0R**) |
+| off | `SCAN1M_LEADER_CATCHUP=0` |
+
+The 15:33 summary counts them: `LATE LEADER catch-ups 1 (signal fired before its
+sector was picked)`.
+
+This is why it was not silent-by-default: a missed leader is the one case where
+*no* message is worse than a labelled one — you cannot act on a signal you never
+saw, and you cannot tell "the leader never fired" from "the leader fired before
+its sector was picked" without the log. The message says exactly which of those
+happened, carries the fire's own stop and R, and states in the text that bot 1
+has no alert for it.
+
+## Still open (not touched)
+
+* **The alert-by-alert audit of the 16 Nov feed** — waiting for the export: the
+  messages from both bots with timestamps, and the day's bars from the runner
+  (this sandbox has no route to Yahoo, so price moves must come from there).
+  For each alert the audit answers: which candle's pick was in force, did the
+  name fire on that candle or an earlier one, and how many minutes separated
+  bot 3 from bot 1.

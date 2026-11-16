@@ -29,6 +29,15 @@ This module adds the missing mode as its own scan, on its own bot:
   a fifth of the candle at minute 1: a name whose completed candle scores 65
   showed 60 and was not projected until the candle was nearly over. The scale is
   exactly 1.0 at the close, so the confirmed stream is unchanged;
+* a sector's **leader** usually fires *before* its sector is picked, and the
+  scan rejects such a signal as ``earlier`` (it is not a new signal on the
+  candle being scanned) — so it used to stay silent while the followers, which
+  fire on the later candles, got their alerts. ``catchup_candidate`` announces
+  it once, labelled ``⏰ LATE LEADER``, when the sector is picked and the trade
+  is still valid: the stop the fire defined has not been touched since, the fire
+  is no older than ``SCAN1M_LEADER_MAX_MINUTES`` and the move is within
+  ``SCAN1M_LEADER_MAX_R``. Bot 3 only; never an entry (``sent``/``positions``
+  are untouched);
 * at the candle's close the completed candle is evaluated again and the
   **confirmed** entry is sent to the same bot. A projection that does not
   survive the close is dropped silently (``SCAN1M_CANCEL_MESSAGE=1`` to report
@@ -49,6 +58,10 @@ Configuration (environment):
 ``SCAN1M_MARKET_SOURCE``     ``ledger`` | ``own`` | ``auto`` (auto)
 ``SCAN1M_CANCEL_MESSAGE``    ``1`` also report a projection that failed (0)
 ``SCAN1M_SUMMARY``           ``1`` send a session summary at 15:33 (1)
+``SCAN1M_LEADER_CATCHUP``    ``1`` announce a leader that fired before its sector
+                             was picked, labelled ``LATE LEADER`` (1)
+``SCAN1M_LEADER_MAX_MINUTES``  how old such a fire may be to still count (30)
+``SCAN1M_LEADER_MAX_R``      skip it once the move already exceeds this R (2.0)
 ===========================  ====================================================
 
 ``SCAN1M_MARKET_SOURCE=ledger`` reads the 5m scan's pick and can therefore only
@@ -134,6 +147,21 @@ def cancel_message() -> bool:
 
 def want_summary() -> bool:
     return os.environ.get("SCAN1M_SUMMARY", "1") != "0"
+
+
+def leader_catchup() -> bool:
+    """Announce a leader whose signal fired before its sector was picked (1)."""
+    return os.environ.get("SCAN1M_LEADER_CATCHUP", "1") != "0"
+
+
+def leader_max_minutes() -> int:
+    """How old a pre-pick fire may be and still be worth a catch-up (30 min)."""
+    return _env_int("SCAN1M_LEADER_MAX_MINUTES", 30, 5, 120)
+
+
+def leader_max_r() -> float:
+    """Skip a catch-up once the move from the fire already exceeds this (2.0R)."""
+    return max(0.5, _env_float("SCAN1M_LEADER_MAX_R", 2.0))
 
 
 # ── ledger ───────────────────────────────────────────────────────────────────
@@ -675,6 +703,9 @@ def format_summary(st: dict) -> str:
     if leads:
         lines.append(f"Average lead {stats.get('lead_sum', 0) / leads:.1f} min before the 5m close "
                      f"(earliest {stats.get('lead_min', 0)} min)")
+    if stats.get("catchup"):
+        lines.append(f"LATE LEADER catch-ups {stats['catchup']} "
+                     f"(signal fired before its sector was picked)")
     skips = stats.get("proj_skip") or {}
     if skips:
         bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]
@@ -686,6 +717,124 @@ def format_summary(st: dict) -> str:
         lines.append(f"⚠ the 1m feed lagged past the close on {stats['feed_behind']} candle(s)")
     lines.append(f"Projected alerts fire {first_minute()}–4 minutes before the 5m close.")
     return "\n".join(line for line in lines if line)
+
+
+# ── the leader that fired before its sector was picked ───────────────────────
+# ``pipeline.run_once`` (and this module's own projection pass) only alerts a
+# signal that fires on the candle it is scanning. A sector's leader usually fires
+# *before* the sector is picked, so it is rejected as ``earlier`` and stays
+# silent — while the followers, which fire on the later candles, get their
+# alerts. That reads as "missed the leader, late on the followers".
+#
+# A catch-up is not a new signal and not an entry: it says, in one labelled
+# message and once per name per session, "this name fired at 09:20, the sector
+# was only picked at 10:35, the stop it defined has not been touched since, and
+# the move is still worth taking". Bot 1 never sends it; nothing is written to
+# ``sent``/``positions``, so the normal entry flow is untouched.
+_CATCHUP_WINDOW_MINUTES = 10      # minutes after a pick appears that are re-checked
+
+
+def catchup_due(st: dict, pick: dict, bar: datetime) -> bool:
+    """Evaluate catch-ups around a pick change, not on every minute of the day.
+
+    A leader can only become "skipped" when a sector is newly picked, so the
+    extra scan runs while the pick is new (or changes) and for the next ten
+    minutes, which is enough to retry a name whose feed had not published yet.
+    """
+    if not leader_catchup():
+        return False
+    key = f"{pick.get('sector')}|{pick.get('side')}"
+    prev = st.get("catchup_pick") or {}
+    if prev.get("key") != key:
+        st["catchup_pick"] = {"key": key, "since": bar.isoformat()}
+        return True
+    try:
+        since = pd.Timestamp(prev.get("since") or bar.isoformat())
+    except (TypeError, ValueError):
+        st["catchup_pick"] = {"key": key, "since": bar.isoformat()}
+        return True
+    if since.tzinfo is None and bar.tzinfo is not None:
+        since = since.tz_localize(bar.tzinfo)
+    return (bar - since) <= timedelta(minutes=_CATCHUP_WINDOW_MINUTES)
+
+
+def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
+                      bar: datetime, now: datetime, daily=None) -> dict | None:
+    """The name's day-first fire of this side, if a catch-up is still justified.
+
+    Valid means all of: the fire is on an earlier candle of today's session, its
+    age is within ``SCAN1M_LEADER_MAX_MINUTES``, the EMA9 stop it defined has
+    not been touched by any candle since, and the move from that entry is not
+    already beyond ``SCAN1M_LEADER_MAX_R`` (a leader that has run is no longer a
+    catch-up — it is a chase).
+    """
+    if frame is None or frame.empty or not fires:
+        return None
+    hhmm = bar.strftime("%H:%M")
+    earlier = [s for s in fires if s.side == want and s.time < hhmm]
+    if not earlier:
+        return None
+    sig = min(earlier, key=lambda s: s.time)          # the day's first fire of this side
+    fire = _fire_bar(bar, sig.time)
+    if fire is None:
+        return None
+    age = (now - (fire + timedelta(minutes=BAR_MINUTES))).total_seconds() / 60.0
+    if age < 0 or age > leader_max_minutes():
+        return None
+    upto = frame.loc[frame.index <= pd.Timestamp(fire)]
+    if upto.empty or to_ist(upto.index[-1]) != to_ist(fire):
+        return None
+    plan = build_plan(sig, upto, fire, daily)
+    if plan is None:
+        return None
+    after = frame.loc[frame.index > fire]
+    if after.empty:
+        return None
+    stopped = (bool((after["Low"] <= plan.sl).any()) if sig.side == "BUY"
+               else bool((after["High"] >= plan.sl).any()))
+    if stopped:
+        return None
+    price = float(frame["Close"].iloc[-1])
+    signed = (price - plan.entry) if sig.side == "BUY" else (plan.entry - price)
+    r = signed / plan.risk if plan.risk else 0.0
+    if r > leader_max_r():
+        return None
+    return {"sig": sig, "plan": plan, "price": price, "r": r, "fire": fire, "age": age}
+
+
+def _fire_bar(bar: datetime, hhmm: str) -> datetime | None:
+    """Today's candle at ``hh:mm`` (the bar a stored fire time refers to)."""
+    try:
+        hour, minute = (int(part) for part in hhmm.split(":"))
+    except (AttributeError, ValueError):
+        return None
+    return bar.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime) -> str:
+    """One labelled message; unmistakably not an entry alert."""
+    sig, plan = hit["sig"], hit["plan"]
+    arrow = "🟢" if sig.side == "BUY" else "🔴"
+    close = bar + timedelta(minutes=BAR_MINUTES)
+    left = max(0, int((close - now).total_seconds()))
+    risk_now = abs(hit["price"] - plan.sl)
+    pct_now = risk_now / hit["price"] * 100.0 if hit["price"] else 0.0
+    target = _targets(plan)
+    return (
+        f"⏰ {arrow} <b>LATE LEADER {sig.side}</b> — fired before its sector was picked\n"
+        f"<b>{raw}</b> · sector <b>{pick.get('sector')}</b>  |  "
+        f"Market {pick.get('label')} ({pick.get('conf')}%)\n"
+        f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
+        f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
+        f"Price now <b>{hit['price']:.2f}</b> "
+        f"({hit['r']:+.1f}R from the fire) · SL {plan.sl:.2f} "
+        f"(the fire candle's EMA9 stop, untouched since)\n"
+        f"Risk if taken now ≈ {risk_now:.2f} ({pct_now:.2f}%)  |  next pivot target: {target}\n"
+        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"5m bar {bar:%H:%M}–{close:%H:%M} forming · {left // 60}m {left % 60:02d}s left\n"
+        f"<b>Not an entry alert</b> — no signal fired on this candle; bot 1 has none for "
+        f"this name either. Check the stop yourself before acting."
+    )
 
 
 # ── one minute of the projection ─────────────────────────────────────────────
@@ -745,13 +894,18 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     book = st.setdefault("early", {})
     sent = st.setdefault("sent", {})
     positions = st.setdefault("positions", {})
-    names = [raw for raw in sector_of
-             if raw not in sent and raw not in positions
-             and _early_allowed(book.get(raw), session, bar)]
-    if not names:
+    caught = st.setdefault("catchup", {})
+    tradeable = [raw for raw in sector_of if raw not in sent and raw not in positions]
+    names = [raw for raw in tradeable if _early_allowed(book.get(raw), session, bar)]
+    # A leader that fired before its sector was picked is not a projection (its
+    # signal is not on this candle) but it is what the feed was missing.
+    catching = ([raw for raw in tradeable if raw not in caught]
+                if catchup_due(st, pick, bar) else [])
+    wanted = list(dict.fromkeys(names + catching))
+    if not wanted:
         return []
 
-    tickers = {raw: data.yahoo_stock(raw) for raw in names}
+    tickers = {raw: data.yahoo_stock(raw) for raw in wanted}
     sm5 = five_minute_history(tickers, bar)
     sm1 = one_minute_frames(tickers, bar)
     sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
@@ -770,18 +924,25 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         """
         skips[reason] = skips.get(reason, 0) + 1
 
+    frames: dict[str, pd.DataFrame] = {}
+    fires_book: dict[str, list] = {}
+    projected_now: set[str] = set()
     for raw, ysym in tickers.items():
         m1 = sm1.get(ysym)
         frame = projected_frame(sm5.get(ysym), m1, bar, now)
         if frame is None:
             _no_projection(raw, "no_1m_frame")
             continue
+        frames[raw] = frame
         try:
             fires = scan_stock(raw, frame, sd1.get(ysym), keep_all=True)
         except Exception:
             log.exception("1m projection failed for %s", raw)
             _no_projection(raw, "error")
             continue
+        fires_book[raw] = fires
+        if raw not in names:
+            continue                  # a catch-up candidate, not a projection
         fresh = [s for s in fires if s.time == hhmm and s.side == want]
         if not fresh:
             if fires:                 # fired earlier / opposite: the shared reject book
@@ -834,8 +995,49 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                  BAR_MINUTES - minute, "projected" if pick.get("projected") else "ledger",
                  stamp.strftime("%H:%M:%S"))
         out.append({**best.__dict__, "early": True, "minute": minute})
-    if skips:
+        projected_now.add(raw)
+
+    out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now))
+    if skips or catching:
         save_ledger(st)              # the summary reports these counts
+    return out
+
+
+def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: dict,
+              daily: dict, bar: datetime, now: datetime) -> list[dict]:
+    """Send the labelled LATE LEADER messages for this minute (bot 3 only)."""
+    if not catching:
+        return []
+    caught = st.setdefault("catchup", {})
+    sent = st.setdefault("sent", {})
+    hhmm = bar.strftime("%H:%M")
+    out: list[dict] = []
+    for raw in catching:
+        if raw in sent or raw in caught:
+            continue
+        frame, fires_list = frames.get(raw), fires.get(raw)
+        if frame is None or not fires_list:
+            continue
+        hit = catchup_candidate(frame, fires_list, "BUY" if pick.get("side") == 1 else "SELL",
+                                bar, now, daily.get(data.yahoo_stock(raw)))
+        if hit is None:
+            continue
+        if not telegram.send_bot3(format_catchup(raw, hit, pick, bar, now), dry_run=_dry()):
+            continue
+        caught[raw] = {"bar": bar.isoformat(), "session": str(bar.date()),
+                       "fired": hit["sig"].time, "side": hit["sig"].side,
+                       "code": hit["sig"].code, "price": hit["price"],
+                       "at": now.strftime("%H:%M:%S")}
+        stats = st.setdefault("stats", {})
+        stats["catchup"] = stats.get("catchup", 0) + 1
+        save_ledger(st)              # before the next send: never twice
+        log.info("1m LATE LEADER %s %s fired %s as %s, sector %s picked %s "
+                 "(%.1fR, %.0f min late, sent %s IST)", raw, hit["sig"].side, hit["sig"].time,
+                 hit["sig"].name, pick.get("sector"), hhmm, hit["r"], hit["age"],
+                 now.strftime("%H:%M:%S"))
+        out.append({"symbol": raw, "side": hit["sig"].side, "fired": hit["sig"].time,
+                    "code": hit["sig"].code, "price": hit["price"], "r": hit["r"],
+                    "catchup": True})
     return out
 
 
