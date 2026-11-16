@@ -564,7 +564,7 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **358 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **365 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still
@@ -626,3 +626,47 @@ move, 25% the position in a one-bar range), so `PSUBK 59` at 09:15 carries the s
 authority on the block as `FMCG 93` at 11:55. The 50/64 floor and the conf-55 gate
 are what keep the first bar from being traded; a "few bars so far" marker on the
 block would be a display nicety, not a fix.
+
+## Final recommendation (16 Nov close of the audit)
+
+**16 Nov was a chop day, and the divergence rule reads chop.** Its trigger is
+`MTF < 3` or `conf < 70` or breadth against the index — the first two *are* the
+definition of an unconfirmed tape. So `DIVERGENCE_SHORT` does not filter chop; it
+monetises it. Turning it on turns every `STAND ASIDE` day into a short day, on the
+evidence of one sector and one session.
+
+That does not make the REALTY observation wrong — REALTY did fall from −1.4% on
+the day at 09:30 to −3.1% at 11:55 while the index rose — it makes it
+**unmeasured**. One day, one sector, sector-level, and no close.
+
+So the recommendation is a tightening, not a new lane:
+
+| what | value | why |
+|---|---|---|
+| everything measured (cap, targets, EMA9 buffer, breakeven, conf delta) | on | measured on 16 Nov: −3.2R → −2.4R, 5 of 9 exits held |
+| everything structural (lag guard, RS margin, lead rank, pool side, floor, sticky, bot-3 parity) | on | each one fixes a mis-pick visible in the feed |
+| `PICK_CONF_SCALED_FLOOR` | **1** | removes the conf-56 / persist-56 entry; makes 16 Nov a **flat day** |
+| `SECTOR_FOLLOW_ON_WEAK` | **0** | longs into a 5▲/10▼ tape: the shape of every loss in the record |
+| `DIVERGENCE_SHORT` | **0** | trigger is chop; one sample; needs the study below |
+
+A flat day is the correct output of a chop day. The engine's only defensible edge
+in this record is a *persistent mover on the aligned side* — 16 Nov never offered
+one until 11:55, by which time the index confidence was 41.
+
+### How to settle the short, expensively avoided
+
+`backtest` now reports it. For any session it has replayed, the report ends with
+a divergence study: every bar where the index was up but unconfirmed (or narrow),
+the `PERSIST −` leader there, its day move then and at the close, and whether a
+long pick was holding that bar.
+
+```
+python -m nse_scanner backtest --date 2026-11-16
+```
+
+The early trigger and the late one are not the same trade: on the 16 Nov path the
+09:30 row starts at −1.40% while the 11:55 row starts at −3.10% — a rule that only
+fires when the breadth finally turns is shorting into the low. Run it across the
+sessions you have: if the morning rows keep showing the sector lower by the close,
+the lane has evidence; if they oscillate around zero, it is a chop-day coin flip
+and stays off.

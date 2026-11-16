@@ -296,3 +296,62 @@ class DivergenceWiringTests(TestCase):
         self.assertIn("short on divergence", text)
         self.assertIn("SECTOR PICK:", text)
         self.assertIn("BEAR", text)
+
+
+class DivergenceStudyTests(TestCase):
+    """`divergence_rows` answers "would the REALTY short have paid?" from a replay."""
+
+    @staticmethod
+    def bar(hhmm, *, label="BULL", conf=35, mtf=2, day=0.42, adv=9, dec=6,
+            pool=(("REALTY", 76),), pick="WAIT", realty=-1.40, nifty=25250.0):
+        return {"time": hhmm, "dir": label, "conf": conf, "mtf_bull": mtf,
+                "nifty_day_ret": day, "breadth": f"{adv}/{dec}",
+                "persist_minus": list(pool), "pick": pick,
+                "sectors": {"REALTY": {"day_ret": realty, "persist_bear": 76.0}}}
+
+    def rows(self, *bars):
+        from nse_scanner.backtest import divergence_rows
+        return divergence_rows(list(bars))
+
+    def test_the_16_nov_morning_is_a_divergence_bar(self):
+        # MTF 2/3, conf 35, breadth 9▲/6▼: not a breadth divergence at all.
+        out = self.rows(self.bar("09:30"), self.bar("15:25", day=0.40, realty=-3.10))
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["sector"], "REALTY")
+        self.assertAlmostEqual(out[0]["day_at"], -1.40)
+        self.assertAlmostEqual(out[0]["day_close"], -3.10)
+        self.assertAlmostEqual(out[0]["move"], -1.70)        # kept falling
+        self.assertFalse(out[0]["blocked"])
+
+    def test_a_confirmed_uptrend_has_no_rows(self):
+        out = self.rows(self.bar("10:00", mtf=3, conf=85, adv=9, dec=6),
+                        self.bar("15:25", mtf=3, conf=85, realty=-3.0))
+        self.assertEqual(out, [])
+
+    def test_a_flat_or_falling_index_has_no_rows(self):
+        # no index up-day at all: every bar fails the first gate
+        self.assertEqual(self.rows(self.bar("10:00", day=-0.2), self.bar("15:25", day=-0.3)), [])
+        self.assertEqual(self.rows(self.bar("10:00", label="BEAR", day=0.3),
+                                   self.bar("15:25", label="BEAR", day=0.3)), [])
+
+    def test_narrow_breadth_alone_qualifies(self):
+        out = self.rows(self.bar("11:55", mtf=3, conf=41, adv=5, dec=10),
+                        self.bar("15:25", mtf=3, conf=41, adv=5, dec=10, realty=-3.1))
+        self.assertEqual(len(out), 2)
+
+    def test_a_long_pick_marks_the_bar_as_blocked(self):
+        out = self.rows(self.bar("09:35", pick="PHA"), self.bar("15:25"))
+        self.assertTrue(out[0]["blocked"])
+
+    def test_a_recovering_sector_shows_a_positive_move(self):
+        out = self.rows(self.bar("10:00"), self.bar("15:25", realty=-0.4))
+        self.assertGreater(out[0]["move"], 0)        # a short would have lost
+
+    def test_the_table_renders_and_says_when_there_is_nothing(self):
+        from nse_scanner.backtest import render_divergence
+        rows = self.rows(self.bar("09:30"), self.bar("15:25", realty=-3.10))
+        text = render_divergence(rows, "2026-11-16")
+        self.assertIn("Divergence study", text)
+        self.assertIn("REALTY", text)
+        self.assertIn("kept falling", text)
+        self.assertIn("no divergence bar", render_divergence([], "2026-11-16"))

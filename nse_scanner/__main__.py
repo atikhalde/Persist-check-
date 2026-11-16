@@ -149,11 +149,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "backtest":
         from datetime import date as _date
         from pathlib import Path
-        from .backtest import replay_session, render_report
+        from .backtest import (divergence_rows, render_divergence, replay_session,
+                               render_report)
 
         d = _date.fromisoformat(args.date)
         res = replay_session(d)
-        text = render_report(res)
+        text = render_report(res) + "\n\n" + render_divergence(
+            divergence_rows(res.get("path") or []), args.date)
         outp = Path("state") / f"backtest_{args.date}.txt"
         outp.parent.mkdir(parents=True, exist_ok=True)
         outp.write_text(text + "\n", encoding="utf-8")
