@@ -222,10 +222,12 @@ def _doctor() -> int:
           f"market block on a {_conf_delta()}-point conf move · "
           f"breakeven stop after T1 {'on' if breakeven_after_t1() else 'off'}")
     lag = sector_max_lag_bars()
+    from .market import follow_on_weak
     print(f"sector pick: rs margin {pick_rs_margin():.2f}pp · "
           f"persist floor {pick_min_persist():.0f} · "
           f"hold the incumbent by {pick_sticky_margin():.0f} · "
-          f"index freshness {'off' if lag < 0 else f'{lag} bars'}")
+          f"index freshness {'off' if lag < 0 else f'{lag} bars'} · "
+          f"weak-day follow {'on' if follow_on_weak() else 'off (conf < 55 stands aside)'}")
     from .scan1m import early_retries, leader_catchup, leader_max_minutes, leader_max_r
     catchup = (f"on (max {leader_max_minutes()} min old, <= {leader_max_r():.1f}R)"
                if leader_catchup() else "off")

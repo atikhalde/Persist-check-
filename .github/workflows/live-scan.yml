@@ -175,6 +175,9 @@ jobs:
           # Points a challenger must beat the incumbent sector by to take the pick
           # (0 = switch on any margin).
           PICK_STICKY_MARGIN: ${{ vars.PICK_STICKY_MARGIN || '5' }}
+          # 1 = a weak-but-directional BULL may still follow a plainly leading
+          # sector (conf < 55). 0 = the locked rule: conf < 55 stands aside.
+          SECTOR_FOLLOW_ON_WEAK: ${{ vars.SECTOR_FOLLOW_ON_WEAK || '0' }}
           # A pivot closer than this to entry is resistance, not a target.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}

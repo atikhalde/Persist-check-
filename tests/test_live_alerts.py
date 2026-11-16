@@ -269,6 +269,38 @@ class MarketBlockTests(TestCase):
         self.assertIn("Live flow  PHA▲ Q (85)", up)
         self.assertIn("PERSIST −  REALTY 91", down)      # the contradiction, now visible
 
+    def test_a_block_that_trades_nothing_does_not_announce_a_direction(self):
+        # 16 Nov 11:55 read "MARKET BULL conf 41% WEAK" over "WAIT — market
+        # TRANSITION conf 41": a bullish call the engine then refused to act on.
+        text = REAL_FORMAT_MARKET(market_decision(
+            dir_conf=41, dir_tier="WEAK", regime="TRANSITION", breadth_adv=5, breadth_dec=10,
+            pick_sector="WAIT", pick_side=0, action="WAIT",
+            pick_reason="WAIT — market TRANSITION conf 41 < 55"))
+        self.assertIn("MARKET STAND ASIDE", text)
+        self.assertIn("BULL lean", text)                 # the lean is still shown
+        self.assertNotIn("<b>MARKET BULL", text)
+        self.assertIn("conf 41 < 55", text)              # what it is waiting for
+
+    def test_the_day_s_movers_are_named_when_nothing_is_traded(self):
+        text = REAL_FORMAT_MARKET(market_decision(
+            pick_sector="WAIT", pick_side=0, action="WAIT",
+            persist_plus=[("FMCG", 93), ("BANK", 44)],
+            persist_minus=[("REALTY", 91), ("AUTO", 86)]))
+        self.assertIn("No pick · persistent movers  FMCG long 93 · REALTY short 91", text)
+
+    def test_a_traded_block_keeps_its_label_and_has_no_extra_line(self):
+        text = REAL_FORMAT_MARKET(market_decision())
+        self.assertIn("<b>MARKET BULL</b>  conf 94%", text)
+        self.assertNotIn("STAND ASIDE", text)
+        self.assertNotIn("persistent movers", text)
+
+    def test_a_neutral_stand_aside_has_no_lean(self):
+        text = REAL_FORMAT_MARKET(market_decision(
+            dir_label="NEUTRAL", dir_state=0, dir_conf=41, dir_tier="WEAK",
+            pick_sector="WAIT", pick_side=0, action="WAIT"))
+        self.assertIn("MARKET STAND ASIDE</b>  conf 41% WEAK", text)
+        self.assertNotIn("lean", text.splitlines()[0])
+
     def test_a_stale_index_is_named_on_the_block(self):
         text = REAL_FORMAT_MARKET(market_decision(stale_sectors=[("FMCG", 6)]))
         self.assertIn("⚠ stale index  FMCG 6 bars behind", text)

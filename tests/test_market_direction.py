@@ -280,3 +280,57 @@ class PreviousPickTests(TestCase):
                                          "bar": "2026-11-16 10:15"}, bar))
         self.assertIsNone(previous_pick(None, bar))
         self.assertIsNone(previous_pick({"sector": "PHA", "side": 1}, bar))
+
+
+class WeakFollowTests(TestCase):
+    """16 Nov 11:55: BULL at conf 41, FMCG 93 / REALTY 91 — and no path at all.
+
+    `_complementary_pick` stands aside below conf 55, and `_follow_leaders` only
+    ran with no committed side. A weak-but-directional day therefore had no way
+    to reach the sector that was actually moving.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def fallback(self, pick, commit_side, conf, plus, **env):
+        from unittest.mock import patch
+        from nse_scanner.market import _follow_fallback
+        with patch.dict("os.environ", env):
+            return _follow_fallback(pick, commit_side, conf, plus)
+
+    plus = [("FMCG", 93)]
+
+    def leaders(self):
+        return [self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6, bull=70.0)]
+
+    def test_the_locked_rule_is_the_default(self):
+        self.assertIsNone(self.fallback(None, 1, 41, self.leaders()))
+
+    def test_the_knob_opens_the_weak_bull_case(self):
+        out = self.fallback(None, 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1")
+        self.assertEqual((out["pick"], out["side"], out["action"]), ("FMCG", 1, "SCAN LONG"))
+        self.assertIn("Nifty BULL weak (41%)", out["reason"])
+
+    def test_the_neutral_case_is_unchanged(self):
+        out = self.fallback(None, 0, 41, self.leaders())
+        self.assertEqual(out["pick"], "FMCG")
+        self.assertIn("Nifty NEUTRAL", out["reason"])
+
+    def test_a_weak_bear_is_not_followed(self):
+        # The bear mirror is not written: a weak BEAR still waits.
+        self.assertIsNone(self.fallback(None, -1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_pick_is_never_overridden(self):
+        self.assertIsNone(self.fallback("PHA", 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_weak_day_still_needs_a_leading_sector(self):
+        dull = [self.snap("FMCG", persist_bull=52.0, pos=45.0, rs=-0.2)]
+        self.assertIsNone(self.fallback(None, 1, 41, dull, SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_strong_day_is_not_affected(self):
+        # conf 74 with a good sector never reaches the fallback: the picker picks.
+        self.assertIsNone(self.fallback(None, 1, 74, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_follow_switch_still_turns_everything_off(self):
+        self.assertIsNone(self.fallback(None, 0, 41, self.leaders(), SECTOR_FOLLOW="0",
+                                        SECTOR_FOLLOW_ON_WEAK="1"))

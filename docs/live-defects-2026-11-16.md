@@ -369,3 +369,110 @@ clear switch / faded / stale / below-floor incumbent, `previous_pick` adjacency
 (only the candle 5 minutes earlier, never `WAIT`), bot 3's cap + lead ranking +
 pivot names + "not taken" cancel reason, the CatchupWindow window anchor, and
 the `new_position` record both bots now share.
+
+## Follow-up — the 11:55 WAIT block, and what "the day's sector" means when it is two
+
+The block from the 11:55 feed:
+
+```
+MARKET BULL  conf 41% WEAK  (was 67%)
+Nifty 25,255.2  day +0.44%  intra +0.19%
+VIX 15.69 ↓ -6.74%   ADX 15   MTF 3/3
+Breadth 5▲/10▼  TRANSITION
+PERSIST +  FMCG 93 · BANK 44 · FIN 32
+PERSIST −  REALTY 91 · AUTO 86 · DEF 83
+Live flow  AUTO Q (79)
+
+SECTOR PICK: WAIT  FLAT
+WAIT — market TRANSITION conf 41
+```
+
+Read from the feed: *"today's sector could be REALTY and FMCG."* That reading is
+right, and the block had already measured it: **FMCG 93 is the most persistent
+bullish sector, REALTY 91 the most persistent bearish one.** They are the two
+ends of the same rotation — a defensive bid (FMCG) with property offered
+(REALTY) — on a tape where the index is held up by a few names while 5 stocks
+advance and 10 decline. That is what `PERSIST +` / `PERSIST −` are for.
+
+Three things were wrong with the block, and only the third changes behaviour.
+
+### 1. It opened with a direction it had refused to act on
+
+`MARKET BULL conf 41% WEAK` sat directly above `WAIT — market TRANSITION conf
+41`. A bullish header on a 5▲/10▼ tape, followed by an action of `WAIT`: the
+engine names a side and then declines to use it, and the reader is left to guess
+which half to believe. A block that trades nothing now says so, and keeps the
+lean as a lean:
+
+```
+MARKET STAND ASIDE  BULL lean · conf 41% WEAK  (was 67%)
+...
+WAIT — market TRANSITION conf 41 < 55
+```
+
+`dir_label` itself is untouched (it is the *commit* side, and the summaries and
+the "did the label change" test depend on it) — only the rendered header
+distinguishes "trading this side" from "leaning that way".
+
+### 2. It never answered "which sectors are moving?"
+
+The two pools answer it, but only if you know that `PERSIST +` is long and
+`PERSIST −` is short. A WAIT block now says it in one line, on both sides:
+
+```
+No pick · persistent movers  FMCG long 93 · REALTY short 91
+```
+
+Display only. Nothing is scanned, no entry is opened.
+
+The `Live flow` line in the pasted block also reads `AUTO Q (79)` with **no
+arrow**, while `AUTO` is the #2 of `PERSIST −`: that block predates the
+`REALTY▼` fix (PR #28) and reads `AUTO▼ Q (79)` on this tree.
+
+### 3. The two gates left a gap, and the day fell in it
+
+```python
+# _complementary_pick
+if commit_side == 0 or regime == "CHOP" or dir_conf < PICK_MIN_CONF:   # 41 < 55 -> WAIT
+    return None, 0, "WAIT ..."
+
+# run_market, before this change
+if not pick and commit_side == 0:        # <- and the fallback needs NO side at all
+    leaders = _follow_leaders(persist_plus)
+```
+
+The engine could pick a sector with a confident direction, or follow one with no
+direction at all. A direction it did not trust — `commit_side == 1` at conf 41 —
+was the one case with **no path to a sector**, and FMCG 93 was sitting in that
+gap.
+
+`SECTOR_FOLLOW_ON_WEAK` (default **0**) closes it: a weak committed BULL falls
+back to the same strict gates the NEUTRAL case uses — persist ≥ 55, up on the
+day, upper half of the range, positive RS, bullish live flow, not rolling over —
+which is much stricter than the complementary path it replaces. The reason line
+says which market it is: `SECTOR FOLLOW — Nifty BULL weak (41%), FMCG leads
+(persist 93, day +0.90%, range pos 88, flow aligned)`.
+
+It is **off by default** because the locked rule is `conf < 55 → WAIT`, and
+because 16 Nov is the day that rule was written for: six entries on a weak tape
+in 35 seconds. Turning it on trades the *strict* path, not the lax one. Longs
+only — a weak BEAR still waits, because the mirrored gates are not written and a
+half-mirrored rule is worse than none.
+
+### What it does not fix
+
+**REALTY 91 could not have been traded on this block either way.** It is the most
+persistent *bearish* sector, and the rule is that the pick must agree with the
+committed side: on a `commit_side == 1` bar the only usable pool is `PERSIST +`.
+Shorting the loser of a 5▲/10▼ tape is defensible, but it is a counter-index
+trade and it needs a BEAR lock, which this day never gave. If that is a trade you
+want, it is a new rule (a two-sided pick on a weak tape), not a bug fix — say so
+and it can be specified.
+
+### Proof
+
+`pytest -q` → **325 passed**. New: the stand-aside header (and that a traded
+block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
+and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
+unchanged, weak BEAR refused, no override of a real pick, a dull sector still
+refused, `SECTOR_FOLLOW=0` still master.

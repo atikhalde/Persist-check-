@@ -68,6 +68,10 @@ SECTOR_SMOOTH = 5
 RECENT_FLOW_BARS = 4
 VOL_SCALE_REF = 14.0
 VIX_SPIKE = 4.0
+# Confidence the complementary pick needs before it will name a sector. Below it
+# the block says WAIT — and, by the locked rule, nothing is scanned. It was a
+# literal 55 in three places; a WAIT block could not say what it waits for.
+PICK_MIN_CONF = 55
 CONCRETE_COMMIT = 2
 CONCRETE_MIN_CONF = 65
 CONCRETE_WARMUP = 3
@@ -415,7 +419,8 @@ def run_market(
     vwap = float(last_row["VWAP"])
     npos = _pos_in_range(n_close, n_high, n_low)
     dir_conf = _dir_conf(mtf_bull, mtf_bear, above_vwap, below_vwap, adx, npos, dir_state, last_or_up, last_or_dn, last_slope)
-    dir_tier = "TREND-LOCK" if dir_conf >= 85 else "STRONG" if dir_conf >= 70 else "BUILDING" if dir_conf >= 55 else "WEAK"
+    dir_tier = ("TREND-LOCK" if dir_conf >= 85 else "STRONG" if dir_conf >= 70
+                else "BUILDING" if dir_conf >= PICK_MIN_CONF else "WEAK")
 
     # Prefer concrete if committed
     commit_side = concrete if concrete != 0 else dir_state
@@ -484,13 +489,11 @@ def run_market(
         action = "SCAN SHORT"
     extra_sectors: list[str] = []
     flow_aligned: list[str] = []
-    if not pick and commit_side == 0:
-        leaders = _follow_leaders(persist_plus)
-        if leaders:
-            pick, pick_side, action = leaders[0].name, 1, "SCAN LONG"
-            extra_sectors = [s.name for s in leaders[1:]]
-            flow_aligned = [s.name for s in leaders if s.qualified]
-            reason = _follow_reason(leaders)
+    follow = _follow_fallback(pick, commit_side, dir_conf, persist_plus)
+    if follow:
+        pick, pick_side, action = follow["pick"], follow["side"], follow["action"]
+        extra_sectors, flow_aligned = follow["extra"], follow["aligned"]
+        reason = follow["reason"]
 
     return MarketDecision(
         session=str(sid),
@@ -843,7 +846,7 @@ def _manual_aligned() -> set:
     return {x.strip().upper() for x in raw.split(",") if x.strip()}
 
 
-def _follow_reason(leaders) -> str:
+def _follow_reason(leaders, note: str = "Nifty NEUTRAL") -> str:
     s = leaders[0]
     manual = _manual_aligned()
     notes = [f"persist {s.persist_bull:.0f}", f"day {s.day_ret:+.2f}%", f"range pos {s.pos:.0f}"]
@@ -851,10 +854,37 @@ def _follow_reason(leaders) -> str:
         notes.append("flow aligned")
     if s.name in manual:
         notes.append("chart aligned")
-    text = f"{SECTOR_FOLLOW_PREFIX} — Nifty NEUTRAL, {s.name} leads ({', '.join(notes)})"
+    text = f"{SECTOR_FOLLOW_PREFIX} — {note}, {s.name} leads ({', '.join(notes)})"
     if len(leaders) > 1:
         text += "; also scanning " + ", ".join(f"{x.name} {x.persist_bull:.0f}" for x in leaders[1:])
     return text
+
+
+def _follow_fallback(pick, commit_side, dir_conf, plus):
+    """Fallback pick when the complementary path stood aside, or ``None``.
+
+    ``commit_side == 0`` is the original case (Nifty has no side at all).
+    ``SECTOR_FOLLOW_ON_WEAK=1`` adds "has a side, but too weak to pick with it".
+    """
+    if pick:
+        return None
+    if commit_side == 0:
+        note = "Nifty NEUTRAL"
+    elif follow_on_weak() and commit_side == 1 and dir_conf < PICK_MIN_CONF:
+        note = f"Nifty BULL weak ({dir_conf}%)"
+    else:
+        return None
+    leaders = _follow_leaders(plus)
+    if not leaders:
+        return None
+    return {
+        "pick": leaders[0].name,
+        "side": 1,
+        "action": "SCAN LONG",
+        "reason": _follow_reason(leaders, note),
+        "extra": [s.name for s in leaders[1:]],
+        "aligned": [s.name for s in leaders if s.qualified],
+    }
 
 
 def _follow_pick(plus):
@@ -865,8 +895,8 @@ def _follow_pick(plus):
 
 def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_day_ret):
     """Strongest persistent sector on the SAME side as committed Nifty direction."""
-    if commit_side == 0 or regime == "CHOP" or dir_conf < 55:
-        return None, 0, f"WAIT — market {regime} conf {dir_conf}"
+    if commit_side == 0 or regime == "CHOP" or dir_conf < PICK_MIN_CONF:
+        return None, 0, f"WAIT — market {regime} conf {dir_conf} < {PICK_MIN_CONF}"
     # VIX spike against the day → stand aside
     if vix_chg >= VIX_SPIKE and ((commit_side == 1 and n_day_ret < 0) or (commit_side == -1 and n_day_ret > 0)):
         return None, 0, f"WAIT — VIX spike {vix_chg:.1f}% fights direction"
@@ -970,6 +1000,28 @@ def pick_sticky_margin() -> float:
         return max(0.0, float(os.environ.get("PICK_STICKY_MARGIN", "5")))
     except ValueError:
         return 5.0
+
+
+def follow_on_weak() -> bool:
+    """May the sector-follow path run when Nifty *has* a side but is weak (``0``)?
+
+    Two gates sat next to each other and neither opened on 16 Nov 11:55:
+    ``_complementary_pick`` stands aside below ``PICK_MIN_CONF`` (41 < 55), and
+    ``_follow_leaders`` only ran with **no** committed side at all. A tape that
+    read ``MARKET BULL conf 41% WEAK``, ``PERSIST + FMCG 93``, ``PERSIST − REALTY
+    91`` therefore had no path to a sector: the picker refused the direction's
+    confidence and the fallback refused the direction's existence.
+
+    With this on, a *weak* committed BULL falls back to the same strict leader
+    gates the NEUTRAL case uses (persist >= 55, up on the day, upper part of the
+    range, positive RS, bullish live flow, not rolling over) — much stricter
+    than the complementary path it replaces. Longs only: the bear mirror is not
+    written, so a weak BEAR still waits.
+
+    Default ``0``: the locked rule (conf < 55 -> no scan) is unchanged unless you
+    ask for it. ``SECTOR_FOLLOW=0`` still turns both paths off.
+    """
+    return os.environ.get("SECTOR_FOLLOW_ON_WEAK", "0") != "0"
 
 
 def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
