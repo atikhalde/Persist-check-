@@ -281,7 +281,7 @@ value away:
 
 | knob | default | what it fixes |
 |---|---|---|
-| `MAX_ENTRIES_PER_PICK` | 3 | six entries on one pick in 35 seconds → three, best score first |
+| `MAX_ENTRIES_PER_PICK` | 3 | six entries on one pick in 35 seconds → three, most ahead of its sector first |
 | `MIN_TARGET_R` / `MIN_TARGET_PCT` | 0.5 / 0.10% | a "TARGET HIT +0.2R" 75 paise from entry |
 | `EXIT_EMA9_BUFFER_PCT` / `_R` | 0.10% / 0.25 | nine exits on breaches of 0.009–0.13%; five of them are held |
 | `BREAKEVEN_AFTER_T1` | on | all three T1 hits were given back; the stop now moves to entry |
@@ -289,3 +289,24 @@ value away:
 
 None of them changes *which* signal fires. They change what the same signal is
 allowed to cost.
+
+## Fourth pass — the sector pick, and the stock inside it
+
+[`docs/audit-2026-11-16-sector-pick.md`](audit-2026-11-16-sector-pick.md) walks
+the other half of the path: which sector gets picked, and which stock inside it.
+The goal is one sentence — *pick the persistent moving stock from its sector* — and
+three of the four defects were against it:
+
+| # | what was wrong | why it mattered | fix |
+|---|---|---|---|
+| 1 | `_sector_snap` took the decision bar as `last_ts` and **never read it** | a sector index that stopped printing 30 minutes ago was scored, listed in PERSIST + and *picked* — and the pick decides which stocks are scanned at all | `SECTOR_MAX_LAG_BARS` (2) + `⚠ stale index` on the block |
+| 2 | a leader was dropped for `rs -0.01` (five basis points) and the block never said so | this is the churn that moved the 16 Nov pick `PHA → FMCG` one candle later, with no way to tell it from "the leader faded" | `PICK_RS_MARGIN` (0.05 pp) + `· passed over PHA (rs -0.01)` |
+| 3 | the entry cap ranked by the absolute 0–100 `score`, whose "rs" leg is `close > previous close` — one bar, 15 points | "best score first" was "most extended chart first": the follower with the prettier chart outranked the sector's mover | `RANK_BY_SECTOR_LEAD`, ranked by stock-minus-sector move from each session open, printed as `lead +1.9pp vs sector` |
+| 4 | `Live flow` never printed its side | 16 Nov read `REALTY Q (85)` in a BULL block while REALTY was the **top of PERSIST −** | `REALTY▼ Q (85)` |
+
+Two findings are proposals rather than changes, both because the wrong value turns
+a day into `WAIT`: the complementary pick has **no persistence floor** (laxer than
+the `SECTOR_FOLLOW` fallback that needs 55), and there is **no hysteresis** — a
+2-point margin switches the sector, which now also resets the per-pick cap and
+cancels the pending early alert.
+

@@ -54,11 +54,70 @@ def max_entries_per_pick() -> int:
     return value if value >= 0 else 3
 
 
+def rank_by_sector_lead() -> bool:
+    """Rank the names that clear the cap by how far they lead their sector (1).
+
+    ``0`` restores ranking by the absolute 0-100 ``score``.
+    """
+    return os.environ.get("RANK_BY_SECTOR_LEAD", "1").strip() != "0"
+
+
+def _session_open(df5: pd.DataFrame, last) -> float | None:
+    """First traded price of the decision session in a stock's 5m frame."""
+    if df5 is None or df5.empty:
+        return None
+    try:
+        sid = session_date(last)
+        for i, ts in enumerate(df5.index):
+            if session_date(ts) == sid:
+                return float(df5["Open"].iloc[i])
+    except Exception:
+        return None
+    return None
+
+
+def _lead_vs_sector(df5: pd.DataFrame, last, close: float, md, sector: str | None,
+                    long_side: bool) -> float | None:
+    """How far this stock is running ahead of its own sector today, in pp.
+
+    ``StockSignal.score`` is absolute: its "rs" leg is ``close > previous
+    close`` — one bar, worth 15 of 100 — so ranking a pick by it keeps the most
+    extended chart, which is not the same thing as the mover in that sector.
+    This is the number the goal is about: the stock's move from the session open
+    minus its sector index's move from its own session open, signed so positive
+    always means "ahead in the direction of the trade".
+    """
+    if close is None:
+        return None
+    open_px = _session_open(df5, last)
+    snap = (getattr(md, "sectors", None) or {}).get(sector or "") or {}
+    if not open_px or not snap:
+        return None
+    try:
+        stock_intra = (float(close) - open_px) / open_px * 100.0
+        # the sector index's own move from its session open (same basis)
+        if snap.get("intra_ret") is not None:
+            sector_intra = float(snap["intra_ret"])
+        else:
+            sector_intra = float(snap.get("rs", 0.0)) + float(getattr(md, "nifty_intra", 0.0))
+    except (TypeError, ValueError):
+        return None
+    return (stock_intra - sector_intra) * (1.0 if long_side else -1.0)
+
+
 def format_market(md, prev_conf: int | None = None) -> str:
     side = "BULL" if md.pick_side == 1 else "BEAR" if md.pick_side == -1 else "FLAT"
     plus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_plus)
     minus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_minus)
     vix_arrow = "↑" if md.vix_chg > 0 else "↓" if md.vix_chg < 0 else "→"
+    # The flow score has a side. 16 Nov printed "REALTY Q (85)" while REALTY was
+    # the top of PERSIST − : in a BULL market that reads as a bullish flow and is
+    # the opposite of what the number means.
+    flow_side = getattr(md, "live_flow_side", 0)
+    flow_arrow = "▲" if flow_side == 1 else "▼" if flow_side == -1 else "·"
+    stale = getattr(md, "stale_sectors", None) or []
+    stale_line = ("⚠ stale index  "
+                  + " · ".join(f"{n} {b} bars behind" for n, b in stale) + "\n") if stale else ""
     moved = ""
     if prev_conf is not None and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta() > 0:
         moved = f"  <i>(was {int(prev_conf)}%)</i>"
@@ -69,7 +128,9 @@ def format_market(md, prev_conf: int | None = None) -> str:
         f"Breadth {md.breadth_adv}▲/{md.breadth_dec}▼  {md.regime}\n"
         f"PERSIST +  {plus}\n"
         f"PERSIST −  {minus}\n"
-        f"Live flow  {md.live_flow} {'Q' if md.live_flow_qualified else 'uQ'} ({md.live_flow_score:.0f})\n"
+        f"{stale_line}"
+        f"Live flow  {md.live_flow}{flow_arrow} {'Q' if md.live_flow_qualified else 'uQ'} "
+        f"({md.live_flow_score:.0f})\n"
         f"\n<b>SECTOR PICK: {md.pick_sector}</b>  {side}\n"
         f"{md.pick_reason}\n"
         f"Action: <b>{md.action}</b>\n"
@@ -188,14 +249,16 @@ def _oi_line(reading) -> str:
 
 
 def format_stock(sig: StockSignal, md, plan: TradePlan, *, sector: str | None = None,
-                 oi_line: str = "") -> str:
+                 oi_line: str = "", lead: float | None = None) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close_time = (datetime.strptime(sig.time, "%H:%M") + timedelta(minutes=5)).strftime("%H:%M")
     below = "below" if sig.side == "BUY" else "above"
     targets = _target_text(plan)
+    # Stock move minus sector move, in percentage points, since each session open.
+    lead_text = f"  ·  lead {lead:+.1f}pp vs sector" if lead is not None else ""
     return (
         f"{arrow} <b>{sig.side}</b> | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{sector or md.pick_sector}</b>{_follow_tag(md, sector)}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        f"Sector <b>{sector or md.pick_sector}</b>{_follow_tag(md, sector)}  |  Market {md.dir_label} ({md.dir_conf}%){lead_text}\n"
         f"{oi_line}"
         f"Entry (candle close) <b>{plan.entry:.2f}</b>\n"
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
@@ -1099,13 +1162,24 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             continue
         # No send here: candidates are ranked and capped below, so one pick
         # cannot alert six names in universe order.
+        lead = None
+        if rank_by_sector_lead():
+            lead = _lead_vs_sector(df5, last, float(df5["Close"].iloc[-1]), md,
+                                   sector_of[raw], want_buy)
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
-                           "early": early, "close": float(df5["Close"].iloc[-1])})
+                           "early": early, "lead": lead,
+                           "close": float(df5["Close"].iloc[-1])})
 
     cap = max_entries_per_pick()
     side_key = "long" if want_buy else "short"
     taken = st.setdefault("pick_entries", {})
-    candidates.sort(key=lambda c: -float(getattr(c["best"], "score", 0) or 0))
+    # The cap keeps the names that are moving *within* their sector, not the
+    # names with the highest absolute score; score breaks ties.
+    if rank_by_sector_lead():
+        candidates.sort(key=lambda c: (-(c["lead"] if c["lead"] is not None else 0.0),
+                                       -float(getattr(c["best"], "score", 0) or 0)))
+    else:
+        candidates.sort(key=lambda c: -float(getattr(c["best"], "score", 0) or 0))
     for cand in candidates:
         raw, early, plan, best = cand["raw"], cand["early"], cand["plan"], cand["best"]
         # One sector is one risk factor — counted per sector, not per message, so
@@ -1122,7 +1196,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                               close=cand["close"])
             continue
         reading = cand["reading"]
-        text = format_stock(best, md, plan, sector=sector_of[raw], oi_line=_oi_line(reading))
+        text = format_stock(best, md, plan, sector=sector_of[raw], oi_line=_oi_line(reading),
+                            lead=cand.get("lead"))
         if early:
             text = _confirm_header(early, plan.entry) + text
         if not telegram.send(text, dry_run=_dry()):
@@ -1136,7 +1211,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _bump(st, "entries")
         _bump(st, "lag_sum", lag)
         st["stats"]["lag_max"] = max(st["stats"].get("lag_max", 0), lag)
-        new_signals.append({**best.__dict__, "ema9": plan.ema9, "risk": plan.risk,
+        new_signals.append({**best.__dict__, "lead": cand.get("lead"),
+                            "ema9": plan.ema9, "risk": plan.risk,
                             "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
                             "sector": sector_of[raw],
                             "oi_regime": reading.regime.value if reading else None,

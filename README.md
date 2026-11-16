@@ -40,7 +40,7 @@ Action: SCAN LONG
 
 ```
 🟢 BUY | BUY-EX17  PNB
-Sector PSUBK  |  Market BULL (88%)
+Sector PSUBK  |  Market BULL (88%)  ·  lead +1.9pp vs sector
 Entry (candle close) 135.73
 SL 134.94 (0.02% below EMA9)
 Risk 0.79  |  next pivot target: T1 R2 136.75 (1.3R, +0.75%) · T2 R3 141.02 (6.7R, +3.90% ⚠) · T3 N/A
@@ -167,8 +167,8 @@ One stock entry per symbol per IST session. Later rank upgrades or re-discovered
 
 | Nifty lock | Sector used | Stocks scanned |
 |---|---|---|
-| BULL / STRONG BULL | strongest **PERSIST +** that still has RS ≥ 0 and is not a qualified short | that sector, **BUY** entries only |
-| BEAR / STRONG BEAR | strongest **PERSIST −** that still has RS ≤ 0 and is not a qualified long | that sector, **SELL** entries only |
+| BULL / STRONG BULL | strongest **PERSIST +** that still has RS ≥ −`PICK_RS_MARGIN`, is up on the day and is not a qualified short | that sector, **BUY** entries only |
+| BEAR / STRONG BEAR | strongest **PERSIST −** that still has RS ≤ `PICK_RS_MARGIN`, is down on the day and is not a qualified long | that sector, **SELL** entries only |
 | NEUTRAL / CHOP / conf < 55 / VIX spike against the day | **WAIT** | none |
 
 The label describes the side the engine actually trades (`commit_side`, the concrete
@@ -176,6 +176,21 @@ lock when one exists), so an alert can no longer read *"Market NEUTRAL"* on a BU
 `NEUTRAL` now always means no pick and no scan.
 
 No pair-trades. No “rel-long the strongest bull while index is bear”.
+
+The pick reads the sector list, never a single sector in isolation:
+
+* **A sector index that stopped printing is not picked.** Its own 5m feed is
+  allowed to trail the Nifty decision bar by `SECTOR_MAX_LAG_BARS` (2) — Yahoo's
+  cash indices gap more than stocks do — and a sector further behind is dropped
+  from PERSIST + / PERSIST − and from the pick, and named on the block
+  (`⚠ stale index  FMCG 5 bars behind`). The stock level has always required a
+  current frame (`index[-1] == last`); the sector decides which stocks are
+  scanned at all, so it needs the same rule.
+* **A leader is not dropped for a hair.** `rs` is in percentage points, so
+  `PICK_RS_MARGIN` (0.05) is five basis points of noise. With `0` a sector
+  leading PERSIST + by 30 points was passed over for reading `rs -0.01`.
+* **Whatever is passed over is named**, with the number that did it:
+  `PERSIST + FMCG persistent (score 60) · passed over PHA (rs -0.01)`.
 
 ---
 
@@ -412,17 +427,22 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 summary |
 | `SCAN1M_1M_PERIOD` | `1d` | 1m history window fetched every minute (prior sessions come from one 7d fetch per day) |
 
-Five more decide what a 5m alert is allowed to say. They apply to **both** loops —
-bot 3 trails the same positions and renders the same plan, so the exit and target
-rules are shared, not forked:
+A few more decide what a 5m alert is allowed to say. The exit, target and
+sector-pick rules apply to **both** loops — bot 3 trails the same positions,
+renders the same plan and must not scan a sector bot 1 would have refused — so
+they are shared, not forked. Only `MAX_ENTRIES_PER_PICK` and
+`RANK_BY_SECTOR_LEAD` are 5m-only, because the cap only exists there.
 
 | variable | default | what it does |
 |---|---|---|
-| `MAX_ENTRIES_PER_PICK` | `3` | entries per pick (sector + side) per session, `0` = no cap. The names that clear it are alerted **best score first**. Six names can fire on one candle (16 Nov: six pharma entries in 35 seconds, all out within 45 minutes for −1.6R); one pick is one risk factor |
+| `MAX_ENTRIES_PER_PICK` | `3` | entries per pick (sector + side) per session, `0` = no cap. Six names can fire on one candle (16 Nov: six pharma entries in 35 seconds, all out within 45 minutes for −1.6R); one pick is one risk factor |
+| `RANK_BY_SECTOR_LEAD` | `1` | which of the names that clear the cap is alerted: ranked by **how far the stock leads its own sector today** (stock move minus sector-index move, both from the session open, in pp), score breaking ties. `0` = rank by the absolute 0–100 `score`, whose "rs" leg is only `close > previous close` — one bar, 15 of 100 points. The alert shows the number: `lead +1.9pp vs sector` |
+| `SECTOR_MAX_LAG_BARS` | `2` | how many 5m bars a sector index may trail the decision bar and still be picked (`-1` = no check). A sector further behind is taken out of PERSIST + / PERSIST − and out of the pick, and shown as `⚠ stale index` |
 | `MIN_TARGET_R` / `MIN_TARGET_PCT` | `0.5` / `0.10` | a pivot closer than this to the entry is not a target (`0` = old behaviour). GODREJCP on 16 Nov: entered 877.25 with T1 at 878.00 — 0.2R, +0.09% — announced as "TARGET HIT +0.2R" |
 | `EXIT_EMA9_BUFFER_PCT` / `EXIT_EMA9_BUFFER_R` | `0.10` / `0.25` | a close must be beyond EMA9 by the *smaller* of these before the trail counts as broken (`0`/`0` = the old bare comparison). The band is what stops a 4-paise poke from ending a trade |
 | `BREAKEVEN_AFTER_T1` | `1` | once T1 is touched the stop moves to entry, so a hit target cannot turn into a loss (16 Nov: LUPIN +1.3R → +0.2R, NESTLEIND +0.8R → −0.1R). The R in every later alert is still measured against the **original** stop |
 | `MARKET_CONF_DELTA` | `10` | send the market block when confidence moves this many points, not only when the label or the pick changes — 16 Nov slid 99% → 94% → 67% without a message while three entries were taken (`0` = off) |
+| `PICK_RS_MARGIN` | `0.05` | pp of RS a sector may give up and still complement the pick; `0` restores the bare `rs >= 0` test that skipped a persist-91 leader for reading `rs -0.01` |
 
 `python -m nse_scanner doctor` prints the ones that change behaviour most
 (`first minute → up to N min early`, `market source`, `re-projections after a

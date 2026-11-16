@@ -150,6 +150,11 @@ class SectorSnap:
     side: int
     score: float
     qualified: bool
+    # How many 5m bars this sector's own index is behind the Nifty decision bar.
+    # The index feed gaps far more often than the stock feed, and a sector scored
+    # on a 30-minute-old bar describes a tape that no longer exists.
+    lag_bars: int = 0
+    stale: bool = False
 
 
 @dataclass
@@ -185,6 +190,9 @@ class MarketDecision:
     # and which of the scanned sectors have live flow agreeing with persistence.
     extra_sectors: list = field(default_factory=list)
     flow_aligned: list = field(default_factory=list)
+    # Sectors left out of the pick because their index stopped updating:
+    # [(name, lag_bars)]. Shown on the market block, never silently dropped.
+    stale_sectors: list = field(default_factory=list)
 
 
 def _day_ohlc_so_far(df: pd.DataFrame, sid) -> tuple[float, float, float, float]:
@@ -447,9 +455,16 @@ def run_market(
         "TRANSITION"
     )
 
-    persist_plus = sorted(snaps.values(), key=lambda s: s.persist_bull, reverse=True)
-    persist_minus = sorted(snaps.values(), key=lambda s: s.persist_bear, reverse=True)
-    live_ranked = sorted(snaps.values(), key=lambda s: s.score, reverse=True)
+    # A sector whose index has stopped printing is scored on its last bar but
+    # cannot be picked, and it cannot sit in PERSIST + either: the list is read
+    # as "what is moving now".
+    stale_sectors = [(s.name, s.lag_bars)
+                     for s in sorted((s for s in snaps.values() if s.stale),
+                                     key=lambda s: -s.lag_bars)]
+    fresh = [s for s in snaps.values() if not s.stale] or list(snaps.values())
+    persist_plus = sorted(fresh, key=lambda s: s.persist_bull, reverse=True)
+    persist_minus = sorted(fresh, key=lambda s: s.persist_bear, reverse=True)
+    live_ranked = sorted(fresh, key=lambda s: s.score, reverse=True)
     live_qual = next((s for s in live_ranked if s.qualified), live_ranked[0])
 
     pick, pick_side, reason = _complementary_pick(
@@ -501,6 +516,7 @@ def run_market(
         sectors={k: vars(v) for k, v in snaps.items()},
         extra_sectors=extra_sectors,
         flow_aligned=flow_aligned,
+        stale_sectors=stale_sectors,
     )
 
 
@@ -538,9 +554,48 @@ def _dir_conf(mtf_bull, mtf_bear, above, below, adx, npos, dir_state, or_up, or_
     return int(round(float(np.clip(core + boost, 0, 100))))
 
 
+def sector_max_lag_bars() -> int:
+    """Bars a sector index may trail the Nifty decision bar and still be picked (2).
+
+    Yahoo's cash indices gap far more often than stocks do. Before this check the
+    picker scored whatever the last available bar was: on a synthetic replay a
+    sector whose index stopped printing 30 minutes earlier still won the pick
+    (persist 92, day +1.37%) on a tape that had already moved on. ``0`` requires
+    the sector to print the decision bar itself, ``-1`` disables the check.
+    """
+    try:
+        return int(os.environ.get("SECTOR_MAX_LAG_BARS", "2"))
+    except ValueError:
+        return 2
+
+
+def _lag_bars(sector_bar, decision_bar) -> int:
+    """Whole 5m bars between a sector's last bar and the decision bar (0 if none)."""
+    if decision_bar is None or sector_bar is None:
+        return 0
+    try:
+        a = to_ist(decision_bar) if not isinstance(decision_bar, pd.Timestamp) else decision_bar
+        b = to_ist(sector_bar) if not isinstance(sector_bar, pd.Timestamp) else sector_bar
+        if a.tzinfo is None:
+            a = a.tz_localize(IST)
+        if b.tzinfo is None:
+            b = b.tz_localize(IST)
+        return max(0, int(round((a - b).total_seconds() / 300.0)))
+    except Exception:
+        return 0
+
+
 def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
-    """Pine `sectorMetric` + v3.9 `pBull`/`pBear` on the last available bar."""
+    """Pine `sectorMetric` + v3.9 `pBull`/`pBear` on the last *fresh* bar.
+
+    ``last_ts`` is the decision bar. A sector whose index stops short of it is
+    scored on its own last bar and flagged ``stale`` once it trails by more than
+    ``SECTOR_MAX_LAG_BARS``; the pickers skip stale sectors and the market block
+    names them.
+    """
     x = df5.copy().sort_index()
+    lag = _lag_bars(x.index[-1], last_ts)
+    max_lag = sector_max_lag_bars()
     x["sid"] = [session_date(t) for t in x.index]
     close = x["Close"].to_numpy(dtype=float)
     high = x["High"].to_numpy(dtype=float)
@@ -723,6 +778,8 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
         side=side,
         score=score,
         qualified=bool(qualified),
+        lag_bars=lag,
+        stale=bool(max_lag >= 0 and lag > max_lag),
     )
 
 
@@ -732,6 +789,7 @@ SECTOR_FOLLOW_PREFIX = "SECTOR FOLLOW"
 def _is_leading(s, need: float) -> bool:
     return bool(
         s.side == 1 and s.persist_bull >= need
+        and not getattr(s, "stale", False)
         and s.day_ret >= BULL_MIN_DAY and s.pos >= BULL_MIN_POS and s.rs > 0
         and s.bull >= FLOW_MIN and s.recent > -RECENT_MOVE_MIN
     )
@@ -809,20 +867,47 @@ def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_d
 
     pool = plus if commit_side == 1 else minus
     want_side = commit_side
+    margin = max(0.0, pick_rs_margin())
+    passed: list[str] = []
     for s in pool[:3]:
-        complements = (
-            (want_side == 1 and s.rs >= 0 and s.day_ret >= -0.05 and s.side != -1)
-            or (want_side == -1 and s.rs <= 0 and s.day_ret <= 0.05 and s.side != 1)
-        )
-        # reject if the name is qualified the opposite way
-        if want_side == 1 and s.qualified and s.side == -1:
+        edge = s.rs if want_side == 1 else -s.rs
+        if getattr(s, "stale", False):
+            passed.append(f"{s.name} (index {getattr(s, 'lag_bars', 0)} bars behind)")
             continue
-        if want_side == -1 and s.qualified and s.side == 1:
+        if s.side != want_side:
+            passed.append(f"{s.name} (flow {'bearish' if want_side == 1 else 'bullish'})")
             continue
-        if not complements:
+        if edge < -margin:
+            passed.append(f"{s.name} (rs {s.rs:+.2f})")
+            continue
+        if (want_side == 1 and s.day_ret < -0.05) or (want_side == -1 and s.day_ret > 0.05):
+            passed.append(f"{s.name} (day {s.day_ret:+.2f}%)")
             continue
         tag = "PERSIST +" if want_side == 1 else "PERSIST −"
         q = "qualified" if s.qualified and s.side == want_side else "persistent"
-        return s.name, want_side, f"{tag} {s.name} {q} (score {s.persist_bull if want_side==1 else s.persist_bear:.0f})"
+        text = f"{tag} {s.name} {q} (score {s.persist_bull if want_side==1 else s.persist_bear:.0f})"
+        return s.name, want_side, _passed_over(text, passed)
     top = pool[0].name if pool else "?"
-    return None, 0, f"WAIT — persist #{top} does not complement {('BULL' if commit_side==1 else 'BEAR')} market"
+    text = f"WAIT — persist #{top} does not complement {('BULL' if commit_side==1 else 'BEAR')} market"
+    return None, 0, _passed_over(text, passed)
+
+
+def pick_rs_margin() -> float:
+    """How far a sector may lag Nifty and still complement a BULL pick (0.05pp).
+
+    ``rs`` is in percentage points of index move, so ``0.05`` is five basis
+    points — noise. Without it, a sector that leads PERSIST + by 30 points was
+    passed over for reading ``rs -0.01`` and the block said nothing about it;
+    ``0`` restores the bare ``rs >= 0`` test.
+    """
+    try:
+        return float(os.environ.get("PICK_RS_MARGIN", "0.05"))
+    except ValueError:
+        return 0.05
+
+
+def _passed_over(text: str, passed: list[str], most: int = 2) -> str:
+    """Name the sectors the pick walked past, and why — never skip one silently."""
+    if not passed:
+        return text
+    return text + " · passed over " + ", ".join(passed[:most])

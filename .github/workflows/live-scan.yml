@@ -160,8 +160,16 @@ jobs:
           # confidence moves this many points, not only on a label change.
           MARKET_CONF_DELTA: ${{ vars.MARKET_CONF_DELTA || '10' }}
           # Entries allowed per pick (sector+side) per session, 0 = no cap; the
-          # names that clear it are alerted best-score first.
+          # names that clear it are alerted most-ahead-of-sector first.
           MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
+          # 1 = rank those names by how far they lead their own sector today
+          # (stock move minus sector move from each session open), 0 = by score.
+          RANK_BY_SECTOR_LEAD: ${{ vars.RANK_BY_SECTOR_LEAD || '1' }}
+          # A sector index may trail the decision bar this many 5m bars and still
+          # be picked (-1 = no check); a further-behind index is named on the block.
+          SECTOR_MAX_LAG_BARS: ${{ vars.SECTOR_MAX_LAG_BARS || '2' }}
+          # How far (pp) a sector may lag Nifty and still complement the pick.
+          PICK_RS_MARGIN: ${{ vars.PICK_RS_MARGIN || '0.05' }}
           # A pivot closer than this to entry is resistance, not a target.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
