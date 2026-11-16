@@ -1,6 +1,8 @@
 """Direction label vs committed side (the "Market NEUTRAL ... BUY" contradiction)."""
 from unittest import TestCase
 
+from unittest.mock import patch
+
 from nse_scanner.market import _complementary_pick, _direction_label
 
 
@@ -280,3 +282,258 @@ class PreviousPickTests(TestCase):
                                          "bar": "2026-11-16 10:15"}, bar))
         self.assertIsNone(previous_pick(None, bar))
         self.assertIsNone(previous_pick({"sector": "PHA", "side": 1}, bar))
+
+
+class WeakFollowTests(TestCase):
+    """16 Nov 11:55: BULL at conf 41, FMCG 93 / REALTY 91 — and no path at all.
+
+    `_complementary_pick` stands aside below conf 55, and `_follow_leaders` only
+    ran with no committed side. A weak-but-directional day therefore had no way
+    to reach the sector that was actually moving.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def fallback(self, pick, commit_side, conf, plus, **env):
+        from unittest.mock import patch
+        from nse_scanner.market import _follow_fallback
+        with patch.dict("os.environ", env):
+            return _follow_fallback(pick, commit_side, conf, plus)
+
+    plus = [("FMCG", 93)]
+
+    def leaders(self):
+        return [self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6, bull=70.0)]
+
+    def test_the_locked_rule_is_the_default(self):
+        self.assertIsNone(self.fallback(None, 1, 41, self.leaders()))
+
+    def test_the_knob_opens_the_weak_bull_case(self):
+        out = self.fallback(None, 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1")
+        self.assertEqual((out["pick"], out["side"], out["action"]), ("FMCG", 1, "SCAN LONG"))
+        self.assertIn("Nifty BULL weak (41%)", out["reason"])
+
+    def test_the_neutral_case_is_unchanged(self):
+        out = self.fallback(None, 0, 41, self.leaders())
+        self.assertEqual(out["pick"], "FMCG")
+        self.assertIn("Nifty NEUTRAL", out["reason"])
+
+    def test_a_weak_bear_is_not_followed(self):
+        # The bear mirror is not written: a weak BEAR still waits.
+        self.assertIsNone(self.fallback(None, -1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_pick_is_never_overridden(self):
+        self.assertIsNone(self.fallback("PHA", 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_weak_day_demands_more_persistence_than_a_flat_one(self):
+        # NEUTRAL follows at persist 55; a weak BULL only follows the exception (65).
+        mid = [self.snap("PHA", persist_bull=58.0, pos=70.0, rs=0.4)]
+        self.assertEqual(self.fallback(None, 0, 41, mid)["pick"], "PHA")
+        self.assertIsNone(self.fallback(None, 1, 41, mid, SECTOR_FOLLOW_ON_WEAK="1"))
+        strong = [self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6)]
+        self.assertEqual(self.fallback(None, 1, 41, strong, SECTOR_FOLLOW_ON_WEAK="1")["pick"],
+                         "FMCG")
+
+    def test_the_weak_floor_can_be_moved(self):
+        mid = [self.snap("PHA", persist_bull=58.0, pos=70.0, rs=0.4)]
+        out = self.fallback(None, 1, 41, mid, SECTOR_FOLLOW_ON_WEAK="1",
+                            SECTOR_FOLLOW_WEAK_MIN_PERSIST="55")
+        self.assertEqual(out["pick"], "PHA")
+
+    def test_the_pick_is_one_sided(self):
+        # Decided 16 Nov: no two-sided pick. On a committed BULL bar the top of
+        # PERSIST − (REALTY 91) is a reading, never a pick — even when the weak
+        # path is on and REALTY is the more persistent of the two.
+        plus = self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6)
+        bear = self.snap("REALTY", side=-1, persist_bear=95.0, persist_bull=5.0,
+                         pos=10.0, rs=-0.9, day_ret=-1.2)
+        from nse_scanner.market import _follow_leaders
+        self.assertEqual([x.name for x in _follow_leaders([bear, plus], 65)], ["FMCG"])
+        with patch.dict("os.environ", {"SECTOR_FOLLOW_ON_WEAK": "1"}):
+            out = self.fallback(None, 1, 41, [bear, plus])
+        self.assertEqual((out["pick"], out["side"]), ("FMCG", 1))
+
+    def test_a_weak_day_still_needs_a_leading_sector(self):
+        dull = [self.snap("FMCG", persist_bull=52.0, pos=45.0, rs=-0.2)]
+        self.assertIsNone(self.fallback(None, 1, 41, dull, SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_a_strong_day_is_not_affected(self):
+        # conf 74 with a good sector never reaches the fallback: the picker picks.
+        self.assertIsNone(self.fallback(None, 1, 74, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
+
+    def test_follow_switch_still_turns_everything_off(self):
+        self.assertIsNone(self.fallback(None, 0, 41, self.leaders(), SECTOR_FOLLOW="0",
+                                        SECTOR_FOLLOW_ON_WEAK="1"))
+
+
+class DivergenceShortTests(TestCase):
+    """Index up, breadth down — the one tape the one-sided rule cannot trade.
+
+    16 Nov 11:55: Nifty +0.44%, breadth 5▲/10▼, PERSIST − REALTY 91. A BULL bar
+    has no short pool, so nothing was picked. This is the rule that would.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def short(self, commit=1, day=0.44, adv=5, dec=10, minus=None, prev=None,
+              mtf=3, conf=99, **env):
+        from nse_scanner.market import _divergence_short
+        pool = minus if minus is not None else [self.faller()]
+        with patch.dict("os.environ", {"DIVERGENCE_SHORT": "1", **env}):
+            return _divergence_short(commit, day, adv, dec, pool, prev,
+                                     mtf_bull=mtf, dir_conf=conf)
+
+    def faller(self, name="REALTY", persist=91.0, **over):
+        base = dict(side=-1, persist_bear=persist, day_ret=-1.20, pos=8.0, rs=-0.9,
+                    bear=85.0, recent=-0.02, stale=False)
+        return self.snap(name, **{**base, **over})
+
+    def test_it_fires_on_the_16_nov_tape(self):
+        out = self.short(mtf=3, conf=41)
+        self.assertEqual((out["pick"], out["side"], out["action"]), ("REALTY", -1, "SCAN SHORT"))
+        self.assertIn("DIVERGENCE SHORT — index up (Nifty +0.44%)", out["reason"])
+        self.assertIn("breadth 5▲/10▼", out["reason"])
+        self.assertIn("persist 91", out["reason"])
+
+    def test_it_is_off_by_default(self):
+        with patch.dict("os.environ", {"DIVERGENCE_SHORT": "0"}):
+            from nse_scanner.market import _divergence_short
+            self.assertIsNone(_divergence_short(1, 0.44, 5, 10, [self.faller()]))
+
+    def test_the_index_has_to_be_up(self):
+        self.assertIsNone(self.short(day=-0.30))          # a falling index has a short pool
+        self.assertIsNone(self.short(commit=-1, day=-0.30))
+
+    def test_a_confirmed_uptrend_is_never_shorted(self):
+        # MTF 3/3, conf 85, breadth positive: the index is a real uptrend.
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=85))
+
+    def test_an_unconfirmed_uptrend_is_enough(self):
+        # 16 Nov 09:30: MTF 2/3, conf 35, breadth 9▲/6▼ -> REALTY 76 was the
+        # persistent faller and nothing could be shorted. This is that bar.
+        out = self.short(adv=9, dec=6, mtf=2, conf=35, minus=[self.faller(persist=76.0)])
+        self.assertEqual((out["pick"], out["side"]), ("REALTY", -1))
+        self.assertIn("MTF 2/3", out["reason"])
+        self.assertIn("conf 35%", out["reason"])
+        self.assertNotIn("breadth", out["reason"])        # breadth was not the reason
+
+    def test_a_marginal_confidence_alone_is_enough(self):
+        # 16 Nov 09:35: MTF 2/3, conf 56, breadth 8▲/7▼.
+        self.assertIsNotNone(self.short(adv=8, dec=7, mtf=3, conf=56))
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=70))
+        self.assertIsNone(self.short(adv=8, dec=7, mtf=3, conf=85))
+
+    def test_narrow_breadth_alone_is_enough(self):
+        # 16 Nov 11:55: MTF 3/3, conf 41, breadth 5▲/10▼.
+        out = self.short(adv=5, dec=10, mtf=3, conf=85)
+        self.assertIsNotNone(out)
+        self.assertIn("breadth 5▲/10▼", out["reason"])
+
+    def test_a_small_negative_spread_is_not_narrow_enough(self):
+        self.assertIsNone(self.short(adv=7, dec=8, mtf=3, conf=85))     # 1 is noise
+        self.assertIsNotNone(self.short(adv=6, dec=9, mtf=3, conf=85))  # 2 is the bar
+
+    def test_a_marginal_faller_is_not_shorted(self):
+        self.assertIsNone(self.short(minus=[self.faller(persist=58.0)]))
+        self.assertIsNotNone(self.short(minus=[self.faller(persist=65.0)]))
+
+    def test_every_mirrored_gate_matters(self):
+        for bad in (dict(side=1),                  # not a short sector
+                    dict(day_ret=+0.10),           # not down enough
+                    dict(pos=55.0),                # middle of its range
+                    dict(rs=+0.10),                # ahead of Nifty
+                    dict(bear=40.0),               # flow not bearish
+                    dict(recent=+0.12),            # bouncing
+                    dict(stale=True)):             # index not printing
+            self.assertIsNone(self.short(minus=[self.faller(**bad)]), bad)
+
+    def test_the_floor_can_be_moved(self):
+        self.assertIsNone(self.short(minus=[self.faller(persist=58.0)]))
+        self.assertIsNotNone(self.short(minus=[self.faller(persist=58.0)],
+                                        DIVERGE_MIN_PERSIST="55"))
+
+    def test_the_incumbent_faller_is_held_within_the_margin(self):
+        # Two persistent fallers must not trade the short back and forth.
+        best = self.faller("REALTY", persist=91.0)
+        near = self.faller("DEF", persist=88.0)
+        out = self.short(minus=[best, near], prev={"name": "DEF", "side": -1})
+        self.assertEqual(out["pick"], "DEF")
+        self.assertIn("held over REALTY", out["reason"])
+        far = self.faller("DEF", persist=80.0)
+        self.assertEqual(self.short(minus=[best, far], prev={"name": "DEF", "side": -1})["pick"],
+                         "REALTY")
+
+    def test_a_recovered_incumbent_is_not_held(self):
+        best = self.faller("REALTY", persist=91.0)
+        back = self.faller("DEF", persist=88.0, recent=+0.20)     # bouncing: not a short
+        self.assertEqual(self.short(minus=[best, back], prev={"name": "DEF", "side": -1})["pick"],
+                         "REALTY")
+
+    def test_no_bear_pool_is_no_trade(self):
+        self.assertIsNone(self.short(minus=[]))
+
+
+class ConfScaledFloorTests(TestCase):
+    """The floor should rise as the confidence falls.
+
+    16 Nov 09:35: `MARKET BULL conf 56% BUILDING`, `PERSIST + PHA 56 · FMCG 54 ·
+    BANK 48` -> buy PHA at 56. The morning's persistent sector was REALTY
+    (66/76/69 on PERSIST −); the long side never got above 59 and the pharma
+    entries were given up within 40 minutes.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def floor(self, conf, **env):
+        from nse_scanner.market import persist_floor
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1", **env}):
+            return persist_floor(conf)
+
+    def pick(self, conf, plus, **env):
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1", **env}):
+            return _complementary_pick(1, conf, "TRANSITION", plus, [], 0.0, 0.5)
+
+    def test_the_flat_floor_is_the_default(self):
+        from nse_scanner.market import persist_floor
+        with patch.dict("os.environ", {}):
+            self.assertEqual(persist_floor(56), 50.0)
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "0"}):
+            self.assertEqual(persist_floor(56), 50.0)
+
+    def test_the_floor_scales_between_the_gate_and_a_good_confidence(self):
+        self.assertEqual(self.floor(55), 65.0)          # at the gate
+        self.assertEqual(self.floor(70), 50.0)          # a good day: no premium
+        self.assertEqual(self.floor(90), 50.0)          # never below the base
+        self.assertAlmostEqual(self.floor(56), 64.0, places=1)
+        self.assertAlmostEqual(self.floor(62.5), 57.5, places=1)
+
+    def test_a_marginal_confidence_call_needs_a_persistent_sector(self):
+        # the 09:35 bar: conf 56, best long 56 -> now refused
+        plus = [self.snap("PHA", persist_bull=56.0), self.snap("FMCG", persist_bull=54.0)]
+        name, side, reason = self.pick(56, plus)
+        self.assertIsNone(name)
+        self.assertEqual(side, 0)
+        self.assertIn("persist 56 < 64", reason)
+
+    def test_the_same_sector_is_taken_on_a_confident_bar(self):
+        plus = [self.snap("PHA", persist_bull=56.0)]
+        name, side, _ = self.pick(74, plus)
+        self.assertEqual((name, side), ("PHA", 1))
+
+    def test_a_strong_sector_still_passes_on_a_marginal_bar(self):
+        plus = [self.snap("FMCG", persist_bull=93.0)]
+        self.assertEqual(self.pick(56, plus)[0], "FMCG")
+
+    def test_the_premium_can_be_tuned(self):
+        plus = [self.snap("PHA", persist_bull=56.0)]
+        self.assertIsNone(self.pick(56, plus)[0])
+        self.assertEqual(self.pick(56, plus, PICK_LOWCONF_MIN_PERSIST="55")[0], "PHA")
+
+    def test_the_incumbent_is_held_against_the_same_floor(self):
+        from nse_scanner.market import _sticky_pick
+        inc = self.snap("PHA", persist_bull=56.0)
+        near = self.snap("FMCG", persist_bull=58.0)
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1"}):
+            held = _sticky_pick("FMCG", 1, "PERSIST + FMCG", [near, inc], [], 
+                                {"name": "PHA", "side": 1}, floor=64.0)
+        self.assertEqual(held[0], "FMCG")      # the incumbent is below the floor: not held

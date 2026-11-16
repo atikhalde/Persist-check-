@@ -369,3 +369,304 @@ clear switch / faded / stale / below-floor incumbent, `previous_pick` adjacency
 (only the candle 5 minutes earlier, never `WAIT`), bot 3's cap + lead ranking +
 pivot names + "not taken" cancel reason, the CatchupWindow window anchor, and
 the `new_position` record both bots now share.
+
+## Follow-up — the 11:55 WAIT block, and what "the day's sector" means when it is two
+
+The block from the 11:55 feed:
+
+```
+MARKET BULL  conf 41% WEAK  (was 67%)
+Nifty 25,255.2  day +0.44%  intra +0.19%
+VIX 15.69 ↓ -6.74%   ADX 15   MTF 3/3
+Breadth 5▲/10▼  TRANSITION
+PERSIST +  FMCG 93 · BANK 44 · FIN 32
+PERSIST −  REALTY 91 · AUTO 86 · DEF 83
+Live flow  AUTO Q (79)
+
+SECTOR PICK: WAIT  FLAT
+WAIT — market TRANSITION conf 41
+```
+
+Read from the feed: *"today's sector could be REALTY and FMCG."* That reading is
+right, and the block had already measured it: **FMCG 93 is the most persistent
+bullish sector, REALTY 91 the most persistent bearish one.** They are the two
+ends of the same rotation — a defensive bid (FMCG) with property offered
+(REALTY) — on a tape where the index is held up by a few names while 5 stocks
+advance and 10 decline. That is what `PERSIST +` / `PERSIST −` are for.
+
+Three things were wrong with the block, and only the third changes behaviour.
+
+### 1. It opened with a direction it had refused to act on
+
+`MARKET BULL conf 41% WEAK` sat directly above `WAIT — market TRANSITION conf
+41`. A bullish header on a 5▲/10▼ tape, followed by an action of `WAIT`: the
+engine names a side and then declines to use it, and the reader is left to guess
+which half to believe. A block that trades nothing now says so, and keeps the
+lean as a lean:
+
+```
+MARKET STAND ASIDE  BULL lean · conf 41% WEAK  (was 67%)
+...
+WAIT — market TRANSITION conf 41 < 55
+```
+
+`dir_label` itself is untouched (it is the *commit* side, and the summaries and
+the "did the label change" test depend on it) — only the rendered header
+distinguishes "trading this side" from "leaning that way".
+
+### 2. It never answered "which sectors are moving?"
+
+The two pools answer it, but only if you know that `PERSIST +` is long and
+`PERSIST −` is short. A WAIT block now says it in one line, on both sides:
+
+```
+No pick · persistent movers  FMCG long 93 · REALTY short 91
+```
+
+Display only. Nothing is scanned, no entry is opened.
+
+The `Live flow` line in the pasted block also reads `AUTO Q (79)` with **no
+arrow**, while `AUTO` is the #2 of `PERSIST −`: that block predates the
+`REALTY▼` fix (PR #28) and reads `AUTO▼ Q (79)` on this tree.
+
+### 3. The two gates left a gap, and the day fell in it
+
+```python
+# _complementary_pick
+if commit_side == 0 or regime == "CHOP" or dir_conf < PICK_MIN_CONF:   # 41 < 55 -> WAIT
+    return None, 0, "WAIT ..."
+
+# run_market, before this change
+if not pick and commit_side == 0:        # <- and the fallback needs NO side at all
+    leaders = _follow_leaders(persist_plus)
+```
+
+The engine could pick a sector with a confident direction, or follow one with no
+direction at all. A direction it did not trust — `commit_side == 1` at conf 41 —
+was the one case with **no path to a sector**, and FMCG 93 was sitting in that
+gap.
+
+`SECTOR_FOLLOW_ON_WEAK` (default **0**) closes it: a weak committed BULL falls
+back to the same strict gates the NEUTRAL case uses — persist ≥ 55, up on the
+day, upper half of the range, positive RS, bullish live flow, not rolling over —
+which is much stricter than the complementary path it replaces. The reason line
+says which market it is: `SECTOR FOLLOW — Nifty BULL weak (41%), FMCG leads
+(persist 93, day +0.90%, range pos 88, flow aligned)`.
+
+It is **off by default** because the locked rule is `conf < 55 → WAIT`, and
+because 16 Nov is the day that rule was written for: six entries on a weak tape
+in 35 seconds. Turning it on trades the *strict* path, not the lax one.
+
+Two decisions were taken with it:
+
+* **the weak path is stricter than the flat one** — `SECTOR_FOLLOW_WEAK_MIN_PERSIST`
+  (65) against the NEUTRAL case's 55. On a day where the index offers no help,
+  only the exception is worth following: FMCG 93 qualifies, a sector at 58 does
+  not;
+* **the pick stays one-sided.** Asked on 16 Nov, the answer was one side only: on
+  a `commit_side == 1` bar the top of `PERSIST −` is a reading on the block,
+  never a pick. `_follow_leaders` is long-only and a test now pins it —
+  REALTY 91 with `persist_bear 95` is refused even with the weak path on.
+
+A weak BEAR still waits: the mirrored gates are not written, and a
+half-mirrored rule is worse than none.
+
+### "REALTY was top persistent — why was FMCG picked?"
+
+Because the two numbers are not on the same scale, and because the pick is
+direction-first. From a replay of the same two sectors, the only thing that
+changes between the two runs is the Nifty series:
+
+| sector | side | persist **+** | persist **−** | day | range pos |
+|---|---|---|---|---|---|
+| FMCG | +1 | **96.8** | 1.2 | +2.24% | 96 |
+| REALTY | −1 | 0.8 | **97.3** | −3.28% | 3 |
+
+* Nifty rising → `pick FMCG` (`PERSIST + FMCG qualified (score 97)`);
+* Nifty falling → `pick REALTY` (`PERSIST − REALTY qualified (score 97)`);
+* Nifty flat → `pick FMCG` (`SECTOR FOLLOW — Nifty NEUTRAL, FMCG leads`).
+
+REALTY's 91 is **bearish** persistence — its score on the bull metric is 0.8.
+Putting 91 next to FMCG's 93 compares a fall with a rise. The pools never rank
+against each other: `commit_side` chooses the pool, and only then does
+persistence order it. On a BULL bar REALTY is not second, it is **not a
+candidate**, and in the morning — before the concrete lock and conf ≥ 55 — the
+lane that runs is `SECTOR FOLLOW`, which is long-only by construction.
+
+On 16 Nov the index was `BULL` in both blocks, so **no version of the current
+rule picks REALTY that day**, at 11:55 or in the morning. What would is a
+divergence rule (index up, breadth 5▲/10▼ → allow a `PERSIST −` short with the
+mirrored gates) — a new rule, not a bug. Pinned by `DirectionFirstTests`.
+
+### The divergence rule — `DIVERGENCE_SHORT` (off, for testing)
+
+The one tape the one-sided rule cannot trade: **index up, breadth against it.** On
+16 Nov 11:55 that was `Nifty +0.44%`, breadth `5▲/10▼`, `PERSIST − REALTY 91` —
+and no pick, because a BULL bar has no short pool. The rule, when
+`DIVERGENCE_SHORT=1`:
+
+| condition | value |
+|---|---|
+| index side | committed **BULL** and `nifty day > 0` |
+| the up-move is not confirmed | **`MTF < 3`** or **`conf < 70`** or **breadth `dec − adv ≥ 2`** — any one |
+| sector | top of `PERSIST −`, `side == −1`, not stale |
+| persistence | `persist_bear ≥ DIVERGE_MIN_PERSIST` (65) |
+| trend | `day ≤ −0.20%`, `range pos ≤ 40`, `rs < 0` |
+| flow | bear flow ≥ 55, and `recent < +0.07` — **not bouncing** |
+| precedence | **one pick per bar, long side first**: the short only replaces a `WAIT`, never a long |
+| hysteresis | the incumbent faller is held unless a challenger is `PICK_STICKY_MARGIN` more persistent |
+
+**Why the first version was wrong.** It required the breadth to be against the
+index, and on 16 Nov the morning breadth was *positive* (10▲/5▼ → 9▲/6▼ →
+8▲/7▼) while REALTY was the persistent faller (66 → 76 → 69) — so the rule would
+have refused the whole morning and fired only at 11:55. The breadth was never the
+signal; the signal is that **the index is up on evidence it cannot back**: `MTF
+2/3` at every morning bar (only the 11:55 bar was 3/3) and a confidence stuck
+between 29 and 56. Breadth is now one of three ways to establish that, not the
+only one. Each alert names which one applied:
+
+```
+DIVERGENCE SHORT — index up (Nifty +0.48%) but MTF 2/3 · conf 35%; REALTY is
+breaking down (persist 76, day -1.20%, range pos 8, flow 85 bear)
+```
+
+It is a fallback, not a second pick: on a bar where a sector can be bought, the
+short does not exist. The block says which one it is —
+`MARKET BULL conf 41% WEAK  ·  short on divergence` over `SECTOR PICK: REALTY
+BEAR`, with the reason spelled out:
+
+```
+DIVERGENCE SHORT — index up (Nifty +0.44%) but breadth 5▲/10▼; REALTY is breaking
+down (persist 91, day -1.20%, range pos 3, flow 85 bear)
+```
+
+Downstream it is an ordinary short: `pick_cap_key` is `REALTY short`, the cap and
+the lead ranking apply, bot 3 scans the same sector, and the stock ranked first is
+the one falling *fastest relative to its sector* (the short-side `lead`).
+
+**Why it is off.** It shorts into a rising index. The tape it targets — index held
+up by two or three names, everything else offered — can grind up for hours while
+the breadth stays red, and then the fade never comes. It is a rule to test, not a
+rule to switch on and forget. To A/B it: set `DIVERGENCE_SHORT=1` for a session
+(the block and the log then name every divergence short it would take), and on a
+day it is off, the same information is still on the block as
+`No pick · persistent movers  FMCG long 93 · REALTY short 91`.
+
+### What it does not fix
+
+**REALTY 91 could not have been traded on this block either way.** It is the most
+persistent *bearish* sector, and the rule is that the pick must agree with the
+committed side: on a `commit_side == 1` bar the only usable pool is `PERSIST +`.
+Shorting the loser of a 5▲/10▼ tape is defensible, but it is a counter-index
+trade and it needs a BEAR lock, which this day never gave. If that is a trade you
+want, it is a new rule (a two-sided pick on a weak tape), not a bug fix — say so
+and it can be specified.
+
+### Proof
+
+`pytest -q` → **365 passed**. New: the stand-aside header (and that a traded
+block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
+and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
+unchanged, weak BEAR refused, no override of a real pick, a dull sector still
+refused, `SECTOR_FOLLOW=0` still master.
+
+### The "persist test" — the three morning blocks, read against each other
+
+The 09:15 / 09:30 / 09:35 feed, same morning as the 11:55 block:
+
+| bar | label / conf | breadth | PERSIST + | PERSIST − | pick |
+|---|---|---|---|---|---|
+| 09:15 | NEUTRAL 29 WEAK | 10▲/5▼ | PSUBK 59 · PHA 43 · CDUR 42 | **REALTY 66** · MET 54 · PSE 50 | WAIT |
+| 09:30 | BULL 35 WEAK | 9▲/6▼ | PSUBK 50 · PHA 50 · BANK 42 | **REALTY 76** · MET 65 · DEF 59 | WAIT |
+| 09:35 | BULL 56 BUILDING | 8▲/7▼ | **PHA 56** · FMCG 54 · BANK 48 | **REALTY 69** · DEF 66 · PSE 63 | **PHA** |
+| 11:55 | BULL 41 WEAK | 5▲/10▼ | **FMCG 93** · BANK 44 · FIN 32 | **REALTY 91** · AUTO 86 · DEF 83 | WAIT |
+
+Three things the test shows, and only one of them is a defect.
+
+**1. REALTY was the one persistent sector of the day, and the engine was right
+not to trade it.** Top of `PERSIST −` at every bar (66 → 76 → 69 → 91), live flow
+on it at 09:30 and 09:35, and it kept falling. It is the cleanest reading in the
+whole feed. It was also untradeable: the index was `BULL` at every one of those
+bars, and the pick has to agree with the index. The divergence rule
+(`DIVERGENCE_SHORT`) would not have fired either — breadth was **positive** all
+morning (10▲/5▼, 9▲/6▼, 8▲/7▼); it only looks at the 5▲/10▼ tape that arrived
+by 11:55. So on this morning nothing in the current design, on or off, shorts
+REALTY. That is the one-sided rule doing exactly what it was asked to do.
+
+**2. The long side was never persistent, and 09:35 bought the best of a weak
+bunch.** The `PERSIST +` top went 59 → 50 → 56 while the floor was 50. At 09:35
+the pick was `PERSIST + PHA persistent (score 56)` — the label says *persistent*,
+not *qualified*, which is the engine being honest: PHA was not flow-aligned, and
+56 is six points over a 50 floor. The same pharma names were given up within 40
+minutes at the day's high (third pass). This is the floor, not the measurement.
+
+**3. The three paths sat on a gradient and only one number knew it.** 50 for the
+complementary pick, 55 for `SECTOR FOLLOW`, 65 for a weak day reads as "the less
+index confirmation, the more the sector has to prove" — coherent. But the
+complementary floor was flat, so a **conf 56** bar was treated exactly like a
+**conf 96** bar. `PICK_CONF_SCALED_FLOOR` (default **0**) fixes the gradient:
+`PICK_MIN_PERSIST` (50) at conf ≥ 70, `PICK_LOWCONF_MIN_PERSIST` (65) at the 55
+gate, linear between. On the 09:35 bar the floor becomes 64, and:
+
+```
+WAIT — persist #PHA does not complement BULL market · passed over PHA (persist 56 < 64)
+```
+
+The morning's only long entry disappears; FMCG 93 still passes on any bar with
+conf ≥ 55. The incumbent is validated against the same floor, so a pick made at
+conf 74 is dropped — not held — once the confidence falls to the gate.
+
+**Not changed:** the 09:30 block reads `Breadth 9▲/6▼ TREND UP` while the header
+says `WEAK` and the action is `WAIT`. `regime` is a breadth/ADX description, not a
+trade signal, and the header no longer announces a direction it will not use
+(`MARKET STAND ASIDE  BULL lean · conf 35% WEAK`). Considered, left alone.
+
+**Also noted:** at 09:15 `persist` is built on a single bar (30% of it is the day
+move, 25% the position in a one-bar range), so `PSUBK 59` at 09:15 carries the same
+authority on the block as `FMCG 93` at 11:55. The 50/64 floor and the conf-55 gate
+are what keep the first bar from being traded; a "few bars so far" marker on the
+block would be a display nicety, not a fix.
+
+## Final recommendation (16 Nov close of the audit)
+
+**16 Nov was a chop day, and the divergence rule reads chop.** Its trigger is
+`MTF < 3` or `conf < 70` or breadth against the index — the first two *are* the
+definition of an unconfirmed tape. So `DIVERGENCE_SHORT` does not filter chop; it
+monetises it. Turning it on turns every `STAND ASIDE` day into a short day, on the
+evidence of one sector and one session.
+
+That does not make the REALTY observation wrong — REALTY did fall from −1.4% on
+the day at 09:30 to −3.1% at 11:55 while the index rose — it makes it
+**unmeasured**. One day, one sector, sector-level, and no close.
+
+So the recommendation is a tightening, not a new lane:
+
+| what | value | why |
+|---|---|---|
+| everything measured (cap, targets, EMA9 buffer, breakeven, conf delta) | on | measured on 16 Nov: −3.2R → −2.4R, 5 of 9 exits held |
+| everything structural (lag guard, RS margin, lead rank, pool side, floor, sticky, bot-3 parity) | on | each one fixes a mis-pick visible in the feed |
+| `PICK_CONF_SCALED_FLOOR` | **1** | removes the conf-56 / persist-56 entry; makes 16 Nov a **flat day** |
+| `SECTOR_FOLLOW_ON_WEAK` | **0** | longs into a 5▲/10▼ tape: the shape of every loss in the record |
+| `DIVERGENCE_SHORT` | **0** | trigger is chop; one sample; needs the study below |
+
+A flat day is the correct output of a chop day. The engine's only defensible edge
+in this record is a *persistent mover on the aligned side* — 16 Nov never offered
+one until 11:55, by which time the index confidence was 41.
+
+### How to settle the short, expensively avoided
+
+`backtest` now reports it. For any session it has replayed, the report ends with
+a divergence study: every bar where the index was up but unconfirmed (or narrow),
+the `PERSIST −` leader there, its day move then and at the close, and whether a
+long pick was holding that bar.
+
+```
+python -m nse_scanner backtest --date 2026-11-16
+```
+
+The early trigger and the late one are not the same trade: on the 16 Nov path the
+09:30 row starts at −1.40% while the 11:55 row starts at −3.10% — a rule that only
+fires when the breadth finally turns is shorting into the low. Run it across the
+sessions you have: if the morning rows keep showing the sector lower by the close,
+the lane has evidence; if they oscillate around zero, it is a chop-day coin flip
+and stays off.

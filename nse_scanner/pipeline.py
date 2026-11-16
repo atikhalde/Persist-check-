@@ -179,14 +179,38 @@ def format_market(md, prev_conf: int | None = None) -> str:
     moved = ""
     if prev_conf is not None and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta() > 0:
         moved = f"  <i>(was {int(prev_conf)}%)</i>"
+    # A block that trades nothing must not open by announcing a direction. On
+    # 16 Nov 11:55 it read "MARKET BULL conf 41% WEAK" over "WAIT — market
+    # TRANSITION conf 41": a bullish call the engine then refused to act on, on a
+    # tape that was 5▲/10▼. The lean is still shown — named as a lean.
+    if side == "FLAT":
+        lean = "" if md.dir_label == "NEUTRAL" else f"{md.dir_label} lean · "
+        head = f"<b>MARKET STAND ASIDE</b>  {lean}conf {md.dir_conf}% {md.dir_tier}{moved}"
+    else:
+        head = f"<b>MARKET {md.dir_label}</b>  conf {md.dir_conf}% {md.dir_tier}{moved}"
+        # A pick that goes against the lock must say so: "MARKET BULL" over
+        # "SECTOR PICK: REALTY BEAR" is only readable if the divergence is named.
+        commit = getattr(md, "commit_side", getattr(md, "dir_state", 0))
+        if commit in (1, -1) and md.pick_side != commit:
+            head += ("  ·  short on divergence" if md.pick_side == -1 else "  ·  long on divergence")
+    # The day's persistent movers on each side, even when nothing is traded:
+    # that is the question the block was silent on — "which sectors are moving?"
+    watch = ""
+    if side == "FLAT":
+        movers = [f"{n} {word} {sc:.0f}"
+                  for (pool, word) in ((md.persist_plus, "long"), (md.persist_minus, "short"))
+                  for n, sc in list(pool or [])[:1]]
+        if movers:
+            watch = "No pick · persistent movers  " + " · ".join(movers) + "\n"
     return (
-        f"<b>MARKET {md.dir_label}</b>  conf {md.dir_conf}% {md.dir_tier}{moved}\n"
+        f"{head}\n"
         f"Nifty {md.nifty:,.1f}  day {md.nifty_day_ret:+.2f}%  intra {md.nifty_intra:+.2f}%\n"
         f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   MTF {md.mtf_bull}/3\n"
         f"Breadth {md.breadth_adv}▲/{md.breadth_dec}▼  {md.regime}\n"
         f"PERSIST +  {plus}\n"
         f"PERSIST −  {minus}\n"
         f"{stale_line}"
+        f"{watch}"
         f"Live flow  {md.live_flow}{flow_arrow} {'Q' if md.live_flow_qualified else 'uQ'} "
         f"({md.live_flow_score:.0f})\n"
         f"\n<b>SECTOR PICK: {md.pick_sector}</b>  {side}\n"

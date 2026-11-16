@@ -153,6 +153,18 @@ jobs:
           PICK_RS_MARGIN: ${{ vars.PICK_RS_MARGIN || '0.05' }}
           PICK_MIN_PERSIST: ${{ vars.PICK_MIN_PERSIST || '50' }}
           PICK_STICKY_MARGIN: ${{ vars.PICK_STICKY_MARGIN || '5' }}
+          # 1 = a weak-but-directional BULL may still follow a plainly leading
+          # sector (conf < 55). 0 = the locked rule: conf < 55 stands aside.
+          SECTOR_FOLLOW_ON_WEAK: ${{ vars.SECTOR_FOLLOW_ON_WEAK || '0' }}
+          SECTOR_FOLLOW_WEAK_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_WEAK_MIN_PERSIST || '65' }}
+          # 1 = index up but breadth against it: the persistent faller may be
+          # shorted (mirrored gates). 0 = the pick must agree with Nifty.
+          DIVERGENCE_SHORT: ${{ vars.DIVERGENCE_SHORT || '0' }}
+          DIVERGE_MIN_PERSIST: ${{ vars.DIVERGE_MIN_PERSIST || '65' }}
+          # 1 = the persist floor rises as the confidence falls (50 at conf 70,
+          # 65 at the conf-55 gate). 0 = a flat floor.
+          PICK_CONF_SCALED_FLOOR: ${{ vars.PICK_CONF_SCALED_FLOOR || '0' }}
+          PICK_LOWCONF_MIN_PERSIST: ${{ vars.PICK_LOWCONF_MIN_PERSIST || '65' }}
           # Entries per pick: bot 3 confirms on the same ceiling as bot 1 (it used
           # to announce six names where bot 1 announced three).
           MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}

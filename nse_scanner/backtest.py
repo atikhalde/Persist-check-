@@ -73,6 +73,12 @@ def replay_session(target: date) -> dict:
             "nifty_day_ret": md.nifty_day_ret,
             "vix_chg": md.vix_chg,
             "breadth": f"{md.breadth_adv}/{md.breadth_dec}",
+            "mtf_bull": md.mtf_bull,
+            # the whole sector table, so a study can ask "and then what happened?"
+            "sectors": {n: {"persist_bull": v.get("persist_bull"), "persist_bear": v.get("persist_bear"),
+                            "day_ret": v.get("day_ret"), "rs": v.get("rs"), "pos": v.get("pos"),
+                            "side": v.get("side")}
+                        for n, v in (md.sectors or {}).items()},
         }
         path.append(rec)
         if i == 0 or i == len(day_bars) - 1 or rec["pick"] != path[max(0, i - 1)]["pick"] or rec["dir"] != path[max(0, i - 1)]["dir"]:
@@ -183,6 +189,70 @@ def replay_session(target: date) -> dict:
         "diagnostic_fires": diagnostic_fires,
         "last": last,
     }
+
+
+def divergence_rows(path: list[dict]) -> list[dict]:
+    """Bars where a divergence short was available, and how the sector ended.
+
+    The question the 16 Nov feed left open: when the index is up but on evidence
+    it cannot back (``MTF < 3``, ``conf < 70``, or breadth against it) and a
+    sector is persistently falling, would shorting that sector have paid by the
+    close? ``path`` is a replayed session (``replay_session``'s per-bar records),
+    so this answers it from the tool's own data — no feed, no guess.
+
+    Each row: the bar, the sector, its persistence there, its day move there and
+    at the last bar, and the move in between (negative = it kept falling, which
+    is what a short needs). ``blocked`` is set when a long pick held the bar,
+    because the divergence short only exists when the long side has nothing.
+    """
+    if not path:
+        return []
+    last = path[-1]
+    rows: list[dict] = []
+    for rec in path:
+        if rec.get("dir") not in ("BULL", "STRONG BULL"):
+            continue
+        if (rec.get("nifty_day_ret") or 0) <= 0:
+            continue
+        mtf = rec.get("mtf_bull")
+        unconfirmed = (mtf is not None and mtf < 3) or (rec.get("conf") or 0) < 70
+        try:
+            adv, dec = (int(x) for x in str(rec.get("breadth", "0/0")).split("/"))
+        except ValueError:
+            adv = dec = 0
+        if not (unconfirmed or dec - adv >= 2):
+            continue
+        pool = rec.get("persist_minus") or []
+        if not pool:
+            continue
+        name, score = pool[0]
+        here = (rec.get("sectors") or {}).get(name) or {}
+        then = (last.get("sectors") or {}).get(name) or {}
+        if here.get("day_ret") is None or then.get("day_ret") is None:
+            continue
+        rows.append({
+            "time": rec.get("time"), "sector": name, "persist": score,
+            "day_at": here["day_ret"], "day_close": then["day_ret"],
+            "move": then["day_ret"] - here["day_ret"],
+            "blocked": rec.get("pick") not in (None, "", "WAIT"),
+        })
+    return rows
+
+
+def render_divergence(rows: list[dict], target: str) -> str:
+    """One table for ``divergence_rows``: did the persistent faller keep falling?"""
+    if not rows:
+        return f"{target}: no divergence bar (index up and unconfirmed or narrow)"
+    lines = [f"Divergence study  {target}  (would a short on the PERSIST − leader have paid?)",
+             "  time   sector   persist  day@bar   day@close   move   long pick held the bar"]
+    for r in rows:
+        lines.append(f"  {r['time']}  {r['sector']:7s}  {r['persist']:6.0f}  "
+                     f"{r['day_at']:+7.2f}%  {r['day_close']:+9.2f}%  {r['move']:+6.2f}%  "
+                     f"{'yes' if r['blocked'] else 'no'}")
+    moves = [r["move"] for r in rows]
+    lines.append(f"  median move {sorted(moves)[len(moves) // 2]:+.2f}% over {len(rows)} bars"
+                 f" · {sum(1 for m in moves if m < 0)} of {len(moves)} kept falling")
+    return "\n".join(lines)
 
 
 def render_report(res: dict) -> str:

@@ -192,6 +192,8 @@ The pick reads the sector list, never a single sector in isolation:
 * **A sector has to be persistent to be picked at all.** `PICK_MIN_PERSIST` (50)
   is the floor the complementary path never had: it used to accept any sector
   that was merely not fighting the market, while SECTOR FOLLOW demanded 55.
+  `PICK_CONF_SCALED_FLOOR=1` moves that floor with the confidence (50 → 65 as
+  conf falls from 70 to 55), so a marginal call needs an exceptional sector.
 * **The pick does not flicker.** A challenger must beat the incumbent by
   `PICK_STICKY_MARGIN` (5) points to take the pick, so two sectors a couple of
   points apart stop trading it every bar (and the same stock stops being
@@ -201,6 +203,13 @@ The pick reads the sector list, never a single sector in isolation:
   `PERSIST + PHA qualified (score 56) · held — FMCG 59 is +3.0, needs 5 to take the pick`.
 * **Whatever is passed over is named**, with the number that did it:
   `PERSIST + FMCG persistent (score 60) · passed over PHA (rs -0.01)`.
+* **A block that trades nothing does not announce a direction.** `MARKET BULL
+  conf 41% WEAK` sat directly above `WAIT — market TRANSITION conf 41` on 16 Nov
+  11:55: a bullish call on a 5▲/10▼ tape that the engine then refused to act on.
+  Such a block now opens `MARKET STAND ASIDE  BULL lean · conf 41% WEAK`, names
+  the confidence it needs (`conf 41 < 55`) and still lists the day's movers on
+  both sides — `No pick · persistent movers  FMCG long 93 · REALTY short 91` —
+  because "which sectors are moving" is the question a WAIT used to leave open.
 
 ---
 
@@ -458,6 +467,12 @@ sector bot 1 would have refused — so they are shared, not forked.
 | `PICK_RS_MARGIN` | `0.05` | pp of RS a sector may give up and still complement the pick; `0` restores the bare `rs >= 0` test that skipped a persist-91 leader for reading `rs -0.01` |
 | `PICK_MIN_PERSIST` | `50` | persistence a sector needs before it can be picked at all (`0` = no floor). The complementary path used to accept anything not fighting the market, while SECTOR FOLLOW demanded 55: a sector that had been drifting all day could be picked over one that had actually held |
 | `PICK_STICKY_MARGIN` | `5` | points a challenger must beat the incumbent sector by to take the pick (`0` = switch on any margin). Two sectors 2–3 points apart used to trade the pick back and forth every bar, so the same stock was scanned in two sectors. The incumbent is only ever *held*, never *restored*: stale, below-floor or rolled-over and it is dropped at once — and the line says so: `held — FMCG 59 is +3.0, needs 5 to take the pick` |
+| `PICK_CONF_SCALED_FLOOR` | `0` | `1` makes the persistence floor rise as the confidence falls: `PICK_MIN_PERSIST` (50) at `conf ≥ 70`, `PICK_LOWCONF_MIN_PERSIST` (65) at the conf-55 gate, linear between. On 16 Nov 09:35 a sector at **56** was bought on a **conf 56** bar — the best of a weak bunch, while the morning's persistent sector was REALTY (66/76/69 on PERSIST −) and the long side never got above 59. The three paths already sat on that gradient (50 complementary / 55 follow / 65 weak day); only the first was fixed. The alert says the effective floor: `passed over PHA (persist 56 < 64)` |
+| `PICK_LOWCONF_MIN_PERSIST` | `65` | the floor at the confidence gate when the floor is scaled |
+| `DIVERGENCE_SHORT` | `0` | `1` lets the **persistent faller** be shorted while the index itself is up. `commit_side == BULL` only says the index is on the up side — it does not say the up-move is confirmed, so the short needs the index up **and** one of: `MTF < 3`, `conf < PICK_CONF_GOOD` (70), or breadth against it (`dec − adv ≥ 2`). 16 Nov was `MTF 2/3` and `conf 29–56` all morning (REALTY 66 → 76 → 69 on `PERSIST −`, nothing tradeable) and `5▲/10▼` by 11:55 (REALTY 91). Mirrored gates on the sector: `persist_bear ≥ DIVERGE_MIN_PERSIST` (65), not stale, `day ≤ −0.20%`, `range pos ≤ 40`, `rs < 0`, bearish flow, not bouncing. **One pick per bar, long side first** — the short only replaces a `WAIT`; the block marks it `· short on divergence`. `0` keeps the pick aligned with Nifty |
+| `DIVERGE_MIN_PERSIST` | `65` | `persist_bear` a sector needs for that short (see `DIVERGENCE_SHORT`) |
+| `SECTOR_FOLLOW_WEAK_MIN_PERSIST` | `65` | persistence the weak-day path needs (see below); the NEUTRAL path keeps `SECTOR_FOLLOW_MIN_PERSIST` (55) |
+| `SECTOR_FOLLOW_ON_WEAK` | `0` | `1` lets a **weak but directional** market follow a plainly leading sector. Two gates used to leave a gap between them on 16 Nov 11:55 — `MARKET BULL conf 41% WEAK`, `PERSIST + FMCG 93`, `PERSIST − REALTY 91`, `WAIT`: the picker stands aside below conf 55 and the sector-follow path only ran with *no* committed side, so a day with a direction it did not trust had no path to a sector at all. `1` falls back to the strict `SECTOR_FOLLOW` gates (up on the day, upper half of the range, positive RS, bullish flow, not rolling over) on a weak **BULL** only, with a higher persistence floor than the NEUTRAL case — `SECTOR_FOLLOW_WEAK_MIN_PERSIST` (65) against 55 — because on a weak day only the exception is worth following. `0` is the locked rule: conf < 55 stands aside. The pick stays one-sided: on a committed BULL bar the top of `PERSIST −` is a reading, never a pick |
 
 `python -m nse_scanner doctor` prints the ones that change behaviour most
 (`first minute → up to N min early`, `market source`, `re-projections after a

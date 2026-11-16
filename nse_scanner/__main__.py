@@ -149,11 +149,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "backtest":
         from datetime import date as _date
         from pathlib import Path
-        from .backtest import replay_session, render_report
+        from .backtest import (divergence_rows, render_divergence, replay_session,
+                               render_report)
 
         d = _date.fromisoformat(args.date)
         res = replay_session(d)
-        text = render_report(res)
+        text = render_report(res) + "\n\n" + render_divergence(
+            divergence_rows(res.get("path") or []), args.date)
         outp = Path("state") / f"backtest_{args.date}.txt"
         outp.parent.mkdir(parents=True, exist_ok=True)
         outp.write_text(text + "\n", encoding="utf-8")
@@ -222,10 +224,18 @@ def _doctor() -> int:
           f"market block on a {_conf_delta()}-point conf move · "
           f"breakeven stop after T1 {'on' if breakeven_after_t1() else 'off'}")
     lag = sector_max_lag_bars()
+    from .market import (conf_scaled_floor, divergence_short, diverge_min_persist,
+                         follow_on_weak, lowconf_min_persist, weak_follow_min_persist)
+    floor = (f"persist floor {pick_min_persist():.0f}->{lowconf_min_persist():.0f} as conf falls"
+             if conf_scaled_floor() else f"persist floor {pick_min_persist():.0f}")
     print(f"sector pick: rs margin {pick_rs_margin():.2f}pp · "
-          f"persist floor {pick_min_persist():.0f} · "
+          f"{floor} · "
           f"hold the incumbent by {pick_sticky_margin():.0f} · "
-          f"index freshness {'off' if lag < 0 else f'{lag} bars'}")
+          f"index freshness {'off' if lag < 0 else f'{lag} bars'} · "
+          + (f"weak-day follow on (BULL only, persist >= {weak_follow_min_persist():.0f})"
+             if follow_on_weak() else "weak-day follow off (conf < 55 stands aside)")
+          + (f" · divergence short on (persist >= {diverge_min_persist():.0f})"
+             if divergence_short() else " · divergence short off"))
     from .scan1m import early_retries, leader_catchup, leader_max_minutes, leader_max_r
     catchup = (f"on (max {leader_max_minutes()} min old, <= {leader_max_r():.1f}R)"
                if leader_catchup() else "off")

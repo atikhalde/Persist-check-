@@ -68,6 +68,17 @@ SECTOR_SMOOTH = 5
 RECENT_FLOW_BARS = 4
 VOL_SCALE_REF = 14.0
 VIX_SPIKE = 4.0
+# Confidence the complementary pick needs before it will name a sector. Below it
+# the block says WAIT — and, by the locked rule, nothing is scanned. It was a
+# literal 55 in three places; a WAIT block could not say what it waits for.
+PICK_MIN_CONF = 55
+# A divergence day: the index is up but the sectors are not (16 Nov 11:55 was
+# Nifty +0.44% with 5 advancing sectors against 10 falling).
+DIVERGE_SPREAD = 2
+# With PICK_CONF_SCALED_FLOOR the persistence floor rises as the confidence
+# falls: pick_min_persist() at this confidence, PICK_LOWCONF_MIN_PERSIST at the
+# 55 gate. 16 Nov 09:35 picked a sector at 56 on a conf-56 bar.
+PICK_CONF_GOOD = 70
 CONCRETE_COMMIT = 2
 CONCRETE_MIN_CONF = 65
 CONCRETE_WARMUP = 3
@@ -170,6 +181,7 @@ class MarketDecision:
     dir_label: str
     dir_conf: int
     dir_tier: str
+    commit_side: int
     breadth_adv: int
     breadth_dec: int
     regime: str
@@ -415,7 +427,8 @@ def run_market(
     vwap = float(last_row["VWAP"])
     npos = _pos_in_range(n_close, n_high, n_low)
     dir_conf = _dir_conf(mtf_bull, mtf_bear, above_vwap, below_vwap, adx, npos, dir_state, last_or_up, last_or_dn, last_slope)
-    dir_tier = "TREND-LOCK" if dir_conf >= 85 else "STRONG" if dir_conf >= 70 else "BUILDING" if dir_conf >= 55 else "WEAK"
+    dir_tier = ("TREND-LOCK" if dir_conf >= 85 else "STRONG" if dir_conf >= 70
+                else "BUILDING" if dir_conf >= PICK_MIN_CONF else "WEAK")
 
     # Prefer concrete if committed
     commit_side = concrete if concrete != 0 else dir_state
@@ -474,7 +487,8 @@ def run_market(
     # Persistence is a smoothed score: without this, two sectors a couple of
     # points apart trade the pick back and forth on consecutive candles.
     pick, pick_side, reason = _sticky_pick(
-        pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps
+        pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps,
+        floor=persist_floor(dir_conf),
     )
 
     action = "WAIT"
@@ -484,13 +498,21 @@ def run_market(
         action = "SCAN SHORT"
     extra_sectors: list[str] = []
     flow_aligned: list[str] = []
-    if not pick and commit_side == 0:
-        leaders = _follow_leaders(persist_plus)
-        if leaders:
-            pick, pick_side, action = leaders[0].name, 1, "SCAN LONG"
-            extra_sectors = [s.name for s in leaders[1:]]
-            flow_aligned = [s.name for s in leaders if s.qualified]
-            reason = _follow_reason(leaders)
+    # One pick per bar, and the long side comes first: the divergence short may
+    # only replace a WAIT, never a pick that already exists.
+    if not pick:
+        follow = _follow_fallback(pick, commit_side, dir_conf, persist_plus)
+        if follow:
+            pick, pick_side, action = follow["pick"], follow["side"], follow["action"]
+            extra_sectors, flow_aligned = follow["extra"], follow["aligned"]
+            reason = follow["reason"]
+        else:
+            diverge = _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec,
+                                        persist_minus, prev_pick,
+                                        mtf_bull=mtf_bull, dir_conf=dir_conf)
+            if diverge:
+                pick, pick_side, action = diverge["pick"], diverge["side"], diverge["action"]
+                reason = diverge["reason"]
 
     return MarketDecision(
         session=str(sid),
@@ -506,6 +528,7 @@ def run_market(
         dir_label=dir_label,
         dir_conf=int(dir_conf),
         dir_tier=dir_tier,
+        commit_side=commit_side,
         breadth_adv=breadth_adv,
         breadth_dec=breadth_dec,
         regime=regime,
@@ -801,7 +824,7 @@ def _is_leading(s, need: float) -> bool:
     )
 
 
-def _follow_leaders(plus) -> list:
+def _follow_leaders(plus, need: float | None = None) -> list:
     """Sectors to scan LONG while Nifty itself is NEUTRAL (no committed side).
 
     The complementary pick needs a committed Nifty direction, so on a flat index
@@ -818,16 +841,20 @@ def _follow_leaders(plus) -> list:
     then by persist score. The first is the pick; the rest are scanned with it,
     so a quiet leader does not hide an entry in the next one.
 
-    Longs only — a flat index gives no reason to short a weak sector.
+    Longs only — a flat index gives no reason to short a weak sector, and the
+    pick is one-sided by rule: on a committed BULL bar only PERSIST + is usable,
+    so the top of PERSIST − is a reading on the block, never a pick.
     ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (55) is
-    the score needed, ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
+    the score needed (``need`` overrides it — the weak-day path demands more),
+    ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
     """
     if os.environ.get("SECTOR_FOLLOW", "1") == "0" or not plus:
         return []
-    try:
-        need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
-    except ValueError:
-        need = 55.0
+    if need is None:
+        try:
+            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
+        except ValueError:
+            need = 55.0
     try:
         most = max(1, int(os.environ.get("SECTOR_FOLLOW_MAX") or 2))
     except ValueError:
@@ -843,7 +870,7 @@ def _manual_aligned() -> set:
     return {x.strip().upper() for x in raw.split(",") if x.strip()}
 
 
-def _follow_reason(leaders) -> str:
+def _follow_reason(leaders, note: str = "Nifty NEUTRAL") -> str:
     s = leaders[0]
     manual = _manual_aligned()
     notes = [f"persist {s.persist_bull:.0f}", f"day {s.day_ret:+.2f}%", f"range pos {s.pos:.0f}"]
@@ -851,10 +878,37 @@ def _follow_reason(leaders) -> str:
         notes.append("flow aligned")
     if s.name in manual:
         notes.append("chart aligned")
-    text = f"{SECTOR_FOLLOW_PREFIX} — Nifty NEUTRAL, {s.name} leads ({', '.join(notes)})"
+    text = f"{SECTOR_FOLLOW_PREFIX} — {note}, {s.name} leads ({', '.join(notes)})"
     if len(leaders) > 1:
         text += "; also scanning " + ", ".join(f"{x.name} {x.persist_bull:.0f}" for x in leaders[1:])
     return text
+
+
+def _follow_fallback(pick, commit_side, dir_conf, plus):
+    """Fallback pick when the complementary path stood aside, or ``None``.
+
+    ``commit_side == 0`` is the original case (Nifty has no side at all).
+    ``SECTOR_FOLLOW_ON_WEAK=1`` adds "has a side, but too weak to pick with it".
+    """
+    if pick:
+        return None
+    if commit_side == 0:
+        note, need = "Nifty NEUTRAL", None
+    elif follow_on_weak() and commit_side == 1 and dir_conf < PICK_MIN_CONF:
+        note, need = f"Nifty BULL weak ({dir_conf}%)", weak_follow_min_persist()
+    else:
+        return None
+    leaders = _follow_leaders(plus, need)
+    if not leaders:
+        return None
+    return {
+        "pick": leaders[0].name,
+        "side": 1,
+        "action": "SCAN LONG",
+        "reason": _follow_reason(leaders, note),
+        "extra": [s.name for s in leaders[1:]],
+        "aligned": [s.name for s in leaders if s.qualified],
+    }
 
 
 def _follow_pick(plus):
@@ -865,8 +919,8 @@ def _follow_pick(plus):
 
 def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_day_ret):
     """Strongest persistent sector on the SAME side as committed Nifty direction."""
-    if commit_side == 0 or regime == "CHOP" or dir_conf < 55:
-        return None, 0, f"WAIT — market {regime} conf {dir_conf}"
+    if commit_side == 0 or regime == "CHOP" or dir_conf < PICK_MIN_CONF:
+        return None, 0, f"WAIT — market {regime} conf {dir_conf} < {PICK_MIN_CONF}"
     # VIX spike against the day → stand aside
     if vix_chg >= VIX_SPIKE and ((commit_side == 1 and n_day_ret < 0) or (commit_side == -1 and n_day_ret > 0)):
         return None, 0, f"WAIT — VIX spike {vix_chg:.1f}% fights direction"
@@ -874,7 +928,7 @@ def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_d
     pool = plus if commit_side == 1 else minus
     want_side = commit_side
     margin = max(0.0, pick_rs_margin())
-    floor = max(0.0, pick_min_persist())
+    floor = persist_floor(dir_conf)
     passed: list[str] = []
     for s in pool[:3]:
         ok, why = _complements(s, want_side, margin)
@@ -957,6 +1011,49 @@ def pick_min_persist() -> float:
         return 50.0
 
 
+def conf_scaled_floor() -> bool:
+    """Does the persistence floor rise as the confidence falls (``0``)?
+
+    The three paths already sat on a gradient — 50 for the complementary pick,
+    55 for ``SECTOR FOLLOW``, 65 for a weak day — which reads as "the less index
+    confirmation, the more the sector has to prove". Only the first number was
+    fixed, so on 16 Nov 09:35 a sector at persist 56 was bought on a conf-56 bar:
+    the best of a weak bunch, on the morning the persistent sector was REALTY
+    (66/76/69 on PERSIST −) and the long side never got above 59.
+
+    With this on, the complementary floor moves along the same gradient:
+    ``pick_min_persist()`` at ``PICK_CONF_GOOD`` (70) and up to
+    ``PICK_LOWCONF_MIN_PERSIST`` (65) at the 55 gate. Default ``0`` = flat floor.
+    """
+    return os.environ.get("PICK_CONF_SCALED_FLOOR", "0") != "0"
+
+
+def lowconf_min_persist() -> float:
+    """Floor at the confidence gate when the floor is confidence-scaled (65)."""
+    try:
+        return float(os.environ.get("PICK_LOWCONF_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
+
+
+def persist_floor(dir_conf: int | None = None) -> float:
+    """Persistence the picked sector needs at this confidence.
+
+    ``PICK_MIN_PERSIST`` (50) flat by default; with ``PICK_CONF_SCALED_FLOOR=1``
+    it interpolates to ``PICK_LOWCONF_MIN_PERSIST`` (65) at the 55 gate.
+    ``dir_conf=None`` returns the flat floor (callers with no confidence at hand).
+    """
+    base = max(0.0, pick_min_persist())
+    if not conf_scaled_floor() or base <= 0 or dir_conf is None:
+        return base
+    top = max(base, lowconf_min_persist())
+    if dir_conf >= PICK_CONF_GOOD:
+        return base
+    span = max(1, PICK_CONF_GOOD - PICK_MIN_CONF)
+    frac = max(0.0, min(1.0, (PICK_CONF_GOOD - dir_conf) / span))
+    return base + (top - base) * frac
+
+
 def pick_sticky_margin() -> float:
     """Points a challenger must beat the incumbent sector by to take the pick (5).
 
@@ -972,6 +1069,137 @@ def pick_sticky_margin() -> float:
         return 5.0
 
 
+def follow_on_weak() -> bool:
+    """May the sector-follow path run when Nifty *has* a side but is weak (``0``)?
+
+    Two gates sat next to each other and neither opened on 16 Nov 11:55:
+    ``_complementary_pick`` stands aside below ``PICK_MIN_CONF`` (41 < 55), and
+    ``_follow_leaders`` only ran with **no** committed side at all. A tape that
+    read ``MARKET BULL conf 41% WEAK``, ``PERSIST + FMCG 93``, ``PERSIST − REALTY
+    91`` therefore had no path to a sector: the picker refused the direction's
+    confidence and the fallback refused the direction's existence.
+
+    With this on, a *weak* committed BULL falls back to the same strict leader
+    gates the NEUTRAL case uses (persist >= 55, up on the day, upper part of the
+    range, positive RS, bullish live flow, not rolling over) — much stricter
+    than the complementary path it replaces. Longs only: the bear mirror is not
+    written, so a weak BEAR still waits.
+
+    Default ``0``: the locked rule (conf < 55 -> no scan) is unchanged unless you
+    ask for it. ``SECTOR_FOLLOW=0`` still turns both paths off.
+    """
+    return os.environ.get("SECTOR_FOLLOW_ON_WEAK", "0") != "0"
+
+
+def weak_follow_min_persist() -> float:
+    """Persistence a sector needs when the *index* is the thing that is unsure (65).
+
+    A weak day is followed only by the exception, not the marginal case: the
+    index is offering no help, so the sector has to be plainly persistent
+    (``SECTOR_FOLLOW_MIN_PERSIST`` is 55, the NEUTRAL-market floor).
+    """
+    try:
+        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
+
+
+def divergence_short() -> bool:
+    """May a PERSIST − short be taken while the index itself is up (``0``)?
+
+    The complementary rule is one-sided on purpose: the pick must agree with
+    Nifty. That leaves one tape untradeable — the index held up by a few names
+    while most sectors fall (16 Nov 11:55: Nifty +0.44%, breadth 5▲/10▼, REALTY
+    the persistent faller at 91). Nothing there is a *bug*: a BULL bar has no
+    short pool. This is the rule that would trade it, and it is deliberately
+    narrow — index up, breadth clearly against it, and the sector has to be
+    breaking down on every mirrored gate.
+
+    Default ``0``: the rule is untested live and it shorts into a rising index.
+    ``DIVERGE_MIN_PERSIST`` (65) is the persistence it demands.
+    """
+    return os.environ.get("DIVERGENCE_SHORT", "0") != "0"
+
+
+def diverge_min_persist() -> float:
+    """Persistence a PERSIST − sector needs for a divergence short (65)."""
+    try:
+        return float(os.environ.get("DIVERGE_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
+
+
+def _is_breaking_down(s, need: float) -> bool:
+    """Mirror of ``_is_leading`` for the short side.
+
+    Down on the day, in the lower part of its range, negative RS, bearish flow,
+    and not currently bouncing back (``recent`` below the same threshold the long
+    side uses for "rolling over", with the sign flipped).
+    """
+    return bool(
+        s.side == -1 and s.persist_bear >= need
+        and not getattr(s, "stale", False)
+        and s.day_ret <= -BULL_MIN_DAY and s.pos <= BEAR_MAX_POS and s.rs < 0
+        and s.bear >= FLOW_MIN and s.recent < RECENT_MOVE_MIN
+    )
+
+
+def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus,
+                      prev=None, mtf_bull: int = 3, dir_conf: int = 99):
+    """The persistent faller, when the index is up but is not a real uptrend.
+
+    ``commit_side == 1`` only says the index is on the up side; it does not say
+    the up-move is confirmed. Two things in this engine do:
+
+    * **the timeframes agree** — ``MTF 3/3``. 16 Nov was ``MTF 2/3`` at every bar
+      of the morning (09:15, 09:30, 09:35) and 3/3 only at 11:55;
+    * **the confidence is not marginal** — below ``PICK_CONF_GOOD`` (70) the
+      engine is itself unsure of the direction.
+
+    Either one failing is a *divergence day*: the index is up, but on evidence it
+    cannot back. The other pattern is the narrow market — ``5▲/10▼`` breadth with
+    the index up, i.e. a couple of names carrying it.
+
+    Requiring the breadth to be against the index (the first version) missed the
+    whole of 16 Nov's morning: breadth was 10▲/5▼ → 9▲/6▼ → 8▲/7▼ while REALTY
+    was the persistent faller (66 → 76 → 69) and nothing could be shorted.
+
+    One pick per bar: this only runs when the long side has nothing, so the
+    "one side only" rule is intact — the short replaces a WAIT, never a long.
+    """
+    if not divergence_short() or commit_side != 1 or n_day_ret <= 0 or not minus:
+        return None
+    unconfirmed = mtf_bull < 3 or dir_conf < PICK_CONF_GOOD
+    narrow = breadth_dec - breadth_adv >= DIVERGE_SPREAD
+    if not (unconfirmed or narrow):
+        return None
+    need = diverge_min_persist()
+    candles = [s for s in list(minus)[:3] if _is_breaking_down(s, need)]
+    if not candles:
+        return None
+    best = candles[0]
+    held = False
+    if prev and prev.get("side") == -1:
+        # same hysteresis as the pick: two persistent fallers must not trade the
+        # short back and forth
+        keep = next((s for s in minus if s.name == prev.get("name")), None)
+        if keep is not None and keep in candles and \
+                keep.persist_bear + pick_sticky_margin() > best.persist_bear:
+            best, held = keep, True
+    why = " · ".join(x for x in (
+        f"MTF {mtf_bull}/3" if mtf_bull < 3 else "",
+        f"conf {dir_conf}%" if dir_conf < PICK_CONF_GOOD else "",
+        f"breadth {breadth_adv}▲/{breadth_dec}▼" if narrow else "") if x)
+    reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but {why}; "
+              f"{best.name} is breaking down (persist {best.persist_bear:.0f}, "
+              f"day {best.day_ret:+.2f}%, range pos {best.pos:.0f}, "
+              f"flow {best.bear:.0f} bear)")
+    if held:
+        reason += f" · held over {candles[0].name} (within {pick_sticky_margin():.0f})"
+    return {"pick": best.name, "side": -1, "action": "SCAN SHORT", "reason": reason,
+            "extra": [], "aligned": []}
+
+
 def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
     """The sector snapshot for ``name`` on this side, or None."""
     pool = list(plus if want_side == 1 else minus)
@@ -985,7 +1213,7 @@ def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
     return None
 
 
-def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None):
+def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None, floor=None):
     """Hold the incumbent pick unless a challenger clearly beats it.
 
     ``prev`` is the pick in force on the previous candle (``{"name", "side"}``).
@@ -1009,7 +1237,7 @@ def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None):
     if not ok:
         return pick, pick_side, reason
     inc_score = _persist_of(incumbent, side)
-    if inc_score < max(0.0, pick_min_persist()):
+    if inc_score < (max(0.0, pick_min_persist()) if floor is None else floor):
         return pick, pick_side, reason
     new_score = _persist_of(challenger, pick_side)
     if new_score - inc_score >= margin:
