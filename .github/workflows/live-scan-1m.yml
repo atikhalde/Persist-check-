@@ -128,9 +128,11 @@ jobs:
           SCAN1M_MAX_STALE_SECONDS: ${{ vars.SCAN1M_MAX_STALE_SECONDS || '100' }}
           SCAN1M_GRACE_SECONDS: ${{ vars.SCAN1M_GRACE_SECONDS || '6' }}
           SCAN1M_EARLY_PER_DAY: ${{ vars.SCAN1M_EARLY_PER_DAY || '1' }}
-          # own: this loop decides the sector/side itself (same market engine).
-          # ledger: reuse the 5m scan's pick from state/scan_state.json — only
-          # meaningful when that file is present on this runner.
+          # own: this loop decides the sector/side itself (same market engine)
+          # and projects the forming candle's pick, which is what gives bot 3
+          # its lead. ledger: reuse the 5m scan's pick from state/scan_state.json
+          # — closed candles only, so nothing can be projected and the lead is
+          # lost; only meaningful when that file is present on this runner.
           SCAN1M_MARKET_SOURCE: ${{ vars.SCAN1M_MARKET_SOURCE || 'own' }}
           # 1 = also report a projection that did not survive the close.
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}

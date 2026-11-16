@@ -210,8 +210,11 @@ def _doctor() -> int:
         print("Telegram bot 3 (1m scan): not configured (live-1m prints instead of sending)")
     from .scan1m import cancel_message, first_minute, market_source
     fm = first_minute()
+    source = market_source()
+    lead = ("(pick projected from the forming candle)" if source != "ledger"
+            else "(no projection — the ledger holds closed candles only)")
     print(f"1m scan knobs: first minute {fm} (up to {5 - fm} min early) · "
-          f"market source {market_source()} · "
+          f"market source {source} {lead} · "
           f"cancel messages {'on' if cancel_message() else 'off'}")
     if token and chat:
         ok = telegram.send("NSE scanner doctor ping", dry_run=os.environ.get("DRY_RUN") == "1")

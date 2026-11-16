@@ -1,5 +1,10 @@
 # One-line hit alerts — replay on PNB, 11 Nov 2026
 
+> **Superseded in one respect (2026-11-16).** A trade no longer survives its
+> session: positions are dropped at the rollover instead of being trailed across
+> days (see `docs/live-defects-2026-11-16.md` §3). Everything below about *how*
+> a hit / stop / exit is detected and reported still holds.
+
 Scope: alerting only. Targets, the stop rule, ATR sizing and exit behaviour are
 unchanged. Each completed 5m candle is now checked for three events, and each event
 is sent as **one line**:

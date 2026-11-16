@@ -130,8 +130,9 @@ jobs:
           restore-keys: |
             nse-scan-state-${{ steps.ist.outputs.day }}-
             nse-scan-state-
-          # The second prefix restores the last session's open EMA9 trails.
-          # reset_if_new_day clears sent entries but keeps open positions.
+          # The second prefix restores today's ledger (an open EMA9 trail after
+          # a restart). A trade is intraday: reset_if_new_day drops positions
+          # entered on an earlier session instead of trailing them on today's bars.
 
       - name: Live loop (early pass before each 5m close, confirm after it)
         id: scan

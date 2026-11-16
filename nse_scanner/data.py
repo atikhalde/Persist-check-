@@ -204,6 +204,50 @@ def provisional_5m(df5: pd.DataFrame | None, df1m: pd.DataFrame | None, bar, now
     return pd.concat([done[["Open", "High", "Low", "Close", "Volume"]], row])
 
 
+def project_volume(frame: pd.DataFrame | None, df1m: pd.DataFrame | None, bar,
+                   minutes: int = 5) -> pd.DataFrame | None:
+    """Scale the still-forming candle's volume to a full-candle estimate.
+
+    ``provisional_5m`` sums the 1m prints seen so far, so at minute 1 of a 5m
+    candle it reports about a fifth of the volume the completed candle will
+    have. Every volume reader in the engine then under-reads: ``rel_vol`` (the
+    ``>= 0.2`` entry gate), ``vol_sc`` in the score (15 points need
+    ``rel_vol > 1.5``) and ``total > 60`` that gates ``entry_buy``. A name whose
+    completed candle would score 65 therefore shows 60 — no projection — until
+    the candle is nearly over, which is why a projected alert could arrive at
+    the same minute as the 5m scan's own entry.
+
+    Scaling the forming bar by ``minutes / elapsed`` is the same estimate as
+    "this much per minute so far, for the rest of the candle". It is exact at
+    the close (``elapsed == minutes`` → factor 1.0), so the *confirmed* frame —
+    the one both scans judge at the close — is untouched: only the projection
+    is affected, and only forward in time.
+
+    No-op when the last row is not ``bar`` (no forming candle), when there are
+    no 1m prints inside the candle, or when the prints already cover it.
+    """
+    if frame is None or frame.empty or df1m is None or df1m.empty:
+        return frame
+    bar = pd.Timestamp(bar)
+    end = bar + pd.Timedelta(minutes=minutes)
+    if pd.Timestamp(frame.index[-1]) != bar:
+        return frame
+    part = df1m.loc[(df1m.index >= bar) & (df1m.index < end)].dropna(subset=["Close"])
+    if part.empty:
+        return frame
+    # Minutes covered by the prints seen so far: 1 for the 09:15 print, 5 once
+    # the last print of the candle (hh:mm+4) is in. A lagging feed therefore
+    # scales by the data it actually has, never by the wall clock.
+    covered = int((part.index[-1] - bar).total_seconds() // 60) + 1
+    covered = max(1, min(int(minutes), covered))
+    if covered >= minutes:
+        return frame
+    out = frame.copy()
+    out.iloc[-1, out.columns.get_loc("Volume")] = (
+        float(frame["Volume"].iloc[-1]) * (minutes / covered))
+    return out
+
+
 def resample_1m_to_5m(df1m: pd.DataFrame) -> pd.DataFrame:
     """Aggregate 1m OHLCV to NSE 5m bars (label = bar open)."""
     if df1m is None or df1m.empty:

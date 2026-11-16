@@ -80,7 +80,7 @@ class Scan1mFixture(TestCase):
             patch.object(state, "STATE_PATH", self.dir / "scan_state.json"),
             patch.object(scan1m, "now_ist", side_effect=lambda: self.now),
             patch.object(scan1m, "pick_for",
-                         side_effect=lambda bar, projection, force_sector=None: self.pick),
+                         side_effect=lambda bar, projection, force_sector=None, now=None: self.pick),
             patch.object(scan1m.data, "load_universe", return_value=self.universe),
             patch.object(scan1m.data, "yahoo_stock", side_effect=lambda raw: raw + ".NS"),
             patch.object(scan1m.data, "fetch_many", side_effect=self.fetch),

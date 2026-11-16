@@ -16,6 +16,19 @@ This module adds the missing mode as its own scan, on its own bot:
   liquidity/score gates, same market pick, same side, same EMA9 stop and pivot
   targets. Nothing about the rules is forked
   here; only *when* the alert is emitted;
+* the **market/sector pick is projected the same way** (``projected_market``):
+  Nifty, VIX and every sector index get the same forming bar, so the pick can
+  move *during* the candle instead of only at its close. Judging the forming
+  candle with the **previous** candle's pick made bot 3 blind on exactly the
+  candle that matters — the one where the market flips to a new sector, which
+  is the candle that sector's leader fires on — so its only message was the same
+  entry as bot 1 at the same second, while the followers that fired later got
+  the early alert;
+* the forming bar's **volume is finished from the prints so far**
+  (``data.project_volume``), because ``rel_vol`` and the score's ``vol_sc`` read
+  a fifth of the candle at minute 1: a name whose completed candle scores 65
+  showed 60 and was not projected until the candle was nearly over. The scale is
+  exactly 1.0 at the close, so the confirmed stream is unchanged;
 * at the candle's close the completed candle is evaluated again and the
   **confirmed** entry is sent to the same bot. A projection that does not
   survive the close is dropped silently (``SCAN1M_CANCEL_MESSAGE=1`` to report
@@ -37,6 +50,11 @@ Configuration (environment):
 ``SCAN1M_CANCEL_MESSAGE``    ``1`` also report a projection that failed (0)
 ``SCAN1M_SUMMARY``           ``1`` send a session summary at 15:33 (1)
 ===========================  ====================================================
+
+``SCAN1M_MARKET_SOURCE=ledger`` reads the 5m scan's pick and can therefore only
+ever lag it by a candle: the 5m ledger holds closed candles, and there is then
+nothing to project. ``own``/``auto`` project the forming candle itself, which is
+what gives bot 3 its lead.
 """
 
 from __future__ import annotations
@@ -220,11 +238,8 @@ def _own_market(decision_bar: datetime, force_sector: str | None = None):
     return md
 
 
-def _own_pick(decision_bar: datetime, force_sector: str | None = None) -> dict | None:
-    """Compute the pick the same way the 5m scan does, on the decision bar."""
-    md = _own_market(decision_bar, force_sector)
-    if md is None:
-        return None
+def _pick_dict(md, *, projected: bool = False) -> dict:
+    """The pick fields both scans use, from a ``MarketDecision``."""
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
     return {
         "bar": md.bar_time,
@@ -234,27 +249,172 @@ def _own_pick(decision_bar: datetime, force_sector: str | None = None) -> dict |
         "conf": md.dir_conf,
         "extra": list(getattr(md, "extra_sectors", None) or ()) if scanning else [],
         "follow": bool(scanning and str(getattr(md, "pick_reason", "")).startswith("SECTOR FOLLOW")),
+        "projected": projected,
     }
 
 
-def pick_for(bar: datetime, *, projection: bool, force_sector: str | None = None) -> dict | None:
+def _own_pick(decision_bar: datetime, force_sector: str | None = None) -> dict | None:
+    """Compute the pick the same way the 5m scan does, on ``decision_bar``."""
+    md = _own_market(decision_bar, force_sector)
+    return _pick_dict(md) if md is not None else None
+
+
+def _ledger_pick(allowed: list[str]) -> dict | None:
+    """The 5m scan's own pick, if it is one of ``allowed`` (read-only)."""
+    scan = _five_minute_scan()
+    if scan.get("bar") not in allowed or not scan.get("sector"):
+        return None
+    return {
+        "bar": scan.get("bar"),
+        "sector": scan["sector"],
+        "side": int(scan["side"]) if scan.get("side") in (1, -1) else 0,
+        "label": scan.get("label") or "",
+        "conf": scan.get("conf") or 0,
+        "extra": list(scan.get("extra") or []),
+        "follow": bool(scan.get("follow")),
+        "projected": False,
+    }
+
+
+_index_daily: dict = {}          # session -> {symbol: daily frame} (index universe)
+
+
+def _index_universe() -> tuple[dict, dict]:
+    uni = data.load_universe()
+    index_map = {name: uni["sectors"][name]["index"] for name in SECTOR_ORDER
+                 if name in uni["sectors"]}
+    return uni, index_map
+
+
+def projected_market(bar: datetime, now: datetime, force_sector: str | None = None):
+    """``run_market`` on the STILL-FORMING candle ``bar`` — Nifty, VIX, sectors.
+
+    The 5m scan decides the pick from a candle's close, so while a candle is
+    forming the newest pick it has is the *previous* candle's. Reusing that pick
+    made the 1m scan blind on exactly the candle that matters most — the one
+    where the market flips to a new sector, which is the candle that sector's
+    leader fires on. Bot 3 then had nothing to project and its only message was
+    the same entry as bot 1 at the same second.
+
+    This rebuilds Nifty, VIX and every sector index exactly the way the stock
+    projection rebuilds a stock — completed 5m bars plus the forming candle from
+    the 1m prints — and runs the **unchanged** ``run_market`` on them. Same
+    rules, same windows, same persistence; only the last bar is projected.
+    Returns ``None`` when the forming candle cannot be built (no 1m prints for
+    the indices, a lagger, sanitation moving the bar), never a guess.
+    """
+    uni, index_map = _index_universe()
+    nifty, vix = uni["nifty"], uni["vix"]
+    syms = list(dict.fromkeys([nifty, vix, *index_map.values()]))
+    tickers = {sym: sym for sym in syms}
+    period_1d = os.environ.get("YF_PERIOD_1D", "90d")
+    sm5 = five_minute_history(tickers, bar)
+    sm1 = one_minute_frames(tickers, bar)
+    session = str(bar.date())
+    if _index_daily.get("session") != session:
+        _index_daily.clear()
+        _index_daily.update(session=session, frames=data.fetch_daily(syms, period_1d))
+    d1 = _index_daily.get("frames") or {}
+
+    def frame(sym: str):
+        df5 = sm5.get(sym)
+        if df5 is None or df5.empty:
+            return None
+        built = data.provisional_5m(df5, sm1.get(sym), bar, now, max_stale())
+        if built is None:
+            # No 1m prints for this index: Yahoo's own row for the candle is
+            # partial as well, which is still better than a stale bar.
+            built = df5.loc[df5.index <= pd.Timestamp(bar)]
+        return built if built is not None and not built.empty else None
+
+    nifty_5 = frame(nifty)
+    if nifty_5 is None:
+        return None
+    md = run_market(
+        nifty_5,
+        d1.get(nifty),
+        frame(vix),
+        d1.get(vix),
+        {name: frame(sym) for name, sym in index_map.items()},
+        {name: d1.get(sym) for name, sym in index_map.items()},
+    )
+    if md.bar_time != bar.strftime("%Y-%m-%d %H:%M"):
+        return None                  # sanitation moved the bar: not this candle
+    if force_sector:                 # ``--sector IT``: the 5m scan's override
+        forced = force_sector.upper()
+        if forced in uni["sectors"]:
+            md.pick_sector = forced
+            md.pick_side = md.dir_state if md.dir_state != 0 else 1
+            md.action = "SCAN LONG" if md.pick_side == 1 else "SCAN SHORT"
+            md.pick_reason = f"FORCED {forced}"
+    return md
+
+
+def _projection_pick(bar: datetime, now: datetime,
+                     force_sector: str | None = None) -> dict | None:
+    """The forming candle's own pick — projected, never guessed."""
+    if market_source() == "ledger":
+        return None                  # nothing to project from: closed bars only
+    try:
+        md = projected_market(bar, now, force_sector)
+    except Exception:
+        log.exception("projected market failed for %s", bar.strftime("%H:%M"))
+        return None
+    return _pick_dict(md, projected=True) if md is not None else None
+
+
+def pick_for(bar: datetime, *, projection: bool, force_sector: str | None = None,
+             now: datetime | None = None) -> dict | None:
     """Sector pick for the candle ``bar``.
 
-    ``projection=True``: judging the still-forming candle ``bar``, so only the
-    pick of the **last completed** candle (``bar - 5m``) is valid — a pick is a
-    persistence measure and is re-validated at that candle's close.
-    ``projection=False``: ``bar`` itself has just closed, so its own pick (or,
-    while the 5m scan is still finishing, the previous one) is accepted.
-    """
-    if projection:
-        allowed = [(bar - timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m-%d %H:%M")]
-        decision = bar - timedelta(minutes=BAR_MINUTES)
-    else:
-        allowed = [bar.strftime("%Y-%m-%d %H:%M"),
-                   (bar - timedelta(minutes=BAR_MINUTES)).strftime("%Y-%m-%d %H:%M")]
-        decision = bar
+    ``projection=True`` — judging the still-forming candle ``bar``. Three
+    sources, best first:
 
-    key = f"{decision:%Y-%m-%d %H:%M}|{projection}|{(force_sector or '').upper()}"
+    1. a pick the 5m scan has already written for ``bar`` itself;
+    2. **the forming candle's own verdict** (``projected_market``): the same
+       ``run_market`` rules on Nifty/VIX/sector frames whose last bar is rebuilt
+       from 1m prints. This is what lets bot 3 alert on the candle a sector
+       flips — minutes before bot 1, and on that sector's leader instead of on
+       the followers that fire later;
+    3. the pick of the last completed candle (``bar - 5m``) — the behaviour
+       before the projection existed, used whenever 2 cannot be computed.
+
+    ``projection=False`` — ``bar`` itself has just closed, so its own pick (or,
+    while the 5m scan is still finishing, the previous one) is accepted. This is
+    unchanged on purpose: the confirmed entry must use exactly bot 1's pick.
+    """
+    now = now or now_ist()
+    prev = bar - timedelta(minutes=BAR_MINUTES)
+    source = market_source()
+
+    if projection:
+        minute = int((now - bar).total_seconds() // 60)
+        key = f"{bar:%Y-%m-%d %H:%M}|proj|{minute}|{(force_sector or '').upper()}"
+        hit = _pick_cache.get(key)
+        if hit is not None and hit[1] is not None:
+            return hit[1]
+        found: dict | None = None
+        if source in ("ledger", "auto"):
+            found = _ledger_pick([bar.strftime("%Y-%m-%d %H:%M")])
+        if found is None:
+            found = _projection_pick(bar, now, force_sector)
+        if found is None and source in ("ledger", "auto"):
+            found = _ledger_pick([prev.strftime("%Y-%m-%d %H:%M")])
+        if found is None and source == "ledger":
+            _warn_ledger_once(prev)      # silent failure is the worst kind
+        if found is None and source in ("own", "auto"):
+            try:
+                found = _own_pick(prev, force_sector)
+            except Exception:
+                log.exception("market pick failed for %s", prev.strftime("%H:%M"))
+                found = None
+        if found is not None:
+            found = {**found, "projected": bool(found.get("projected"))}
+        _pick_cache[key] = (time.time(), found)
+        return found
+
+    allowed = [bar.strftime("%Y-%m-%d %H:%M"), prev.strftime("%Y-%m-%d %H:%M")]
+    key = f"{bar:%Y-%m-%d %H:%M}|confirm|{(force_sector or '').upper()}"
     hit = _pick_cache.get(key)
     if hit:
         cached = hit[1]
@@ -263,27 +423,17 @@ def pick_for(bar: datetime, *, projection: bool, force_sector: str | None = None
             return cached
 
     found: dict | None = None
-    source = market_source()
     if source in ("ledger", "auto"):
-        scan = _five_minute_scan()
-        if scan.get("bar") in allowed and scan.get("sector"):
-            found = {
-                "bar": scan.get("bar"),
-                "sector": scan["sector"],
-                "side": int(scan["side"]) if scan.get("side") in (1, -1) else 0,
-                "label": scan.get("label") or "",
-                "conf": scan.get("conf") or 0,
-                "extra": list(scan.get("extra") or []),
-                "follow": bool(scan.get("follow")),
-            }
+        found = _ledger_pick(allowed)
     if found is None and source == "ledger":
-        _warn_ledger_once(decision)          # silent failure is the worst kind
+        _warn_ledger_once(bar)               # silent failure is the worst kind
     if found is None and source in ("own", "auto"):
         try:
-            found = _own_pick(decision, force_sector)
+            found = _own_pick(bar, force_sector)
         except Exception:
-            log.exception("market pick failed for %s", decision.strftime("%H:%M"))
+            log.exception("market pick failed for %s", bar.strftime("%H:%M"))
             found = None
+    found = None if found is None else {**found, "projected": False}
     _pick_cache[key] = (time.time(), found)
     return found
 
@@ -391,14 +541,30 @@ def _in_session(bar: datetime) -> bool:
 
 
 def projected_frame(df5: pd.DataFrame | None, df1m: pd.DataFrame | None,
-                    bar: datetime, now: datetime) -> pd.DataFrame | None:
-    """Completed 5m bars + the still-forming ``bar`` rebuilt from 1m prints."""
+                    bar: datetime, now: datetime,
+                    *, project_volume: bool = True) -> pd.DataFrame | None:
+    """Completed 5m bars + the still-forming ``bar`` rebuilt from 1m prints.
+
+    ``project_volume`` finishes the forming candle's volume from the prints seen
+    so far (``data.project_volume``). Without it every volume reader — ``rel_vol``
+    (the ``>= 0.2`` entry gate), ``vol_sc`` in the score and ``total > 60`` — reads
+    a fifth of the candle at minute 1, so a name whose completed candle scores 65
+    shows 60 and is not projected until the candle is nearly over. That is how a
+    "4 minutes early" alert ended up in the same minute as the 5m scan's entry.
+
+    The scale is exact at the close (factor 1.0), so the confirmed frame judged
+    by ``closed_frame`` is untouched: this changes only how early a projection
+    can appear, never what the close confirms.
+    """
     if df5 is None or df5.empty or df1m is None or df1m.empty:
         return None
     frame = data.provisional_5m(df5, df1m, bar, now, max_stale())
     if frame is None:
         return None
-    return data.apply_1m_volume(frame, df1m)
+    frame = data.apply_1m_volume(frame, df1m)
+    if project_volume:
+        frame = data.project_volume(frame, df1m, bar)
+    return frame
 
 
 def closed_frame(df5: pd.DataFrame | None, df1m: pd.DataFrame | None,
@@ -485,6 +651,17 @@ def format_confirmed(sig, scan: dict, plan, *, early: dict | None, sector: str,
     return head + text
 
 
+_SKIP_LABEL = {
+    "no_signal": "no signal on the forming candle",
+    "no_1m_frame": "1m feed missing/stale",
+    "no_stop": "no valid EMA9 stop yet",
+    "oi": "open interest",
+    "late": "finished too late",
+    "at_close": "finished at the close",
+    "error": "engine error",
+}
+
+
 def format_summary(st: dict) -> str:
     from .pipeline import _summary_rejects, _summary_sectors
 
@@ -493,9 +670,18 @@ def format_summary(st: dict) -> str:
              f"Candles confirmed {stats.get('candles', 0)} · with a sector pick {stats.get('picks', 0)}",
              _summary_sectors(stats),
              f"Projected alerts {stats.get('early', 0)} · of which confirmed at the close "
-             f"{stats.get('confirmed', 0)} · did not hold {stats.get('cancelled', 0)}",
-             f"Entries (close-confirmed, sent to this bot) {stats.get('confirmed', 0)}",
-             _summary_rejects(st)]
+             f"{stats.get('confirmed', 0)} · did not hold {stats.get('cancelled', 0)}"]
+    leads = stats.get("lead_n") or 0
+    if leads:
+        lines.append(f"Average lead {stats.get('lead_sum', 0) / leads:.1f} min before the 5m close "
+                     f"(earliest {stats.get('lead_min', 0)} min)")
+    skips = stats.get("proj_skip") or {}
+    if skips:
+        bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]
+        bits += [f"{k} {v}" for k, v in skips.items() if k not in _SKIP_LABEL]
+        lines.append("Checked, not projected: " + " · ".join(bits))
+    lines += [f"Entries (close-confirmed, sent to this bot) {stats.get('confirmed', 0)}",
+              _summary_rejects(st)]
     if stats.get("feed_behind"):
         lines.append(f"⚠ the 1m feed lagged past the close on {stats['feed_behind']} candle(s)")
     lines.append(f"Projected alerts fire {first_minute()}–4 minutes before the 5m close.")
@@ -537,14 +723,20 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         return []
 
     _track_once(bar - timedelta(minutes=BAR_MINUTES))   # last closed candle's hits
-    pick = pick_for(bar, projection=True, force_sector=force_sector)
+    pick = pick_for(bar, projection=True, force_sector=force_sector, now=now)
     if not pick or pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
-        log.info("1m %s: no current sector pick — nothing projected", bar.strftime("%H:%M"))
+        log.info("1m %s: no sector pick to project on — nothing projected%s",
+                 bar.strftime("%H:%M"),
+                 " (projected from the forming candle)" if (pick or {}).get("projected") else "")
         return []
     session = str(bar.date())
     want = "BUY" if pick["side"] == 1 else "SELL"
     st = load_ledger()
-    market_alert(st, pick)           # same MARKET / SECTOR change message as bot 1
+    if not pick.get("projected"):
+        # A MARKET / SECTOR message is a statement about a finished candle. A
+        # projected pick has not been confirmed yet, so it never announces one:
+        # the close pass sends it, exactly as bot 1 does.
+        market_alert(st, pick)
     uni = data.load_universe()
     sector_of = _scan_list(uni, pick)
     if not sector_of:
@@ -566,35 +758,61 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     oi_reader = _oi_reader(session)
 
     hhmm = bar.strftime("%H:%M")
+    stats = st.setdefault("stats", {})
+    skips = stats.setdefault("proj_skip", {})
     out: list[dict] = []
+
+    def _no_projection(raw: str, reason: str) -> None:
+        """Count *why* a name was not projected — reported in the 1m summary.
+
+        Without this the only evidence of a missed leader is silence: the log
+        says nothing about the names the projection looked at and passed on.
+        """
+        skips[reason] = skips.get(reason, 0) + 1
+
     for raw, ysym in tickers.items():
         m1 = sm1.get(ysym)
         frame = projected_frame(sm5.get(ysym), m1, bar, now)
         if frame is None:
+            _no_projection(raw, "no_1m_frame")
             continue
         try:
             fires = scan_stock(raw, frame, sd1.get(ysym), keep_all=True)
         except Exception:
             log.exception("1m projection failed for %s", raw)
+            _no_projection(raw, "error")
             continue
         fresh = [s for s in fires if s.time == hhmm and s.side == want]
         if not fresh:
+            if fires:                 # fired earlier / opposite: the shared reject book
+                if any(s.time == hhmm for s in fires):
+                    _note_reject(st, "opposite", raw, f"{raw} {hhmm}", per_bar=hhmm)
+                before = [s.time for s in fires if s.side == want and s.time < hhmm]
+                if before:
+                    _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
+                    log.info("1m %s: last %s fire was %s, not this candle — not projected",
+                             raw, want, min(before))
+            _no_projection(raw, "no_signal")
             continue
         best = fresh[-1]
         if not _within_lag(bar, now_ist()):
             log.warning("1m scan finished too late for %s @ %s; dropping entry", raw, best.time)
             _note_reject(st, "late", raw, f"{raw} {best.time}", per_bar=best.time)
+            _no_projection(raw, "late")
             continue
         plan = build_plan(best, frame, bar, sd1.get(ysym))
         if plan is None:
             log.info("1m %s %s: no valid EMA9 stop yet — not projected", raw, best.name)
+            _no_projection(raw, "no_stop")
             continue
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
+            _no_projection(raw, "oi")
             continue
         stamp = now                     # the caller's clock (live loop → now_ist())
         if stamp >= bar + timedelta(minutes=BAR_MINUTES) - timedelta(seconds=2):
             log.info("1m projection for %s finished at the close; leaving it to the confirm pass", hhmm)
+            _no_projection(raw, "at_close")
             continue
         best.price, best.sl = plan.entry, plan.sl
         text = format_projected(best, pick, plan, bar, stamp, minute=minute)
@@ -606,12 +824,18 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                      "minute": minute, "at": stamp.strftime("%H:%M:%S"), "result": None,
                      "n": (int(prev["n"]) + 1) if prev.get("session") == session
                           and prev.get("n") else 1}
-        stats = st.setdefault("stats", {})
         stats["early"] = stats.get("early", 0) + 1
+        stats["lead_sum"] = stats.get("lead_sum", 0) + (BAR_MINUTES - minute)
+        stats["lead_n"] = stats.get("lead_n", 0) + 1
+        stats["lead_min"] = min(stats.get("lead_min", BAR_MINUTES), BAR_MINUTES - minute)
         save_ledger(st)
-        log.info("1m EARLY %s %s %s @ %.2f (minute %d, sent %s IST)", raw, best.side,
-                 best.name, plan.entry, minute, stamp.strftime("%H:%M:%S"))
+        log.info("1m EARLY %s %s %s @ %.2f (minute %d of 4, %d min before the close, %s pick, "
+                 "sent %s IST)", raw, best.side, best.name, plan.entry, minute,
+                 BAR_MINUTES - minute, "projected" if pick.get("projected") else "ledger",
+                 stamp.strftime("%H:%M:%S"))
         out.append({**best.__dict__, "early": True, "minute": minute})
+    if skips:
+        save_ledger(st)              # the summary reports these counts
     return out
 
 
@@ -733,7 +957,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         positions[raw] = {"side": best.side, "entry": plan.entry, "sl": plan.sl,
                           "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2,
                           "t3": plan.t3, "entry_bar": bar.isoformat(),
-                          "last_bar": bar.isoformat()}
+                          "last_bar": bar.isoformat(), "session": str(bar.date())}
         if early:
             early["result"] = "confirmed"
         stats["confirmed"] = stats.get("confirmed", 0) + 1

@@ -264,6 +264,22 @@ Confirmed entry follows at the 10:35 close if the candle holds
   follows on the same bot (with `✅ CONFIRMED — projected 10:31:05 @ 135.70` in
   front when the projection held). A projection that does not hold is dropped
   **silently** (`SCAN1M_CANCEL_MESSAGE=1` to report it instead).
+* **The pick is projected too (2026-11-16).** The forming candle is not judged
+  on the *previous* candle's sector pick any more: `projected_market` rebuilds
+  Nifty, VIX and every sector index the same way and runs the unchanged
+  `run_market` on them, so the pick can move *during* a candle. Without this,
+  bot 3 was blind on exactly the candle that matters — the one where the market
+  flips to a new sector, which is the candle that sector's **leader** fires on.
+  Its only message was then the same entry as bot 1 at the same second, while
+  the followers that fired on the next candles did get the early alert. A
+  projected pick never announces a MARKET/SECTOR change: that message waits for
+  the close, exactly as on bot 1.
+* **The forming bar's volume is finished from its prints.** `rel_vol` and the
+  score's `vol_sc` read the *full* candle, so at minute 1 a partial candle
+  showed a fifth of itself and a name scoring 65 on the completed candle showed
+  60 — no projection until the candle was nearly over. `data.project_volume`
+  scales the forming bar by `5 / minutes covered`, which is exactly 1.0 at the
+  close: the confirmed frame is the one bot 1 judged, unchanged.
 * **Own bot, own ledger.** `TELEGRAM_BOT_TOKEN_3` / `TELEGRAM_CHAT_ID_3` and
   `state/scan1m_state.json`. It never calls the bots 1/2 sender and never reads
   or writes `state/scan_state.json` (the 5m pick is only read when
@@ -309,9 +325,19 @@ bot-3 twin, produced by the same code:
 | 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
 
 Positions are opened by the confirm pass exactly as `run_once` opens them
-(`side, entry, sl, entry_ema9, t1–t3, entry_bar, last_bar`), so a trade confirmed
-on bot 3 is followed to its targets, its stop and its EMA9 exit — and an SL/EXIT
-also blocks a re-entry for the rest of the session, just like bot 1.
+(`side, entry, sl, entry_ema9, t1–t3, entry_bar, last_bar, session`), so a trade
+confirmed on bot 3 is followed to its targets, its stop and its EMA9 exit — and
+an SL/EXIT also blocks a re-entry for the rest of the session, just like bot 1.
+
+**A trade is intraday.** Only candles of the session a trade was entered in are
+replayed, on both scanners: a position left in the ledger by an earlier session
+is dropped before anything is fetched (`state.position_session`), not trailed
+against today's bars. Before 2026-11-16 a PNB trade signalled on 11 Nov was still
+open on the 16th, and the 16th's 09:15 candle — not the trade's candle — "hit"
+`T1 136.75` and `T2 141.02` and produced the alert
+`🎯 TARGET HIT — BUY PNB · T1 136.75 (+0.75%, +1.3R) · T2 141.02 (+3.90%, +6.7R) · 5m 09:15 · entry 135.73`
+(see `docs/live-defects-2026-11-16.md`). Restarting inside the same session still
+keeps an open trade open.
 
 **Prove it, don't claim it:** `tests/test_workflow_parity.py` also reads both workflow
 files and fails if either loses a rule input (`SECTOR_FOLLOW`, `SF_ALIGNED_SECTORS`,

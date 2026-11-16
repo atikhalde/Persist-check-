@@ -596,8 +596,13 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
     ``st["alerts"]`` (written before the next Telegram call) and re-checked before
     any send, so re-driving the same candle — a retried run, a replayed ledger, a
     position record rebuilt by hand — cannot produce the same message twice. Target
-    levels are additionally remembered on the position (``hit_targets``) so they
-    stay quiet when a trade carries overnight.
+    levels are additionally remembered on the position (``hit_targets``) so a
+    level never fires twice within the trade.
+
+    A trade is intraday: only candles of the **session it was entered in** are
+    replayed. A position left in the ledger by an earlier session is dropped
+    before anything is fetched — never trailed against today's bars (see
+    ``state.position_session``).
 
     Every candle since the last check is replayed, so a cycle that missed a bar
     (slow Yahoo, queued Actions run) still reports what happened, stamped with
@@ -614,6 +619,21 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
     if not positions:
         return []
     ledger = st.setdefault("alerts", {})
+    session = session_date(bar)
+    session_key = str(session)
+    # A trade belongs to the session it was entered in. Anything else here is a
+    # leftover: it would be checked against TODAY's candles, which is how a PNB
+    # entry from 11 Nov produced "TARGET HIT T1 136.75 · T2 141.02 · 5m 09:15"
+    # on 16 Nov. Drop it without a message — the trade is not today's.
+    for raw, pos in list(positions.items()):
+        came_from = state.position_session(pos)
+        if came_from and came_from != session_key:
+            del positions[raw]
+            log.warning("dropping %s: trade from %s is not today's (%s) — no hit alerts for it",
+                        raw, came_from, session_key)
+            save(st)
+    if not positions:
+        return []
     symbols = {raw: data.yahoo_stock(raw) for raw in positions}
     frames = data.fetch_many(symbols.values(), period_5m, "5m")
     # An EMA9 exit is decided by the candle's CLOSE: never read it half-published.
@@ -623,7 +643,6 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                             symbols.values(), bar + timedelta(minutes=5))
     pending: list[str] = []
     changed = False
-    session = session_date(bar)
     for raw, pos in list(positions.items()):
         df = frames.get(symbols[raw])
         df = df.loc[df.index <= bar] if df is not None and not df.empty else df
@@ -1022,6 +1041,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "side": best.side, "entry": plan.entry, "sl": plan.sl,
             "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
             "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
+            "session": session,
         }
         _save(st)  # persist each successful send in long-running live mode
         log.info("ALERT %s %s entry=%.2f sl=%.2f EMA9=%.4f @ %s (sent %s IST)",

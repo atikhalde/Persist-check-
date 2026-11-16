@@ -490,29 +490,72 @@ class LiveAlertTests(TestCase):
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
         self.assertEqual(state.load()["session"], "2026-11-09")
 
-    def test_new_session_keeps_open_trail_but_resets_entry_dedupe(self):
+    def test_new_session_resets_dedupe_and_drops_yesterdays_trade(self):
+        """A trade is intraday: the rollover drops it instead of trailing it."""
         pipeline.run_once()
         before = state.load()
+        self.assertTrue(before["positions"])                  # opened today
         after = state.reset_if_new_day(before, "2026-11-10")
         self.assertEqual(after["sent"], {})
-        self.assertEqual(after["positions"], before["positions"])
+        self.assertEqual(after["positions"], {})              # not carried over
+        same_day = state.reset_if_new_day(before, "2026-11-09")   # a restart, same session
+        self.assertEqual(same_day["positions"], before["positions"])
 
-    def test_trail_continues_next_ist_session(self):
+    def test_a_trade_from_an_earlier_session_is_dropped_not_trailed(self):
+        """16 Nov: "TARGET HIT — BUY PNB · T1 136.75 · T2 141.02 · 5m 09:15".
+
+        The PNB trade was signalled on 11 Nov. Its position was carried into the
+        next session and trailed against *that* day's candles, so the 09:15
+        candle "hit" two targets of an eleven-day-old entry. A trade is
+        intraday: yesterday's position is dropped silently, no hit / stop /
+        EMA9-exit alert can be produced for it, and it does not block today's
+        entry on the same name either.
+        """
         pipeline.run_once()
+        self.assertIn("ABC", state.load()["positions"])
         next_bar = datetime(2026, 11, 10, 9, 15, tzinfo=IST)
         self.now = next_bar + timedelta(minutes=6)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
         index = bars(*self.times, next_bar)
         stock = quiet_bars(*self.times, next_bar)
-        stock.loc[next_bar, "Close"] = 99.0
+        stock.loc[next_bar, "Close"] = 99.0                 # would close on EMA9 yesterday
         self.mocks[2].side_effect = lambda *args: {"m5": index, "d1": bars(BAR - timedelta(days=1))}
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: stock.copy() if t == "ABC.NS" else index.copy() for t in tickers}
         pipeline.run_once()
-        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertNotIn("ABC", state.load()["positions"])   # dropped at the rollover
         self.assertEqual(state.load()["session"], "2026-11-10")
-        self.assertEqual(state.load()["sent"]["ABC"]["code"], "EXIT")
-        self.assertEqual(sum("EMA9 EXIT" in c.args[0] for c in self.send.call_args_list), 1)
+        self.assertFalse(any(("EMA9 EXIT" in c.args[0] or "TARGET HIT" in c.args[0]
+                              or "SL HIT" in c.args[0]) for c in self.send.call_args_list))
+        self.assertNotIn("ABC", state.load()["sent"])
+
+    def test_a_ledger_left_over_from_a_previous_day_never_produces_a_hit_alert(self):
+        """The live case: today's session stamp, yesterday's trade inside it.
+
+        16 Nov's ledger was already rolled over to the 16th (so ``session``
+        matched) while the PNB position inside it still pointed at 11 Nov. The
+        rollover cannot see that; ``_track_positions`` must.
+        """
+        stale = {"session": str(BAR.date()),
+                 "alerts": {},
+                 "sent": {},
+                 "positions": {"PNB": {
+                     "side": "BUY", "entry": 135.73, "sl": 134.94,
+                     "entry_ema9": 135.5, "t1": 136.75, "t2": 141.02, "t3": None,
+                     "entry_bar": "2026-11-11T09:15:00+05:30",
+                     "last_bar": "2026-11-11T09:15:00+05:30"}}}
+        state.save(stale)
+        self.now = BAR + timedelta(minutes=6)
+        index = bars(*self.times, BAR)
+        stock = quiet_bars(*self.times, BAR, high=142.0, low=134.0)   # trades through both
+        self.mocks[2].side_effect = lambda *args: {"m5": index, "d1": bars(BAR - timedelta(days=1))}
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: stock.copy() if t == "PNB.NS" else index.copy() for t in tickers}
+        with self.assertLogs("nse_scanner", level="WARNING") as logs:
+            pipeline._track_positions(state.load(), BAR, "7d", send=self.send, save=state.save)
+        self.assertTrue(any("is not today's" in line for line in logs.output))
+        self.assertEqual(state.load()["positions"], {})
+        self.assertFalse(self.send.called)
 
     def test_workflow_retries_until_target_bar_is_available(self):
         # External workflow_dispatch fires seconds after a close. Yahoo may
