@@ -270,3 +270,22 @@ Two things in the feed are reported and deliberately **not** changed:
 * **the pharma leaders were all given up within 40 minutes** by their 5m EMA9
   exits while 09:35–10:20 was the day's high. That is the strategy, not the
   plumbing — the projection did its job and the entries still lost.
+
+## Third pass — the 5m stream, and what it costs
+
+[`docs/audit-2026-11-16-5m-alerts.md`](audit-2026-11-16-5m-alerts.md) reads the
+bot-1/2 feed the same way: the alerts are sound (no duplicate event, no look-ahead,
+the pick on every alert was the pick in force) and the morning still lost 3.2R on the
+day's high. Five gates came out of it, all of them knobs with the old behaviour one
+value away:
+
+| knob | default | what it fixes |
+|---|---|---|
+| `MAX_ENTRIES_PER_PICK` | 3 | six entries on one pick in 35 seconds → three, best score first |
+| `MIN_TARGET_R` / `MIN_TARGET_PCT` | 0.5 / 0.10% | a "TARGET HIT +0.2R" 75 paise from entry |
+| `EXIT_EMA9_BUFFER_PCT` / `_R` | 0.10% / 0.25 | nine exits on breaches of 0.009–0.13%; five of them are held |
+| `BREAKEVEN_AFTER_T1` | on | all three T1 hits were given back; the stop now moves to entry |
+| `MARKET_CONF_DELTA` | 10 | 99% → 67% in 35 minutes with no message while entries were taken |
+
+None of them changes *which* signal fires. They change what the same signal is
+allowed to cost.

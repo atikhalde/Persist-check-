@@ -156,6 +156,20 @@ jobs:
           # shows a print at/after the close; after this many seconds regardless.
           BAR_SETTLE_SECONDS: "45"
           MAX_ALERT_LAG_SECONDS: "180"
+          # Alert quality (16 Nov feed). A block is also sent when market
+          # confidence moves this many points, not only on a label change.
+          MARKET_CONF_DELTA: ${{ vars.MARKET_CONF_DELTA || '10' }}
+          # Entries allowed per pick (sector+side) per session, 0 = no cap; the
+          # names that clear it are alerted best-score first.
+          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
+          # A pivot closer than this to entry is resistance, not a target.
+          MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
+          MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
+          # EMA9 exit needs a close beyond the smaller of these (0 = old rule).
+          EXIT_EMA9_BUFFER_PCT: ${{ vars.EXIT_EMA9_BUFFER_PCT || '0.10' }}
+          EXIT_EMA9_BUFFER_R: ${{ vars.EXIT_EMA9_BUFFER_R || '0.25' }}
+          # T1 hit moves the stop to entry so a hit target cannot become a loss.
+          BREAKEVEN_AFTER_T1: ${{ vars.BREAKEVEN_AFTER_T1 || '1' }}
         run: python -m nse_scanner live --exit-at-close --max-minutes 170
 
       # A corrupt ledger must not turn into another immutable cache snapshot.

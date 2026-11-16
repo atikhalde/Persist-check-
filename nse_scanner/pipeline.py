@@ -16,6 +16,7 @@ from .oi_data import CSV_OIReader, StubOIReader
 from .oi_filter import should_take_entry
 from .session import IST, now_ist, session_date, to_ist
 from .stock import StockSignal, scan_stock
+from . import trade
 from .trade import TradePlan, build_plan, ema9_frame, trail_broken
 
 log = logging.getLogger("nse_scanner")
@@ -25,13 +26,44 @@ def _dry() -> bool:
     return os.environ.get("DRY_RUN", "0") == "1"
 
 
-def format_market(md) -> str:
+def _conf_delta() -> int:
+    """Send a market block when confidence moves this many points (``MARKET_CONF_DELTA``, 10).
+
+    16 Nov: 99% STRONG BULL at 09:45 slid to 94% by the 10:20 entry and to 67% at
+    10:25 — with no message in between, because a block only went out when the
+    label or the pick changed. Three entries were taken during that slide.
+    """
+    try:
+        return max(0, int(os.environ.get("MARKET_CONF_DELTA", "10")))
+    except ValueError:
+        return 10
+
+
+def max_entries_per_pick() -> int:
+    """Entries allowed per pick (sector + side) per session, 0 = no cap (3).
+
+    16 Nov: six PHA names fired on one candle and all six were alerted in 35
+    seconds, in universe order — 82, 62, 77, 62, 82 — and the whole cluster was
+    out within 45 minutes for -1.6R. One pick is one risk factor, so it gets a
+    ceiling, and the names that clear it are alerted best-score first.
+    """
+    try:
+        value = int(os.environ.get("MAX_ENTRIES_PER_PICK", "3"))
+    except ValueError:
+        return 3
+    return value if value >= 0 else 3
+
+
+def format_market(md, prev_conf: int | None = None) -> str:
     side = "BULL" if md.pick_side == 1 else "BEAR" if md.pick_side == -1 else "FLAT"
     plus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_plus)
     minus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_minus)
     vix_arrow = "↑" if md.vix_chg > 0 else "↓" if md.vix_chg < 0 else "→"
+    moved = ""
+    if prev_conf is not None and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta() > 0:
+        moved = f"  <i>(was {int(prev_conf)}%)</i>"
     return (
-        f"<b>MARKET {md.dir_label}</b>  conf {md.dir_conf}% {md.dir_tier}\n"
+        f"<b>MARKET {md.dir_label}</b>  conf {md.dir_conf}% {md.dir_tier}{moved}\n"
         f"Nifty {md.nifty:,.1f}  day {md.nifty_day_ret:+.2f}%  intra {md.nifty_intra:+.2f}%\n"
         f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   MTF {md.mtf_bull}/3\n"
         f"Breadth {md.breadth_adv}▲/{md.breadth_dec}▼  {md.regime}\n"
@@ -69,7 +101,11 @@ def _target_text(plan: TradePlan) -> str:
         bits = ([f"{r:.1f}R"] if r is not None else []) + [f"{pct:+.2f}%"]
         far = (r is not None and r > FAR_TARGET_R) or abs(pct) > FAR_TARGET_PCT
         parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f} ({', '.join(bits)}{' ⚠' if far else ''})")
-    return " · ".join(parts)
+    text = " · ".join(parts)
+    if getattr(plan, "skipped", ()):
+        text += (" · skipped as too close to entry: "
+                 + ", ".join(plan.skipped) + f" (< {trade.min_target_r():.1f}R)")
+    return text
 
 
 def _basis_text(plan: TradePlan) -> str:
@@ -217,6 +253,7 @@ _REJECT_TEXT = (
     ("no_stop", "without a valid EMA9 stop"),
     ("oi", "not confirmed by open interest"),
     ("late", "scanned too late"),
+    ("cap", "not taken — the pick already had its entries"),
 )
 
 
@@ -324,15 +361,20 @@ def _confirm_header(early: dict, entry: float) -> str:
 
 def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "cancelled",
                   close: float | None = None) -> bool:
-    """Tell the user an early heads-up did not survive; once, then never again."""
+    """Tell the user an early heads-up did not survive; once, then never again.
+
+    ``reason`` is a clause about the *alert*, not the stock, and ``who`` puts the
+    name first: the old text read "BUY DIVISLAB · BUY-EX6 is no longer in the
+    scanned sector/side", as if the signal code were the thing that moved.
+    """
     bar = pd.Timestamp(early["bar"])
     hhmm = (bar + timedelta(minutes=5)).strftime("%H:%M")
     head = "❌ <b>EARLY CANCELLED</b>" if result == "cancelled" else "⚠ <b>EARLY UNVERIFIED</b>"
     px = f" · close {close:.2f} vs early {early['price']:.2f}" if close is not None else ""
     tail = ("no confirmed entry — manage/exit if you already entered" if result == "cancelled"
             else "treat as unconfirmed")
-    text = (f"{head} — {early['side']}  {raw} · {early.get('name', '')} {reason} "
-            f"({hhmm} close){px} · {tail}")
+    who = f"{early['side']} {raw}" + (f" ({early['name']})" if early.get("name") else "")
+    text = f"{head} — {who} · {reason} · {hhmm} close{px} · {tail}"
     if not telegram.send(text, dry_run=_dry()):
         return False
     early["result"] = result
@@ -448,8 +490,17 @@ def _move_pct(pos: dict, price: float) -> float:
     return delta / pos["entry"] * 100.0
 
 
+def _risk_of(pos: dict) -> float:
+    """One R in price: the entry-to-original-stop distance, never the moved stop."""
+    if pos.get("risk"):
+        return abs(float(pos["risk"]))
+    entry = float(pos.get("entry") or 0)
+    stop = float(pos.get("sl0") or pos.get("sl") or 0)
+    return abs(entry - stop)
+
+
 def _r_of(pos: dict, price: float) -> str:
-    risk = abs(float(pos["entry"]) - float(pos.get("sl") or 0))
+    risk = _risk_of(pos)
     if risk <= 0:
         return ""
     signed = (price - pos["entry"]) if pos["side"] == "BUY" else (pos["entry"] - price)
@@ -470,13 +521,19 @@ def format_target_hit(raw: str, pos: dict, bar: datetime,
         name = names[slot - 1] if len(names) >= slot and names[slot - 1] else ""
         bits.append(f"T{slot}{' ' + name if name else ''} {level:.2f}"
                     f" ({_move_pct(pos, level):+.2f}%{_r_of(pos, level)})")
+    moved = pos.get("sl0") is not None and abs(float(pos.get("sl") or 0)
+                                               - float(pos["sl0"])) > 1e-9
+    if moved:
+        bits.append(f"stop → breakeven {float(pos['sl']):.2f}")
     return _event_line(raw, pos, bar, f"🎯 <b>TARGET HIT — {pos['side']}</b>", " · ".join(bits))
 
 
 def format_sl_hit(raw: str, pos: dict, bar: datetime, level: float) -> str:
-    """One line when the initial SL is touched (intrabar, evaluated on a closed candle)."""
+    """One line when the stop is touched (intrabar, evaluated on a closed candle)."""
+    moved = pos.get("sl0") is not None and abs(float(level) - float(pos["sl0"])) > 1e-9
+    tag = " · stop moved to breakeven after T1" if moved else ""
     return _event_line(raw, pos, bar, f"🛑 <b>SL HIT — {pos['side']}</b>",
-                       f"SL {level:.2f} ({_move_pct(pos, level):+.2f}%{_r_of(pos, level)})")
+                       f"SL {level:.2f} ({_move_pct(pos, level):+.2f}%{_r_of(pos, level)}){tag}")
 
 
 def format_trail_exit(raw: str, pos: dict, bar: datetime, close: float, ema: float) -> str:
@@ -664,7 +721,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             continue
         ema_at = dict(zip(grid.index, grid["EMA9"].to_numpy(float)))
         side = pos["side"]
-        sl = float(pos.get("sl") or 0)
+        sl = float(pos.get("sl") or 0)          # the live stop (breakeven after T1)
         targets = [(i, float(pos[f"t{i}"])) for i in (1, 2, 3) if pos.get(f"t{i}") is not None]
         done = set(pos.get("hit_targets") or ())
         prefix = _alert_prefix(raw, pos)
@@ -679,10 +736,29 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             row = grid.loc[ts]
             hhmm = to_ist(ts).strftime("%H:%M")
 
+            # The stop in force at the OPEN of this bar. A T1 hit below may move
+            # it to breakeven, which then binds from the NEXT bar: intrabar order
+            # is unknown, so the bar that reaches T1 is not also judged against a
+            # stop that only exists because T1 was reached.
+            sl = float(pos.get("sl") or 0)
             hit_now = [(slot, lvl) for slot, lvl in targets
                        if slot not in done and f"T{slot}" not in announced
                        and (row["High"] >= lvl if side == "BUY" else row["Low"] <= lvl)]
             if hit_now:
+                # A hit target that is then given back is the day's signature
+                # loss (16 Nov: LUPIN +1.3R -> +0.2R, NESTLEIND +0.8R -> -0.1R).
+                # Once T1 is touched the stop goes to entry, so the trade cannot
+                # turn into a loser; the original stop stays on the record as
+                # ``sl0`` so R and "SL HIT" still read against the real risk.
+                # Moved before the send, so the T1 line can say so. It binds from
+                # the NEXT bar: intrabar order is unknown.
+                if 1 in {slot for slot, _ in hit_now} and trade.breakeven_after_t1():
+                    pos.setdefault("sl0", pos.get("sl"))
+                    before = float(pos.get("sl") or 0)
+                    pos["sl"] = trade.breakeven_stop(side, float(pos["entry"]), before)
+                    if abs(pos["sl"] - before) > 1e-9:
+                        log.info("stop moved to breakeven %s %s: %.2f -> %.2f",
+                                 raw, side, before, pos["sl"])
                 if not send(format_target_hit(raw, pos, to_ist(ts), hit_now),
                             dry_run=_dry()):
                     pending.append(raw)
@@ -717,7 +793,8 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
 
             ema = ema_at.get(ts)
             close = float(row["Close"])
-            if ema is not None and isfinite(ema) and trail_broken(side, close, float(ema)):
+            if ema is not None and isfinite(ema) and trail_broken(side, close, float(ema),
+                                                                  risk=_risk_of(pos)):
                 if "EXIT" in announced:         # already delivered: just reconcile
                     del positions[raw]
                     changed = True
@@ -847,6 +924,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             md.action = "SCAN LONG" if md.pick_side == 1 else "SCAN SHORT"
             md.pick_reason = f"FORCED {force_sector}"
 
+    # The pick the early pass is currently using (before this bar overwrites it).
+    prev_pick = (st.get("scan") or {}).get("sector")
     # The next early (pre-close) pass scans this pick; it must be this bar's.
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
     extra = list(getattr(md, "extra_sectors", None) or ()) if scanning else []
@@ -872,7 +951,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     prev_s = st.get("sector") or {}
     market_changed = prev_m.get("dir_state") != md.dir_state or prev_m.get("label") != md.dir_label
     sector_changed = prev_s.get("name") != md.pick_sector or prev_s.get("side") != md.pick_side
-    if (market_changed or sector_changed) and (allow_stale or _recent_bar(last, now_ist())) and telegram.send(format_market(md), dry_run=_dry()):
+    prev_conf = prev_m.get("conf")
+    conf_moved = (prev_conf is not None and _conf_delta() > 0
+                  and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta())
+    if (market_changed or sector_changed or conf_moved) and (allow_stale or _recent_bar(last, now_ist())) and telegram.send(format_market(md, prev_conf), dry_run=_dry()):
         st["market"] = {
             "dir_state": md.dir_state,
             "label": md.dir_label,
@@ -897,7 +979,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if ping_on_wait and not market_changed and not sector_changed:
             log.info("WAIT — no complementary persistent sector")
         if not allow_stale:
-            _settle_early(st, last, set(), "market/sector pick dropped to WAIT")
+            _settle_early(st, last, set(), "not checked — the pick dropped to WAIT")
         _save(st)
         return result
 
@@ -953,6 +1035,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     want_buy = md.pick_side == 1
     new_signals: list[dict] = []
     handled: set[str] = set(missing)
+    candidates: list[dict] = []
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
@@ -986,7 +1069,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                     if before:
                         _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
             if early:
-                _cancel_early(st, raw, early, "did not hold", close=float(df5["Close"].iloc[-1]))
+                _cancel_early(st, raw, early, "did not hold at this close",
+                              close=float(df5["Close"].iloc[-1]))
             continue
         best = fresh[-1]
         if not allow_stale and not _recent_bar(last, now_ist()):
@@ -999,7 +1083,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             if not allow_stale:
                 _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
-                _cancel_early(st, raw, early, "has no valid EMA9 stop",
+                _cancel_early(st, raw, early, "had no valid EMA9 stop",
                               close=float(df5["Close"].iloc[-1]))
             continue
         best.price = plan.entry
@@ -1013,6 +1097,31 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 _cancel_early(st, raw, early, f"was not confirmed by open interest ({why})",
                               close=float(df5["Close"].iloc[-1]))
             continue
+        # No send here: candidates are ranked and capped below, so one pick
+        # cannot alert six names in universe order.
+        candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
+                           "early": early, "close": float(df5["Close"].iloc[-1])})
+
+    cap = max_entries_per_pick()
+    side_key = "long" if want_buy else "short"
+    taken = st.setdefault("pick_entries", {})
+    candidates.sort(key=lambda c: -float(getattr(c["best"], "score", 0) or 0))
+    for cand in candidates:
+        raw, early, plan, best = cand["raw"], cand["early"], cand["plan"], cand["best"]
+        # One sector is one risk factor — counted per sector, not per message, so
+        # a SECTOR FOLLOW scan of two sectors does not halve its own cap.
+        pick_key = f"{sector_of[raw]} {side_key}"
+        if cap and int(taken.get(pick_key) or 0) >= cap:
+            log.info("cap: %s not taken — %s already has %d entries this session",
+                     raw, pick_key, cap)
+            if not allow_stale:
+                _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
+            if early:
+                _cancel_early(st, raw, early,
+                              f"not taken — {pick_key} already has {cap} entries this session",
+                              close=cand["close"])
+            continue
+        reading = cand["reading"]
         text = format_stock(best, md, plan, sector=sector_of[raw], oi_line=_oi_line(reading))
         if early:
             text = _confirm_header(early, plan.entry) + text
@@ -1022,6 +1131,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if early:
             early["result"] = "confirmed"
             _bump(st, "confirmed")
+        taken[pick_key] = int(taken.get(pick_key) or 0) + 1
         lag = max(0.0, (now_ist() - close_at).total_seconds())
         _bump(st, "entries")
         _bump(st, "lag_sum", lag)
@@ -1038,7 +1148,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "price": best.price,
         }
         positions[raw] = {
-            "side": best.side, "entry": plan.entry, "sl": plan.sl,
+            "side": best.side, "entry": plan.entry, "sl": plan.sl, "sl0": plan.sl,
+            "risk": plan.risk, "t_names": list(plan.pivot_names),
             "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
             "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
             "session": session,
@@ -1050,7 +1161,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
     if not allow_stale:
         # Early alerts on names the close scan never looked at (sector switched).
-        _settle_early(st, last, handled, "is no longer in the scanned sector/side")
+        was = prev_pick if prev_pick not in (None, "", "WAIT") else (prev_s or {}).get("name")
+        moved = (f"{was} → {md.pick_sector}" if was and was != md.pick_sector
+                 else f"to {md.pick_sector}")
+        _settle_early(st, last, handled, f"not checked — the pick moved {moved}")
     st["sent"] = sent
     st["session"] = session
     _save(st)

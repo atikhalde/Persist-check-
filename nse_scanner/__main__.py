@@ -213,6 +213,12 @@ def _doctor() -> int:
     source = market_source()
     lead = ("(pick projected from the forming candle)" if source != "ledger"
             else "(no projection — the ledger holds closed candles only)")
+    from .trade import (breakeven_after_t1, min_target_pct, min_target_r)
+    from .pipeline import max_entries_per_pick, _conf_delta
+    print(f"5m alert rules: max {max_entries_per_pick() or 'no'} entries per pick · "
+          f"targets >= {min_target_r():.1f}R / {min_target_pct():.2f}% · "
+          f"market block on a {_conf_delta()}-point conf move · "
+          f"breakeven stop after T1 {'on' if breakeven_after_t1() else 'off'}")
     from .scan1m import early_retries, leader_catchup, leader_max_minutes, leader_max_r
     catchup = (f"on (max {leader_max_minutes()} min old, <= {leader_max_r():.1f}R)"
                if leader_catchup() else "off")

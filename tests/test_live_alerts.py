@@ -10,6 +10,9 @@ from pathlib import Path
 import pandas as pd
 
 from nse_scanner import pipeline, state
+
+# The real market formatter, captured before setUp patches it to "market".
+REAL_FORMAT_MARKET = pipeline.format_market
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
 from nse_scanner.trade import PivotBasis, TradePlan
@@ -35,6 +38,121 @@ def quiet_bars(*times, close=100.0, high=100.01, low=99.99):
 def signal(time="10:00", code=101, side="BUY"):
     return StockSignal("ABC", code, "BUY-EX", side, time, 100.0, 65,
                        "Strong", 20, 1, "test", 99.0)
+
+
+class EntryCapTests(TestCase):
+    """Six names on one pick is one risk factor, not six trades.
+
+    16 Nov: SUNPHARMA, TORNTPHARM, CIPLA, AUROPHARMA, LUPIN and GLENMARK all
+    fired on the 09:35 candle — alerted in 35 seconds, in universe order, with no
+    ceiling. All six were out within 45 minutes for -1.6R.
+    """
+
+    SCORES = {"AAA": 82, "BBB": 62, "CCC": 77, "DDD": 62}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ctx = patch.object(state, "STATE_PATH", Path(self.tmp.name) / "state.json")
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
+        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0"})
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
+        self.now = BAR + timedelta(minutes=6)
+        self.times = [BAR - timedelta(minutes=5 * i) for i in range(39, 0, -1)] + [BAR]
+        self.uni = {"nifty": "NIFTY", "vix": "VIX",
+                    "sectors": {"IT": {"index": "INDEX", "stocks": list(self.SCORES)}}}
+        self.md = SimpleNamespace(bar_time=BAR.strftime("%Y-%m-%d %H:%M"),
+                                  dir_state=1, dir_label="BULL", dir_conf=74,
+                                  pick_sector="IT", pick_side=1,
+                                  pick_reason="test", action="SCAN LONG", regime="TREND")
+        self.contexts = [
+            patch.object(pipeline, "now_ist", side_effect=lambda: self.now),
+            patch.object(pipeline.data, "load_universe", return_value=self.uni),
+            patch.object(pipeline.data, "fetch_symbol", side_effect=lambda *args: {
+                "m5": bars(*self.times), "d1": bars(BAR - timedelta(days=1))}),
+            patch.object(pipeline.data, "fetch_many", side_effect=lambda tickers, period, interval: {
+                t: (quiet_bars(*self.times) if t.endswith(".NS") else bars(*self.times))
+                for t in tickers}),
+            patch.object(pipeline.data, "apply_1m_volume", side_effect=lambda df, _: df),
+            patch.object(pipeline, "run_market", side_effect=self.market_at_bar),
+            patch.object(pipeline, "format_market", return_value="market"),
+            patch.object(pipeline, "format_stock", side_effect=lambda sig, *a, **k: f"stock {sig.symbol}"),
+            patch.object(pipeline, "scan_stock", side_effect=self.scan),
+            patch.object(pipeline.telegram, "send", return_value=True),
+            patch.object(pipeline, "_unsettled", return_value=(set(), False)),
+        ]
+        self.mocks = [p.start() for p in self.contexts]
+        for p in self.contexts:
+            self.addCleanup(p.stop)
+        self.send = self.mocks[9]
+
+    def market_at_bar(self, df, *args):
+        self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
+        return self.md
+
+    def scan(self, symbol, frame, daily, keep_all=False):
+        return [StockSignal(symbol, 101, "BUY-EX", "BUY", BAR.strftime("%H:%M"),
+                            100.0, self.SCORES[symbol], "Strong", 20, 1, "test", 99.0)]
+
+    def stock_texts(self):
+        return [c.args[0] for c in self.send.call_args_list if c.args[0].startswith("stock")]
+
+    def test_one_pick_alerts_only_three_and_best_score_first(self):
+        pipeline.run_once()
+        self.assertEqual(self.stock_texts(), ["stock AAA", "stock CCC", "stock BBB"])
+        self.assertEqual(list(state.load()["sent"]), ["AAA", "CCC", "BBB"])
+
+    def test_the_dropped_name_is_reported_and_still_free(self):
+        pipeline.run_once()
+        st = state.load()
+        self.assertIn("DDD@10:00", st["stats"]["rejected"]["cap"])
+        self.assertNotIn("DDD", st["sent"])          # not consumed by the cap
+        summary = pipeline.format_summary(st)
+        self.assertIn("not taken — the pick already had its entries", summary)
+
+    def test_the_cap_can_be_switched_off(self):
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "0"}):
+            pipeline.run_once()
+        self.assertEqual(len(self.stock_texts()), 4)
+
+    def test_the_cap_is_counted_per_pick_for_the_session(self):
+        pipeline.run_once()
+        self.assertEqual(state.load()["pick_entries"], {"IT long": 3})
+
+
+def market_decision(**over):
+    """A complete MarketDecision, for the block formatter (see market.MarketDecision)."""
+    base = dict(session="2026-11-16", bar_time="2026-11-16 10:20", nifty=25270.8,
+                nifty_day_ret=0.50, nifty_intra=0.26, vix=15.68, vix_chg=-6.74,
+                adx=41, mtf_bull=3, dir_state=1, dir_label="BULL", dir_conf=94,
+                dir_tier="BUILDING", breadth_adv=7, breadth_dec=8, regime="TRANSITION",
+                persist_plus=[("FMCG", 79), ("BANK", 56)], persist_minus=[("REALTY", 91)],
+                live_flow="REALTY", live_flow_qualified=True, live_flow_score=85,
+                pick_sector="FMCG", pick_side=1, pick_reason="PERSIST + FMCG qualified",
+                action="SCAN LONG")
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+class MarketBlockTests(TestCase):
+    """`conf 99% -> 67%` in 35 minutes used to be silent: only labels are news."""
+
+    def test_a_slide_is_disclosed_with_what_it_was(self):
+        text = REAL_FORMAT_MARKET(market_decision(dir_conf=67), 94)
+        self.assertIn("conf 67% BUILDING", text)
+        self.assertIn("(was 94%)", text)
+
+    def test_a_small_move_carries_no_note(self):
+        text = REAL_FORMAT_MARKET(market_decision(dir_conf=94), 99)
+        self.assertIn("conf 94%", text)
+        self.assertNotIn("(was", text)
+
+    def test_the_note_can_be_switched_off(self):
+        with patch.dict("os.environ", {"MARKET_CONF_DELTA": "0"}):
+            text = REAL_FORMAT_MARKET(market_decision(dir_conf=10), 99)
+        self.assertNotIn("(was", text)
 
 
 class LiveAlertTests(TestCase):
@@ -399,7 +517,9 @@ class LiveAlertTests(TestCase):
     # --- never twice (same guarantee as the entry alert) ---------------------
     def test_target_alert_is_not_repeated_when_the_position_record_is_rebuilt(self):
         self._trade()
-        trailing = quiet_bars(*self.times)
+        # Above entry throughout: a dip back to entry would now take the trade
+        # out at the breakeven stop (test_breakeven_after_t1 pins that).
+        trailing = quiet_bars(*self.times, low=100.005)
         trailing.loc[self.times[-1], "High"] = 101.0
         self._frames(trailing)
         pipeline.run_once()
@@ -557,6 +677,73 @@ class LiveAlertTests(TestCase):
         self.assertEqual(state.load()["positions"], {})
         self.assertFalse(self.send.called)
 
+    # --- the stop protects a hit target (16 Nov: all three gave it back) -----
+    def _extra_bar(self, stock, *, minutes=10):
+        """Publish one more closed candle and point the scan at it."""
+        bar = BAR + timedelta(minutes=minutes)
+        self.now = bar + timedelta(minutes=6)
+        self.times = self.times + [bar]
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: (stock.copy() if t.endswith(".NS") else bars(*self.times)) for t in tickers}
+        self.mocks[2].side_effect = lambda *args: {"m5": bars(*self.times),
+                                                   "d1": bars(BAR - timedelta(days=1))}
+        return bar
+
+    def test_breakeven_stop_closes_the_trade_after_t1(self):
+        self._trade()
+        stock = quiet_bars(*self.times, BAR + timedelta(minutes=10))
+        stock.loc[BAR + timedelta(minutes=5), "High"] = 101.0      # T1 on the 10:05 candle
+        self._extra_bar(stock)                                     # ... dips back at 10:10
+        pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        self.assertTrue(any("TARGET HIT" in t and "stop → breakeven 100.00" in t for t in texts))
+        self.assertTrue(any("SL HIT" in t and "stop moved to breakeven after T1" in t
+                            for t in texts))
+        self.assertNotIn("ABC", state.load()["positions"])
+        sl_line = next(t for t in texts if "SL HIT" in t)
+        self.assertIn("+0.0R", sl_line)                 # R still uses the original stop
+
+    def test_t1_without_the_breakeven_rule_keeps_the_original_stop(self):
+        with patch.dict("os.environ", {"BREAKEVEN_AFTER_T1": "0"}):
+            self._trade()
+            stock = quiet_bars(*self.times, BAR + timedelta(minutes=10))
+            stock.loc[BAR + timedelta(minutes=5), "High"] = 101.0
+            self._extra_bar(stock)
+            pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        self.assertTrue(any("TARGET HIT" in t for t in texts))
+        self.assertFalse(any("SL HIT" in t for t in texts))
+        self.assertIn("ABC", state.load()["positions"])
+
+    # --- the market block is not blind between label changes ----------------
+    def _market_texts(self) -> list[str]:
+        return [c.args[0] for c in self.send.call_args_list if c.args[0] == "market"]
+
+    def test_a_confidence_slide_is_announced_without_a_label_change(self):
+        pipeline.run_once()                                # first block, 74%
+        self.send.reset_mock()
+        self.md.dir_conf = 60                              # 74 -> 60, same BULL label
+        self._extra_bar(quiet_bars(*self.times, BAR + timedelta(minutes=10)))
+        pipeline.run_once()
+        self.assertEqual(len(self._market_texts()), 1, "a 14-point confidence drop is news")
+
+    def test_a_small_confidence_move_stays_quiet(self):
+        pipeline.run_once()
+        self.send.reset_mock()
+        self.md.dir_conf = 70                              # 4 points, under the 10 default
+        self._extra_bar(quiet_bars(*self.times, BAR + timedelta(minutes=10)))
+        pipeline.run_once()
+        self.assertEqual(self._market_texts(), [])
+
+    def test_the_confidence_delta_can_be_switched_off(self):
+        pipeline.run_once()
+        self.send.reset_mock()
+        self.md.dir_conf = 10                              # a 64-point drop, knob off
+        self._extra_bar(quiet_bars(*self.times, BAR + timedelta(minutes=10)))
+        with patch.dict("os.environ", {"MARKET_CONF_DELTA": "0"}):
+            pipeline.run_once()
+        self.assertEqual(self._market_texts(), [])
+
     def test_workflow_retries_until_target_bar_is_available(self):
         # External workflow_dispatch fires seconds after a close. Yahoo may
         # still have only the preceding candle on the first fetch.
@@ -590,7 +777,6 @@ class LiveAlertTests(TestCase):
 
         def stock_data(tickers, period, interval):
             nonlocal calls
-            quiet = lambda *ts: quiet_bars(*ts)
             if interval == "5m" and "DEF.NS" in tickers:
                 calls += 1
                 return {t: (quiet_bars(*ts) if t.endswith(".NS") else bars(*ts))

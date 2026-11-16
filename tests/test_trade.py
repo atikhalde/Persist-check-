@@ -2,12 +2,14 @@
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from unittest import TestCase
+from unittest.mock import patch
 
 import pandas as pd
 
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
-from nse_scanner.trade import (PivotBasis, build_plan, ema9_on_bar, pivot_basis,
+from nse_scanner import pipeline
+from nse_scanner.trade import (PivotBasis, build_plan, ema9_on_bar, exit_buffer, pivot_basis,
                              pivot_targets,
                              trail_broken)
 
@@ -84,6 +86,65 @@ class TradePlanTests(TestCase):
         previous.index = previous.index - timedelta(days=3)
         df = pd.concat([previous, candles([100.] * 10)])
         self.assertEqual(pivot_targets("BUY", 100., df, BAR), [102., 104., 106.])
+
+
+class TargetQualityTests(TestCase):
+    """A pivot a few paise away is resistance, not a target (16 Nov feed).
+
+    GODREJCP was entered at 877.25 with T1 at 878.00 — 0.2R, +0.09% — and its
+    "TARGET HIT +0.2R" was announced as a win. The fixture below is the same
+    shape: basis H 102 / L 98 / C 100 gives R1 = 102, and entry 101.99 is 1 paisa
+    under it, so R1 is 0.006R away and R2 104.00 is the first real target.
+    """
+
+    def _plan(self, *, entry=101.99, last=101.99, env=None):
+        df = candles([100.0] * 9 + [last])
+        daily = candles([100.0]).set_axis([BAR - timedelta(days=3)])
+        with patch.dict("os.environ", env or {}, clear=False):
+            return build_plan(signal("BUY", entry), df, BAR, daily)
+
+    def test_a_level_inside_the_floor_is_skipped_and_the_ladder_moves(self):
+        plan = self._plan(env={"MIN_TARGET_R": "0.5", "MIN_TARGET_PCT": "0.10"})
+        self.assertEqual(plan.t1, 104.0)                     # R2, not the R1 2 paise away
+        self.assertEqual(plan.pivot_names, ("R2", "R3", None))
+        self.assertEqual(plan.skipped, ("R1 102.00 (0.0R, +0.01%)",))
+        text = pipeline._target_text(plan)
+        self.assertIn("skipped as too close to entry: R1 102.00 (0.0R, +0.01%)", text)
+
+    def test_every_announced_target_is_at_least_the_floor_away(self):
+        plan = self._plan(env={"MIN_TARGET_R": "0.5", "MIN_TARGET_PCT": "0.10"})
+        for level in (plan.t1, plan.t2, plan.t3):
+            if level is not None:
+                self.assertGreaterEqual((level - plan.entry) / plan.risk, 0.5 - 1e-9)
+
+    def test_the_floor_can_be_switched_off(self):
+        plan = self._plan(env={"MIN_TARGET_R": "0", "MIN_TARGET_PCT": "0"})
+        self.assertEqual(plan.skipped, ())
+        self.assertEqual(plan.t1, 102.0)                     # the old behaviour: R1, 0.006R
+        self.assertNotIn("skipped", pipeline._target_text(plan))
+
+
+class ExitBufferTests(TestCase):
+    """A close 4 paise past EMA9 must not end a trade (VBL, 16 Nov)."""
+
+    def test_a_shallow_breach_holds(self):
+        with patch.dict("os.environ", {"EXIT_EMA9_BUFFER_PCT": "0.10",
+                                       "EXIT_EMA9_BUFFER_R": "0.25"}):
+            self.assertFalse(trail_broken("BUY", 433.96, 434.00, risk=1.97))   # 4 paise
+            self.assertTrue(trail_broken("BUY", 433.00, 434.00, risk=1.97))    # deep
+            self.assertFalse(trail_broken("SELL", 434.04, 434.00, risk=1.97))
+            self.assertTrue(trail_broken("SELL", 435.00, 434.00, risk=1.97))
+
+    def test_the_band_is_the_smaller_of_pct_and_risk(self):
+        with patch.dict("os.environ", {"EXIT_EMA9_BUFFER_PCT": "0.10",
+                                       "EXIT_EMA9_BUFFER_R": "0.25"}):
+            self.assertAlmostEqual(exit_buffer(1841.60, 14.81), 1.84160, places=4)   # 0.10%
+            self.assertAlmostEqual(exit_buffer(1841.60, 2.0), 0.50, places=4)        # 0.25R
+
+    def test_the_buffer_can_be_switched_off(self):
+        with patch.dict("os.environ", {"EXIT_EMA9_BUFFER_PCT": "0",
+                                       "EXIT_EMA9_BUFFER_R": "0"}):
+            self.assertTrue(trail_broken("BUY", 433.99, 434.00, risk=1.97))
 
 
 # ---------------------------------------------------------------------------

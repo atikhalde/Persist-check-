@@ -108,22 +108,31 @@ Every open trade is watched on each completed 5m candle, and **every level that 
 actually touched produces exactly one one-line alert**. Three events, nothing else:
 
 **Target hit** — the first candle that trades through a pivot target. Informational
-only: the position stays open, the trail keeps running, and each of `T1/T2/T3` fires at
-most once (candles that blow through several levels report them on one line).
+only: the **stop moves to breakeven** at T1, the trail keeps running, and each of
+`T1/T2/T3` fires at most once (candles that blow through several levels report them
+on one line). A pivot closer than `MIN_TARGET_R` (0.5) / `MIN_TARGET_PCT` (0.10%) to
+the entry is not a target — it is the resistance the entry was made into — so the
+ladder starts at the first level that is far enough away and every skipped level is
+shown on the entry alert.
 
 ```
-🎯 TARGET HIT — BUY  INFY · T1 R1 1850.20 (+0.42%, +1.8R) · 5m 11:05 · entry 1842.50
+🎯 TARGET HIT — BUY  INFY · T1 R1 1850.20 (+0.42%, +1.8R) · stop → breakeven 1842.50 · 5m 11:05 · entry 1842.50
 ```
 
-**Initial stop hit** — the first candle whose low (BUY) reaches the initial SL. This
+**Stop hit** — the first candle whose low (BUY) reaches the stop. Before T1 that is
+the initial EMA9 stop; after T1 it is the breakeven stop, and the line says so. This
 closes the position in the ledger and blocks a fresh entry on that symbol for the day.
 
 ```
 🛑 SL HIT — BUY  INFY · SL 1838.28 (-0.23%, -1.0R) · 5m 11:20 · entry 1842.50
+🛑 SL HIT — BUY  INFY · SL 1842.50 (+0.00%, +0.0R) · stop moved to breakeven after T1 · 5m 11:20 · entry 1842.50
 ```
 
-**EMA9 trail exit** — the first *completed* candle closing strictly below EMA9 (SELL
-strictly above). A wick alone does not trigger it. Also closes the position.
+**EMA9 trail exit** — the first *completed* candle closing beyond EMA9 by more than
+the noise band: the smaller of `EXIT_EMA9_BUFFER_PCT` (0.10%) of price and
+`EXIT_EMA9_BUFFER_R` (0.25) × risk, SELL mirrored. A wick alone does not trigger it,
+and neither does a 4-paise poke: on 16 Nov nine of ten exits were breaches of
+0.009–0.13%, and five of them are held by the band. Also closes the position.
 
 ```
 🔔 EMA9 EXIT — BUY  INFY · close 1849.00 below EMA9 1850.20 (+0.35%, +1.5R) · 5m 11:05 · entry 1842.50
@@ -403,6 +412,18 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 summary |
 | `SCAN1M_1M_PERIOD` | `1d` | 1m history window fetched every minute (prior sessions come from one 7d fetch per day) |
 
+Five more decide what a 5m alert is allowed to say. They apply to **both** loops —
+bot 3 trails the same positions and renders the same plan, so the exit and target
+rules are shared, not forked:
+
+| variable | default | what it does |
+|---|---|---|
+| `MAX_ENTRIES_PER_PICK` | `3` | entries per pick (sector + side) per session, `0` = no cap. The names that clear it are alerted **best score first**. Six names can fire on one candle (16 Nov: six pharma entries in 35 seconds, all out within 45 minutes for −1.6R); one pick is one risk factor |
+| `MIN_TARGET_R` / `MIN_TARGET_PCT` | `0.5` / `0.10` | a pivot closer than this to the entry is not a target (`0` = old behaviour). GODREJCP on 16 Nov: entered 877.25 with T1 at 878.00 — 0.2R, +0.09% — announced as "TARGET HIT +0.2R" |
+| `EXIT_EMA9_BUFFER_PCT` / `EXIT_EMA9_BUFFER_R` | `0.10` / `0.25` | a close must be beyond EMA9 by the *smaller* of these before the trail counts as broken (`0`/`0` = the old bare comparison). The band is what stops a 4-paise poke from ending a trade |
+| `BREAKEVEN_AFTER_T1` | `1` | once T1 is touched the stop moves to entry, so a hit target cannot turn into a loss (16 Nov: LUPIN +1.3R → +0.2R, NESTLEIND +0.8R → −0.1R). The R in every later alert is still measured against the **original** stop |
+| `MARKET_CONF_DELTA` | `10` | send the market block when confidence moves this many points, not only when the label or the pick changes — 16 Nov slid 99% → 94% → 67% without a message while three entries were taken (`0` = off) |
+
 `python -m nse_scanner doctor` prints the ones that change behaviour most
 (`first minute → up to N min early`, `market source`, `re-projections after a
 cancel`, `cancel messages on/off`, `leader catch-up`) next to the bot-3
@@ -457,7 +478,8 @@ picked while Nifty was NEUTRAL). `Signals not alerted` lists stock signals the
 scanner saw in those sectors but did not send, and why: the stock had already fired
 before its sector was picked (the scanner only alerts a signal on the candle it
 fires), it fired against the pick's side, it had no valid EMA9 stop, open interest
-did not confirm it, or the scan finished too late. Stocks in sectors that were never
+did not confirm it, the scan finished too late, or the pick already had
+`MAX_ENTRIES_PER_PICK` entries. Stocks in sectors that were never
 picked are not scanned and cannot appear here.
 
 `with live 1m data 0` or a very old "newest 1m bar" means Yahoo's feed is too

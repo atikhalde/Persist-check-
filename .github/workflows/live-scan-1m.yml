@@ -139,6 +139,14 @@ jobs:
           # — closed candles only, so nothing can be projected and the lead is
           # lost; only meaningful when that file is present on this runner.
           SCAN1M_MARKET_SOURCE: ${{ vars.SCAN1M_MARKET_SOURCE || 'own' }}
+          # Same exit/target rules as the 5m scan: bot 3 trails the same
+          # positions and renders the same plan, so it must not fork them.
+          MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
+          MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
+          EXIT_EMA9_BUFFER_PCT: ${{ vars.EXIT_EMA9_BUFFER_PCT || '0.10' }}
+          EXIT_EMA9_BUFFER_R: ${{ vars.EXIT_EMA9_BUFFER_R || '0.25' }}
+          BREAKEVEN_AFTER_T1: ${{ vars.BREAKEVEN_AFTER_T1 || '1' }}
+          MARKET_CONF_DELTA: ${{ vars.MARKET_CONF_DELTA || '10' }}
           # 1 = also report a projection that did not survive the close.
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}
