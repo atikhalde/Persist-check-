@@ -82,7 +82,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from . import data, state, telegram
-from .market import run_market, SECTOR_ORDER
+from .market import previous_pick, run_market, SECTOR_ORDER
 from .oi_filter import should_take_entry
 from .session import IST, now_ist, to_ist
 from .stock import scan_stock
@@ -258,6 +258,7 @@ def _own_market(decision_bar: datetime, force_sector: str | None = None):
         d1.get(uni["vix"]),
         {name: m5.get(sym) for name, sym in index_map.items()},
         {name: d1.get(sym) for name, sym in index_map.items()},
+        prev_pick=previous_pick(_five_minute_scan(), decision_bar),
     )
     if md.bar_time != decision_bar.strftime("%Y-%m-%d %H:%M"):
         return None
@@ -283,8 +284,20 @@ def _pick_dict(md, *, projected: bool = False) -> dict:
         "conf": md.dir_conf,
         "extra": list(getattr(md, "extra_sectors", None) or ()) if scanning else [],
         "follow": bool(scanning and str(getattr(md, "pick_reason", "")).startswith("SECTOR FOLLOW")),
+        # the picked sector index's move from its own open — the same number the
+        # 5m scan ranks and labels its entries with
+        "intra": _pick_intra(md) if scanning else None,
         "projected": projected,
     }
+
+
+def _pick_intra(md) -> float | None:
+    snap = (getattr(md, "sectors", None) or {}).get(getattr(md, "pick_sector", "")) or {}
+    try:
+        intra = snap.get("intra_ret") if snap else None
+        return round(float(intra), 3) if intra is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _own_pick(decision_bar: datetime, force_sector: str | None = None) -> dict | None:
@@ -306,6 +319,7 @@ def _ledger_pick(allowed: list[str]) -> dict | None:
         "conf": scan.get("conf") or 0,
         "extra": list(scan.get("extra") or []),
         "follow": bool(scan.get("follow")),
+        "intra": scan.get("intra"),
         "projected": False,
     }
 
@@ -379,6 +393,7 @@ def projected_market(bar: datetime, now: datetime, force_sector: str | None = No
         d1.get(vix),
         {name: frame(sym) for name, sym in index_map.items()},
         {name: d1.get(sym) for name, sym in index_map.items()},
+        prev_pick=previous_pick(_five_minute_scan(), bar - timedelta(minutes=BAR_MINUTES)),
     )
     if md.bar_time != bar.strftime("%Y-%m-%d %H:%M"):
         _why(f"the market engine kept the {md.bar_time} bar")
@@ -715,11 +730,11 @@ def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, min
 
 
 def format_confirmed(sig, scan: dict, plan, *, early: dict | None, sector: str,
-                     oi_line: str = "") -> str:
+                     oi_line: str = "", lead: float | None = None) -> str:
     from .pipeline import format_stock    # the exact 5m entry text
 
     text = format_stock(sig, _md(scan, scan.get("sector")), plan, sector=sector,
-                        oi_line=oi_line)
+                        oi_line=oi_line, lead=lead)
     if early:
         diff = (plan.entry - early["price"]) if early["side"] == "BUY" else (early["price"] - plan.entry)
         pct = diff / early["price"] * 100.0 if early["price"] else 0.0
@@ -960,8 +975,15 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     names = [raw for raw in tradeable if _early_allowed(book.get(raw), session, bar)]
     # A leader that fired before its sector was picked is not a projection (its
     # signal is not on this candle) but it is what the feed was missing.
+    catchup_mark = st.get("catchup_pick")
     catching = ([raw for raw in tradeable if raw not in caught]
                 if catchup_due(st, pick, bar) else [])
+    if st.get("catchup_pick") is not catchup_mark:
+        # Remember when this pick's catch-up window opened. Without this write
+        # the window was re-created on every minute, so "ten minutes after the
+        # pick changed" never expired and the catch-up scan re-fetched the whole
+        # sector on every tick of the session.
+        save_ledger(st)
     wanted = list(dict.fromkeys(names + catching))
     if not wanted:
         return []
@@ -1164,10 +1186,19 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     _note_feed_behind(st, sm1, bar, now)
 
     hhmm = bar.strftime("%H:%M")
+    from .pipeline import (entry_cap_room, new_position, pick_cap_key,
+                           rank_by_sector_lead, rank_candidates, sector_lead,
+                           take_entry_slot)
+    cap_key = pick_cap_key(pick["sector"], int(pick["side"]))
     out: list[dict] = []
     confirmed: set[str] = set()
     checked: set[str] = set()
     closes: dict[str, float] = {}
+    # Same ceiling on the same pick: one sector on one side is one risk factor.
+    # Bot 3 used to confirm every name that fired, so on a six-name candle it
+    # announced six entries where bot 1 announced three — the cap is an entry
+    # rule, not a 5m display rule.
+    candidates: list[dict] = []
     for raw, ysym in tickers.items():
         frame = closed_frame(sm5.get(ysym), sm1.get(ysym), bar)
         if frame is None:
@@ -1207,21 +1238,37 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         if early and early.get("bar") != bar.isoformat():
             early = None
         best.price, best.sl = plan.entry, plan.sl
-        text = format_confirmed(best, pick, plan, early=early, sector=sector_of[raw],
-                                oi_line=_oi_line(reading))
+        # Same condition as bot 1: the lead is the ranking, and it is printed
+        # only when the ranking is in force.
+        lead = (sector_lead(frame, bar, plan.entry, pick.get("intra"), pick["side"] == 1)
+                if rank_by_sector_lead() else None)
+        candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
+                           "early": early, "lead": lead, "close": closes.get(raw)})
+
+    rank_candidates(candidates)
+    capped: dict[str, str] = {}
+    for cand in candidates:
+        raw, best, plan = cand["raw"], cand["best"], cand["plan"]
+        if not entry_cap_room(st, cap_key):
+            _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
+            capped[raw] = f"not taken — {cap_key} already has its entries"
+            log.info("1m cap: %s not taken — %s already has its entries", raw, cap_key)
+            continue
+        text = format_confirmed(best, pick, plan, early=cand["early"], sector=sector_of[raw],
+                                oi_line=_oi_line(cand["reading"]), lead=cand["lead"])
         if not telegram.send_bot3(text, dry_run=_dry()):
             log.warning("bot 3 delivery failed for %s; the next minute retries", raw)
             continue
+        take_entry_slot(st, cap_key)
         confirmed.add(raw)
         sent[raw] = {"code": best.code, "name": best.name, "time": best.time,
                      "price": plan.entry, "sl": plan.sl,
                      "at": now_ist().strftime("%H:%M:%S")}
-        # Open the trade exactly as the 5m scan does, so the same
-        # T1–T3 / SL / EMA9-exit alerts follow it on bot 3.
-        positions[raw] = {"side": best.side, "entry": plan.entry, "sl": plan.sl,
-                          "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2,
-                          "t3": plan.t3, "entry_bar": bar.isoformat(),
-                          "last_bar": bar.isoformat(), "session": str(bar.date())}
+        # Open the trade exactly as the 5m scan does — one builder — so the same
+        # T1–T3 / SL / EMA9-exit alerts follow it on bot 3, with the same pivot
+        # names and the original stop on record.
+        positions[raw] = new_position(best.side, plan, bar.isoformat(), str(bar.date()))
+        early = cand["early"]
         if early:
             early["result"] = "confirmed"
         stats["confirmed"] = stats.get("confirmed", 0) + 1
@@ -1230,7 +1277,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
     _settle(st, bar, confirmed, checked, "did not hold", closes=closes,
-            scanned=set(names))
+            scanned=set(names), reasons=capped)
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
     if checked != set(names):
@@ -1317,7 +1364,8 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
             reason: str = "", closes: dict[str, float] | None = None,
-            scanned: set[str] | None = None) -> None:
+            scanned: set[str] | None = None,
+            reasons: dict[str, str] | None = None) -> None:
     """Resolve projected alerts of ``bar`` that the close did not confirm.
 
     ``checked`` limits this to the stocks the close scan could actually judge: a
@@ -1334,7 +1382,7 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
     for raw, early in list((st.get("early") or {}).items()):
         if early.get("result") or early.get("bar") != bar.isoformat() or raw in confirmed:
             continue
-        why = reason
+        why = (reasons or {}).get(raw) or reason
         if checked is not None and raw not in checked:
             if scanned is None or raw in scanned:
                 continue                 # the feed had not published: retried

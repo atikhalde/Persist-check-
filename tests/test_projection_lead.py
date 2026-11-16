@@ -211,7 +211,7 @@ class ProjectedMarketTests(TestCase):
         prints = {s: frame_1m(0, 1) for s in ("NIFTY", "VIX", "CNXFMCG", "CNXIT")}
         seen = {}
 
-        def capture(nifty_5, nifty_d, vix_5, vix_d, sector_5, sector_d):
+        def capture(nifty_5, nifty_d, vix_5, vix_d, sector_5, sector_d, **kwargs):
             seen["last"] = nifty_5.index[-1]
             seen["nifty_bars"] = len(nifty_5)
             return md("FMCG")

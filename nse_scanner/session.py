@@ -11,10 +11,11 @@ CLOSE = time(15, 30)
 FIRST_BAR = time(9, 15)
 OPEN_MINUTES = 9 * 60 + 15  # 555
 
-# Persistent engine
-OPEN_BLOCK_MIN = 30          # no entries before 09:45
-NO_ENTRY_AFTER_MIN = 345     # 15:00
-FREEZE_AFTER_MIN = 370       # 15:25
+# Opening range of the persistent engine. The entry-time guards that used to sit
+# beside it (no entries before 09:45 / after 15:00, freeze after 15:25) were
+# dead code: nothing called them, and the master scanner's own windows
+# (BUY_W1 09:16-09:59 ... FIN_BUY 09:26-11:15) are the rules that actually
+# bound an entry. They are gone rather than left looking like a safeguard.
 OR_MINUTES = 30              # opening range 09:15-09:45
 
 # Master scanner aggressive windows (bar OPEN time, IST)
@@ -71,15 +72,6 @@ def is_weekday(dt: datetime) -> bool:
     return dt.astimezone(IST).weekday() < 5
 
 
-def is_market_hours(dt: datetime | None = None) -> bool:
-    dt = dt or now_ist()
-    dt = dt.astimezone(IST)
-    if dt.weekday() >= 5:
-        return False
-    t = dt.time()
-    return OPEN <= t <= CLOSE
-
-
 def next_5m_close(dt: datetime | None = None) -> datetime:
     """Next 5-minute wall-clock boundary in IST (bar close)."""
     dt = (dt or now_ist()).astimezone(IST).replace(second=0, microsecond=0)
@@ -91,19 +83,3 @@ def next_5m_close(dt: datetime | None = None) -> datetime:
     return dt + timedelta(minutes=extra)
 
 
-def bar_is_first_of_day(dt: datetime, prev: datetime | None) -> bool:
-    if prev is None:
-        return dt.astimezone(IST).time() <= time(9, 20)
-    return session_date(dt) != session_date(prev)
-
-
-def is_open_blocked(dt: datetime) -> bool:
-    return market_open_minutes(dt) < OPEN_BLOCK_MIN
-
-
-def is_late_blocked(dt: datetime) -> bool:
-    return market_open_minutes(dt) >= NO_ENTRY_AFTER_MIN
-
-
-def is_freeze_time(dt: datetime) -> bool:
-    return market_open_minutes(dt) >= FREEZE_AFTER_MIN

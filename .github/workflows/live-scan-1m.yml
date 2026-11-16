@@ -151,6 +151,12 @@ jobs:
           # bot 1 would have refused (stale index / hair-thin RS).
           SECTOR_MAX_LAG_BARS: ${{ vars.SECTOR_MAX_LAG_BARS || '2' }}
           PICK_RS_MARGIN: ${{ vars.PICK_RS_MARGIN || '0.05' }}
+          PICK_MIN_PERSIST: ${{ vars.PICK_MIN_PERSIST || '50' }}
+          PICK_STICKY_MARGIN: ${{ vars.PICK_STICKY_MARGIN || '5' }}
+          # Entries per pick: bot 3 confirms on the same ceiling as bot 1 (it used
+          # to announce six names where bot 1 announced three).
+          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
+          RANK_BY_SECTOR_LEAD: ${{ vars.RANK_BY_SECTOR_LEAD || '1' }}
           # 1 = also report a projection that did not survive the close.
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}

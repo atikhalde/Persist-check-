@@ -189,6 +189,16 @@ The pick reads the sector list, never a single sector in isolation:
 * **A leader is not dropped for a hair.** `rs` is in percentage points, so
   `PICK_RS_MARGIN` (0.05) is five basis points of noise. With `0` a sector
   leading PERSIST + by 30 points was passed over for reading `rs -0.01`.
+* **A sector has to be persistent to be picked at all.** `PICK_MIN_PERSIST` (50)
+  is the floor the complementary path never had: it used to accept any sector
+  that was merely not fighting the market, while SECTOR FOLLOW demanded 55.
+* **The pick does not flicker.** A challenger must beat the incumbent by
+  `PICK_STICKY_MARGIN` (5) points to take the pick, so two sectors a couple of
+  points apart stop trading it every bar (and the same stock stops being
+  scanned in two sectors). The incumbent is only ever held, never restored: if
+  it goes stale, drops below the floor or rolls over, it is dropped at once.
+  The line carries the arithmetic:
+  `PERSIST + PHA qualified (score 56) · held — FMCG 59 is +3.0, needs 5 to take the pick`.
 * **Whatever is passed over is named**, with the number that did it:
   `PERSIST + FMCG persistent (score 60) · passed over PHA (rs -0.01)`.
 
@@ -353,17 +363,21 @@ bot-3 twin, produced by the same code:
 | start of session | `NSE live scanner started (5m …)` once | `1m projected scan started (bot 3 …)` once |
 | MARKET / SECTOR change | `format_market(md)` when direction or pick moves | the same text, when this loop decided the market (`own`/`auto`) |
 | projected entry | `EARLY` heads-up 60 s before the close | `⚡ EARLY … (1m projection)`, up to 4 min before |
-| entry | `format_stock` + OI line | the same text, with `✅ CONFIRMED` in front |
+| entry | `format_stock` + OI line, at most `MAX_ENTRIES_PER_PICK` per pick, leader first | the same text, with `✅ CONFIRMED` in front — same ceiling, same ranking: a name that does not clear it is told so (`not taken — IT long already has its entries`), never projected and then dropped |
 | 🎯 TARGET HIT / 🛑 SL HIT / 🔔 EMA9 EXIT | `_track_positions` | **the same function** — `pipeline._track_positions(..., send=bot 3, save=1m ledger)` |
 | ⚠ feed delayed | one notice per session on bot 1 | the same notice on bot 3 |
 | ⏰ LATE LEADER | never | the sector's leader fired before its sector was picked: once, labelled, bounded (`SCAN1M_LEADER_CATCHUP`) |
 | ❌ early cancelled | only when `EARLY_…` reports it | only when `SCAN1M_CANCEL_MESSAGE=1` |
 | 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
 
-Positions are opened by the confirm pass exactly as `run_once` opens them
-(`side, entry, sl, entry_ema9, t1–t3, entry_bar, last_bar, session`), so a trade
-confirmed on bot 3 is followed to its targets, its stop and its EMA9 exit — and
-an SL/EXIT also blocks a re-entry for the rest of the session, just like bot 1.
+Positions are opened by the confirm pass through the same `new_position` call
+`run_once` uses (`side, entry, sl, sl0, risk, t_names, entry_ema9, t1–t3,
+entry_bar, last_bar, session`), so a trade confirmed on bot 3 is followed to its
+targets, its stop and its EMA9 exit — and an SL/EXIT also blocks a re-entry for
+the rest of the session, just like bot 1. Bot 3 used to write the record itself,
+which had silently lost `sl0`, `risk` and `t_names`: its target alerts read
+`T1 103.20` where bot 1 read `T1 R1 103.20`, and the R in every later alert was
+measured against a stop that had moved.
 
 **A trade is intraday.** Only candles of the session a trade was entered in are
 replayed, on both scanners: a position left in the ledger by an earlier session
@@ -429,13 +443,12 @@ the workflow set them as repository *Variables*, no commit needed):
 
 A few more decide what a 5m alert is allowed to say. The exit, target and
 sector-pick rules apply to **both** loops — bot 3 trails the same positions,
-renders the same plan and must not scan a sector bot 1 would have refused — so
-they are shared, not forked. Only `MAX_ENTRIES_PER_PICK` and
-`RANK_BY_SECTOR_LEAD` are 5m-only, because the cap only exists there.
+renders the same plan, confirms entries on the same ceiling and must not scan a
+sector bot 1 would have refused — so they are shared, not forked.
 
 | variable | default | what it does |
 |---|---|---|
-| `MAX_ENTRIES_PER_PICK` | `3` | entries per pick (sector + side) per session, `0` = no cap. Six names can fire on one candle (16 Nov: six pharma entries in 35 seconds, all out within 45 minutes for −1.6R); one pick is one risk factor |
+| `MAX_ENTRIES_PER_PICK` | `3` | entries per pick (sector + side) per session, `0` = no cap, enforced by **both** loops. Six names can fire on one candle (16 Nov: six pharma entries in 35 seconds, all out within 45 minutes for −1.6R); one pick is one risk factor. Bot 3 used to confirm all six |
 | `RANK_BY_SECTOR_LEAD` | `1` | which of the names that clear the cap is alerted: ranked by **how far the stock leads its own sector today** (stock move minus sector-index move, both from the session open, in pp), score breaking ties. `0` = rank by the absolute 0–100 `score`, whose "rs" leg is only `close > previous close` — one bar, 15 of 100 points. The alert shows the number: `lead +1.9pp vs sector` |
 | `SECTOR_MAX_LAG_BARS` | `2` | how many 5m bars a sector index may trail the decision bar and still be picked (`-1` = no check). A sector further behind is taken out of PERSIST + / PERSIST − and out of the pick, and shown as `⚠ stale index` |
 | `MIN_TARGET_R` / `MIN_TARGET_PCT` | `0.5` / `0.10` | a pivot closer than this to the entry is not a target (`0` = old behaviour). GODREJCP on 16 Nov: entered 877.25 with T1 at 878.00 — 0.2R, +0.09% — announced as "TARGET HIT +0.2R" |
@@ -443,6 +456,8 @@ they are shared, not forked. Only `MAX_ENTRIES_PER_PICK` and
 | `BREAKEVEN_AFTER_T1` | `1` | once T1 is touched the stop moves to entry, so a hit target cannot turn into a loss (16 Nov: LUPIN +1.3R → +0.2R, NESTLEIND +0.8R → −0.1R). The R in every later alert is still measured against the **original** stop |
 | `MARKET_CONF_DELTA` | `10` | send the market block when confidence moves this many points, not only when the label or the pick changes — 16 Nov slid 99% → 94% → 67% without a message while three entries were taken (`0` = off) |
 | `PICK_RS_MARGIN` | `0.05` | pp of RS a sector may give up and still complement the pick; `0` restores the bare `rs >= 0` test that skipped a persist-91 leader for reading `rs -0.01` |
+| `PICK_MIN_PERSIST` | `50` | persistence a sector needs before it can be picked at all (`0` = no floor). The complementary path used to accept anything not fighting the market, while SECTOR FOLLOW demanded 55: a sector that had been drifting all day could be picked over one that had actually held |
+| `PICK_STICKY_MARGIN` | `5` | points a challenger must beat the incumbent sector by to take the pick (`0` = switch on any margin). Two sectors 2–3 points apart used to trade the pick back and forth every bar, so the same stock was scanned in two sectors. The incumbent is only ever *held*, never *restored*: stale, below-floor or rolled-over and it is dropped at once — and the line says so: `held — FMCG 59 is +3.0, needs 5 to take the pick` |
 
 `python -m nse_scanner doctor` prints the ones that change behaviour most
 (`first minute → up to N min early`, `market source`, `re-projections after a

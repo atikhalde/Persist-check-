@@ -52,8 +52,7 @@ def replay_symbol(raw: str, df5: pd.DataFrame, df1m: pd.DataFrame, d1: pd.DataFr
     df1m = df1m.loc[[session_date(t) <= day for t in df1m.index]]
     full = data.apply_1m_volume(df5, df1m)
     rows: list[dict] = []
-    early: dict | None = None        # the one early alert of the session
-    early_used = False
+    early_used = False               # live: at most one early alert a session
     for ts in [t for t in df5.index if session_date(t) == day]:
         close_at = ts + timedelta(minutes=5)
         hhmm = ts.strftime("%H:%M")
@@ -66,8 +65,8 @@ def replay_symbol(raw: str, df5: pd.DataFrame, df1m: pd.DataFrame, d1: pd.DataFr
                                   d1, hhmm, seen)
                 if fires:
                     early_used = True
-                    pending = early = {"side": fires[-1].side, "name": fires[-1].name,
-                                       "px": float(prov["Close"].iloc[-1])}
+                    pending = {"side": fires[-1].side, "name": fires[-1].name,
+                               "px": float(prov["Close"].iloc[-1])}
         final = _fires_on(raw, full.loc[full.index <= ts], d1, hhmm, close_at)
         close_px = float(full.loc[ts, "Close"])
         base = {"symbol": raw, "bar": hhmm, "close_px": close_px}

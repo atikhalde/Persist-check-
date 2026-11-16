@@ -108,7 +108,7 @@ class GoldenParityTests(TestCase):
         self.signal = None
         self.plan_value = PLAN
 
-    def market_at_bar(self, df, *args):
+    def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
         return self.md
 

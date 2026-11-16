@@ -14,18 +14,15 @@ Outputs:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from datetime import date
 from pathlib import Path
-from typing import Optional
-
 from . import data
 from .data import sanitize_index_5m
 from .market import SECTOR_ORDER, run_market
 from .oi_data import CSV_OIReader, StubOIReader
 from .oi_filter import should_take_entry
-from .session import IST, session_date, to_ist
+from .session import session_date, to_ist
 from .stock import scan_stock
 from .trade import build_plan
 
@@ -123,7 +120,6 @@ def replay_with_oi(target: date, oi_reader, bars_ahead: int = 3):
         if not current:
             continue
 
-        sm1 = data.fetch_many(current, "7d", "1m")
         sd1 = data.fetch_many(current, "90d", "1d")
 
         for raw, ysym in zip(stocks, tickers):

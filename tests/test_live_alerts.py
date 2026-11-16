@@ -88,7 +88,7 @@ class EntryCapTests(TestCase):
             self.addCleanup(p.stop)
         self.send = self.mocks[9]
 
-    def market_at_bar(self, df, *args):
+    def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
         return self.md
 
@@ -186,7 +186,7 @@ class SectorLeadRankingTests(TestCase):
                 out[t] = bars(*self.times)
         return out
 
-    def market_at_bar(self, df, *args):
+    def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
         return self.md
 
@@ -322,7 +322,7 @@ class LiveAlertTests(TestCase):
         self.send = self.mocks[9]
         self.settled = self.contexts[10]
 
-    def market_at_bar(self, df, *args):
+    def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")
         return self.md
 
@@ -946,3 +946,33 @@ class LiveAlertTests(TestCase):
         self.assertNotIn("wide basis day", text)
         self.assertNotIn("⚠", text)
         self.assertIn("Pivot basis 09 Nov", text)
+
+
+class TradeRecordTests(TestCase):
+    """Both bots write one trade record, so both name the pivots they hit."""
+
+    plan = staticmethod(lambda: TradePlan(100.0, 99.8, 99.0, 1.0, 102.0, 104.0, 106.0,
+                                          ("R1", "R2", "R3")))
+
+    def test_the_record_keeps_the_risk_and_the_pivot_names(self):
+        pos = pipeline.new_position("BUY", self.plan(), "2026-11-09T10:00:00+05:30",
+                                    "2026-11-09")
+        self.assertEqual(pos["t_names"], ["R1", "R2", "R3"])
+        self.assertEqual((pos["sl0"], pos["sl"], pos["risk"]), (99.0, 99.0, 1.0))
+        self.assertEqual((pos["t1"], pos["t2"], pos["t3"]), (102.0, 104.0, 106.0))
+        self.assertEqual((pos["entry"], pos["side"], pos["session"]),
+                         (100.0, "BUY", "2026-11-09"))
+
+    def test_a_target_line_names_the_pivot(self):
+        pos = pipeline.new_position("BUY", self.plan(), "2026-11-09T10:00:00+05:30",
+                                    "2026-11-09")
+        text = pipeline.format_target_hit("ABC", pos, BAR, [(1, 102.0)])
+        self.assertIn("T1 R1 102.00", text)
+        self.assertIn("+2.00%", text)
+        self.assertIn("+2.0R", text)          # 2 points against a 1-point risk
+
+    def test_bot3_and_bot1_build_the_record_the_same_way(self):
+        import inspect
+        from nse_scanner import scan1m
+        self.assertIn("new_position", inspect.getsource(scan1m.confirm_pass))
+        self.assertNotIn('"risk":', inspect.getsource(scan1m.confirm_pass))

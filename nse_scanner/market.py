@@ -24,9 +24,7 @@ import pandas as pd
 from . import ta
 from .data import sanitize_index_5m
 from .session import (
-    FREEZE_AFTER_MIN,
     IST,
-    OPEN_BLOCK_MIN,
     OR_MINUTES,
     market_open_minutes,
     session_date,
@@ -243,6 +241,7 @@ def run_market(
     vix_d: pd.DataFrame,
     sector_5: dict[str, pd.DataFrame],
     sector_d: dict[str, pd.DataFrame],
+    prev_pick: dict | None = None,
 ) -> MarketDecision:
     nifty_5 = sanitize_index_5m(nifty_5)
     sector_5 = {k: sanitize_index_5m(v) for k, v in (sector_5 or {}).items()}
@@ -312,12 +311,10 @@ def run_market(
     concrete = 0
     bars_today = 0
 
-    row_i = {t: i for i, t in enumerate(n.index)}
-
     for ts, row in today.iterrows():
         bars_today += 1
         mom = market_open_minutes(to_ist(ts))
-        c, o, h, l = float(row["Close"]), float(row["Open"]), float(row["High"]), float(row["Low"])
+        c, h, l = float(row["Close"]), float(row["High"]), float(row["Low"])
         e9, e21, e50 = float(row["EMA9"]), float(row["EMA21"]), float(row["EMA50"])
         vwap = float(row["VWAP"])
         adx = float(row["ADX"]) if not np.isnan(row["ADX"]) else 0.0
@@ -397,9 +394,6 @@ def run_market(
             conc_commit = 0
 
         warmed = bars_today > CONCRETE_WARMUP
-        last_adx = adx
-        last_vwap = vwap
-        last_pos = npos
         last_or_up = or_up
         last_or_dn = or_dn
         last_slope = vwap_slope
@@ -462,13 +456,25 @@ def run_market(
                      for s in sorted((s for s in snaps.values() if s.stale),
                                      key=lambda s: -s.lag_bars)]
     fresh = [s for s in snaps.values() if not s.stale] or list(snaps.values())
-    persist_plus = sorted(fresh, key=lambda s: s.persist_bull, reverse=True)
-    persist_minus = sorted(fresh, key=lambda s: s.persist_bear, reverse=True)
+    # The lists mean what they say: PERSIST + holds sectors whose live flow is
+    # bullish, PERSIST − the bearish ones. They used to be sorted by persist
+    # alone, so a sector that was up on the day but had rolled over (flow
+    # bearish, persist_bull still high) could sit in "PERSIST +" — and the picker
+    # had to skip it after the fact. Both pools are what the two pickers scan.
+    persist_plus = sorted((s for s in fresh if s.side == 1),
+                          key=lambda s: s.persist_bull, reverse=True)
+    persist_minus = sorted((s for s in fresh if s.side == -1),
+                           key=lambda s: s.persist_bear, reverse=True)
     live_ranked = sorted(fresh, key=lambda s: s.score, reverse=True)
     live_qual = next((s for s in live_ranked if s.qualified), live_ranked[0])
 
     pick, pick_side, reason = _complementary_pick(
         commit_side, dir_conf, regime, persist_plus, persist_minus, vix_chg, n_day_ret
+    )
+    # Persistence is a smoothed score: without this, two sectors a couple of
+    # points apart trade the pick back and forth on consecutive candles.
+    pick, pick_side, reason = _sticky_pick(
+        pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps
     )
 
     action = "WAIT"
@@ -868,28 +874,152 @@ def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_d
     pool = plus if commit_side == 1 else minus
     want_side = commit_side
     margin = max(0.0, pick_rs_margin())
+    floor = max(0.0, pick_min_persist())
     passed: list[str] = []
     for s in pool[:3]:
-        edge = s.rs if want_side == 1 else -s.rs
-        if getattr(s, "stale", False):
-            passed.append(f"{s.name} (index {getattr(s, 'lag_bars', 0)} bars behind)")
+        ok, why = _complements(s, want_side, margin)
+        if not ok:
+            passed.append(f"{s.name} ({why})")
             continue
-        if s.side != want_side:
-            passed.append(f"{s.name} (flow {'bearish' if want_side == 1 else 'bullish'})")
-            continue
-        if edge < -margin:
-            passed.append(f"{s.name} (rs {s.rs:+.2f})")
-            continue
-        if (want_side == 1 and s.day_ret < -0.05) or (want_side == -1 and s.day_ret > 0.05):
-            passed.append(f"{s.name} (day {s.day_ret:+.2f}%)")
+        score = _persist_of(s, want_side)
+        if floor and score < floor:
+            passed.append(f"{s.name} (persist {score:.0f} < {floor:.0f})")
             continue
         tag = "PERSIST +" if want_side == 1 else "PERSIST −"
         q = "qualified" if s.qualified and s.side == want_side else "persistent"
-        text = f"{tag} {s.name} {q} (score {s.persist_bull if want_side==1 else s.persist_bear:.0f})"
+        text = f"{tag} {s.name} {q} (score {score:.0f})"
         return s.name, want_side, _passed_over(text, passed)
     top = pool[0].name if pool else "?"
     text = f"WAIT — persist #{top} does not complement {('BULL' if commit_side==1 else 'BEAR')} market"
     return None, 0, _passed_over(text, passed)
+
+
+def previous_pick(scan: dict | None, bar) -> dict | None:
+    """The pick in force on the candle *before* ``bar`` (``{"name", "side"}``).
+
+    The incumbent for ``PICK_STICKY_MARGIN``. It must be the immediately
+    preceding candle: an entry carried over from an hour ago (a restarted loop,
+    a stale ledger) is not "the current pick", and holding it would be a way to
+    keep trading a sector nobody is watching any more.
+    """
+    scan = scan or {}
+    if scan.get("sector") in (None, "", "WAIT") or scan.get("side") not in (1, -1):
+        return None
+    try:
+        was, now = pd.Timestamp(scan.get("bar")), pd.Timestamp(bar)
+    except (TypeError, ValueError):
+        return None
+    if (was.tzinfo is None) != (now.tzinfo is None):
+        was = was.tz_localize(now.tzinfo) if was.tzinfo is None else was.tz_convert(now.tzinfo)
+        now = now.tz_localize(was.tzinfo) if now.tzinfo is None else now
+    if was != now - pd.Timedelta(minutes=5):
+        return None
+    return {"name": scan["sector"], "side": int(scan["side"])}
+
+
+def _persist_of(s, want_side: int) -> float:
+    """The persistence score that matters on this side."""
+    return float(s.persist_bull if want_side == 1 else s.persist_bear)
+
+
+def _complements(s, want_side: int, margin: float) -> tuple[bool, str]:
+    """Is this sector a usable long (``want_side == 1``) / short complement?
+
+    Returns ``(ok, why-not)`` so every caller — the picker, the sticky rule — can
+    say what it refused and why. The gate is deliberately thin: the pools are
+    already filtered to the sector's own side, the persist floor is applied by
+    the caller, and what is left is "this sector is not fighting the trade".
+    """
+    if getattr(s, "stale", False):
+        return False, f"index {getattr(s, 'lag_bars', 0)} bars behind"
+    if int(getattr(s, "side", 0)) != want_side:
+        return False, f"flow {'bearish' if want_side == 1 else 'bullish'}"
+    edge = float(s.rs) if want_side == 1 else -float(s.rs)
+    if edge < -margin:
+        return False, f"rs {s.rs:+.2f}"
+    if (want_side == 1 and s.day_ret < -0.05) or (want_side == -1 and s.day_ret > 0.05):
+        return False, f"day {s.day_ret:+.2f}%"
+    return True, ""
+
+
+def pick_min_persist() -> float:
+    """Persistence a sector needs before it may be picked at all (``50``).
+
+    The complementary path used to accept any of the top three that was merely
+    *not fighting* the market — no floor at all — while the ``SECTOR_FOLLOW``
+    fallback (used only when Nifty is NEUTRAL) demands 55. The engine was
+    strictest exactly where it was least sure, and a sector at persist 40 could
+    trade. ``0`` restores the old behaviour.
+    """
+    try:
+        return float(os.environ.get("PICK_MIN_PERSIST", "50"))
+    except ValueError:
+        return 50.0
+
+
+def pick_sticky_margin() -> float:
+    """Points a challenger must beat the incumbent sector by to take the pick (5).
+
+    Persistence is a smoothed score, so two sectors a couple of points apart
+    swap the pick on consecutive candles (16 Nov: PHA 56 at 09:35, FMCG 59 at
+    09:50). Since the per-pick cap and the pending early alert are keyed on the
+    pick, every such swap costs a slot and a cancelled heads-up. ``0`` restores
+    the switch-on-any-margin behaviour.
+    """
+    try:
+        return max(0.0, float(os.environ.get("PICK_STICKY_MARGIN", "5")))
+    except ValueError:
+        return 5.0
+
+
+def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
+    """The sector snapshot for ``name`` on this side, or None."""
+    pool = list(plus if want_side == 1 else minus)
+    for s in pool:
+        if s.name == name:
+            return s
+    extra = snaps.values() if isinstance(snaps, dict) else (snaps or ())
+    for s in extra:
+        if getattr(s, "name", None) == name:
+            return s
+    return None
+
+
+def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None):
+    """Hold the incumbent pick unless a challenger clearly beats it.
+
+    ``prev`` is the pick in force on the previous candle (``{"name", "side"}``).
+    The incumbent must still pass the same gate it passed when it was chosen —
+    a sector that has gone stale, rolled over or fallen below the persistence
+    floor is *not* held, so this can only ever delay a switch, never keep a
+    broken pick.
+    """
+    margin = pick_sticky_margin()
+    if not pick or margin <= 0 or not prev:
+        return pick, pick_side, reason
+    name = str(prev.get("name") or "")
+    side = int(prev.get("side") or 0)
+    if not name or name == "WAIT" or side != pick_side or name == pick:
+        return pick, pick_side, reason
+    incumbent = _find_sector(name, side, plus, minus, snaps)
+    challenger = _find_sector(pick, pick_side, plus, minus, snaps)
+    if incumbent is None or challenger is None:
+        return pick, pick_side, reason
+    ok, _ = _complements(incumbent, side, max(0.0, pick_rs_margin()))
+    if not ok:
+        return pick, pick_side, reason
+    inc_score = _persist_of(incumbent, side)
+    if inc_score < max(0.0, pick_min_persist()):
+        return pick, pick_side, reason
+    new_score = _persist_of(challenger, pick_side)
+    if new_score - inc_score >= margin:
+        return pick, pick_side, reason
+    tag = "PERSIST +" if side == 1 else "PERSIST −"
+    q = "qualified" if incumbent.qualified and incumbent.side == side else "persistent"
+    held = (f"{tag} {name} {q} (score {inc_score:.0f}) · held — "
+            f"{pick} {new_score:.0f} is {new_score - inc_score:+.1f}, "
+            f"needs {margin:.0f} to take the pick")
+    return name, side, held
 
 
 def pick_rs_margin() -> float:
