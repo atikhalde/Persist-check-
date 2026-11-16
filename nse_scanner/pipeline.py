@@ -11,7 +11,7 @@ from math import isfinite
 import pandas as pd
 
 from . import data, state, telegram
-from .market import run_market, SECTOR_ORDER
+from .market import previous_pick, run_market, SECTOR_ORDER
 from .oi_data import CSV_OIReader, StubOIReader
 from .oi_filter import should_take_entry
 from .session import IST, now_ist, session_date, to_ist
@@ -76,33 +76,91 @@ def _session_open(df5: pd.DataFrame, last) -> float | None:
     return None
 
 
-def _lead_vs_sector(df5: pd.DataFrame, last, close: float, md, sector: str | None,
-                    long_side: bool) -> float | None:
-    """How far this stock is running ahead of its own sector today, in pp.
+def sector_lead(df5: pd.DataFrame, last, close: float | None,
+                sector_intra: float | None, long_side: bool) -> float | None:
+    """Stock move minus its sector index's move since each session open, in pp.
 
-    ``StockSignal.score`` is absolute: its "rs" leg is ``close > previous
-    close`` — one bar, worth 15 of 100 — so ranking a pick by it keeps the most
-    extended chart, which is not the same thing as the mover in that sector.
-    This is the number the goal is about: the stock's move from the session open
-    minus its sector index's move from its own session open, signed so positive
-    always means "ahead in the direction of the trade".
+    The number the entry cap ranks on: positive always means "ahead of its
+    sector in the direction of the trade". ``None`` when either side of the
+    subtraction is missing — never a guess.
     """
-    if close is None:
+    if close is None or sector_intra is None:
         return None
     open_px = _session_open(df5, last)
-    snap = (getattr(md, "sectors", None) or {}).get(sector or "") or {}
-    if not open_px or not snap:
+    if not open_px:
         return None
     try:
-        stock_intra = (float(close) - open_px) / open_px * 100.0
-        # the sector index's own move from its session open (same basis)
-        if snap.get("intra_ret") is not None:
-            sector_intra = float(snap["intra_ret"])
-        else:
-            sector_intra = float(snap.get("rs", 0.0)) + float(getattr(md, "nifty_intra", 0.0))
+        stock_intra = (float(close) - float(open_px)) / float(open_px) * 100.0
+        return (stock_intra - float(sector_intra)) * (1.0 if long_side else -1.0)
     except (TypeError, ValueError):
         return None
-    return (stock_intra - sector_intra) * (1.0 if long_side else -1.0)
+
+
+def _lead_vs_sector(df5: pd.DataFrame, last, close: float, md, sector: str | None,
+                    long_side: bool) -> float | None:
+    """``sector_lead`` with the sector's intraday % looked up on the decision."""
+    snap = (getattr(md, "sectors", None) or {}).get(sector or "") or {}
+    intra = snap.get("intra_ret") if snap else None
+    return sector_lead(df5, last, close, intra, long_side)
+
+
+def rank_candidates(candidates: list[dict]) -> None:
+    """Order the names that clear the cap: most ahead of its sector first.
+
+    In place, so both loops share one rule. ``lead`` of ``None`` (no sector
+    snapshot, no session open) ranks as 0.0 — neutral, not "worst".
+    """
+    def key(c):
+        score = -float(getattr(c.get("best"), "score", 0) or 0)
+        if not rank_by_sector_lead():
+            return (0.0, score)
+        lead = c.get("lead")
+        return (-(lead if lead is not None else 0.0), score)
+    candidates.sort(key=key)
+
+
+def pick_cap_key(sector: str, side: int) -> str:
+    """One sector on one side is one risk factor."""
+    return f"{sector} {'long' if side == 1 else 'short'}"
+
+
+def entry_cap_room(st: dict, key: str) -> bool:
+    """Is another entry allowed on this pick this session?"""
+    cap = max_entries_per_pick()
+    if not cap:
+        return True
+    return int((st.get("pick_entries") or {}).get(key) or 0) < cap
+
+
+def take_entry_slot(st: dict, key: str) -> None:
+    """Count an entry against its pick."""
+    book = st.setdefault("pick_entries", {})
+    book[key] = int(book.get(key) or 0) + 1
+
+
+def new_position(side: str, plan: TradePlan, bar_iso: str, session: str) -> dict:
+    """The open-trade record — one builder, so the two loops cannot drift.
+
+    Bot 3 used to hand-copy this dict and silently lost ``t_names``, ``sl0`` and
+    ``risk``. Its TARGET HIT lines therefore read ``T1 101.00`` where bot 1's
+    read ``T1 R1 101.00`` for the same trade, and it had no original stop on
+    record once the stop had moved to breakeven.
+    """
+    return {
+        "side": side, "entry": plan.entry, "sl": plan.sl, "sl0": plan.sl,
+        "risk": plan.risk, "t_names": list(plan.pivot_names),
+        "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+        "entry_bar": bar_iso, "last_bar": bar_iso, "session": session,
+    }
+
+
+def _intra_of(snap: dict | None) -> float | None:
+    """A sector snapshot's move from its own open, in % — ``None`` if unknown."""
+    try:
+        intra = (snap or {}).get("intra_ret")
+        return round(float(intra), 3) if intra is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def format_market(md, prev_conf: int | None = None) -> str:
@@ -965,6 +1023,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         d1.get(vix_sym),
         sector_5,
         sector_d,
+        prev_pick=previous_pick(st.get("scan"), last),
     )
     log.info(
         "market %s conf=%s pick=%s action=%s @ %s",
@@ -992,10 +1051,14 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # The next early (pre-close) pass scans this pick; it must be this bar's.
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
     extra = list(getattr(md, "extra_sectors", None) or ()) if scanning else []
+    pick_snap = (getattr(md, "sectors", None) or {}).get(md.pick_sector) or {}
     st["scan"] = {"bar": md.bar_time, "sector": md.pick_sector if scanning else "WAIT",
                   "side": md.pick_side if scanning else 0,
                   "label": md.dir_label, "conf": md.dir_conf,
-                  "extra": extra, "follow": bool(scanning and _follow_tag(md))}
+                  "extra": extra, "follow": bool(scanning and _follow_tag(md)),
+                  # the sector index's move from its own open: bot 3 ranks and
+                  # labels its entries on the same number as bot 1
+                  "intra": _intra_of(pick_snap)}
 
     if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
@@ -1171,21 +1234,16 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                            "close": float(df5["Close"].iloc[-1])})
 
     cap = max_entries_per_pick()
-    side_key = "long" if want_buy else "short"
-    taken = st.setdefault("pick_entries", {})
+    st.setdefault("pick_entries", {})
     # The cap keeps the names that are moving *within* their sector, not the
     # names with the highest absolute score; score breaks ties.
-    if rank_by_sector_lead():
-        candidates.sort(key=lambda c: (-(c["lead"] if c["lead"] is not None else 0.0),
-                                       -float(getattr(c["best"], "score", 0) or 0)))
-    else:
-        candidates.sort(key=lambda c: -float(getattr(c["best"], "score", 0) or 0))
+    rank_candidates(candidates)
     for cand in candidates:
         raw, early, plan, best = cand["raw"], cand["early"], cand["plan"], cand["best"]
         # One sector is one risk factor — counted per sector, not per message, so
         # a SECTOR FOLLOW scan of two sectors does not halve its own cap.
-        pick_key = f"{sector_of[raw]} {side_key}"
-        if cap and int(taken.get(pick_key) or 0) >= cap:
+        pick_key = pick_cap_key(sector_of[raw], md.pick_side)
+        if not entry_cap_room(st, pick_key):
             log.info("cap: %s not taken — %s already has %d entries this session",
                      raw, pick_key, cap)
             if not allow_stale:
@@ -1206,7 +1264,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if early:
             early["result"] = "confirmed"
             _bump(st, "confirmed")
-        taken[pick_key] = int(taken.get(pick_key) or 0) + 1
+        take_entry_slot(st, pick_key)
         lag = max(0.0, (now_ist() - close_at).total_seconds())
         _bump(st, "entries")
         _bump(st, "lag_sum", lag)
@@ -1223,13 +1281,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "time": best.time,
             "price": best.price,
         }
-        positions[raw] = {
-            "side": best.side, "entry": plan.entry, "sl": plan.sl, "sl0": plan.sl,
-            "risk": plan.risk, "t_names": list(plan.pivot_names),
-            "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
-            "entry_bar": last.isoformat(), "last_bar": last.isoformat(),
-            "session": session,
-        }
+        positions[raw] = new_position(best.side, plan, last.isoformat(), session)
         _save(st)  # persist each successful send in long-running live mode
         log.info("ALERT %s %s entry=%.2f sl=%.2f EMA9=%.4f @ %s (sent %s IST)",
                  best.name, raw, plan.entry, plan.sl, plan.ema9, best.time,

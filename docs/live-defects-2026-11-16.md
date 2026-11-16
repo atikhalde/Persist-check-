@@ -310,3 +310,62 @@ the `SECTOR_FOLLOW` fallback that needs 55), and there is **no hysteresis** — 
 2-point margin switches the sector, which now also resets the per-pick cap and
 cancels the pending early alert.
 
+
+## Fifth pass — the whole repo, and the two proposals
+
+The first four passes audited the alert streams. This one reads the codebase
+top to bottom — every module, both workflows, the CLI and its `doctor` line —
+against the same sentence: **pick the persistent moving stock from its sector.**
+Eight defects came out of it; the two proposals from the fourth pass are now
+implemented behind knobs.
+
+### Fixed
+
+| # | what was wrong | why it mattered | fix |
+|---|---|---|---|
+| 1 | `run_market` built PERSIST + / PERSIST − by **sorting on persistence alone** | a sector that led all morning and then rolled over stayed at the top of PERSIST + with a bearish side, and a BULL market could buy the reversal | the pools are filtered to `side == +1` / `−1` first, then ordered; the same sector still shows its persistence — in the other pool |
+| 2 | the complementary pick had **no persistence floor** | it accepted anything that was merely not fighting the market, while the `SECTOR_FOLLOW` fallback demanded 55: a drifting sector could outrank one that had held | `PICK_MIN_PERSIST` (50); the sector passed over is named (`passed over AUTO (persist 42 < 50)`) |
+| 3 | there was **no hysteresis** — a 2-point margin switched the sector | 16 Nov: `PHA → FMCG` one candle later, which also reset the per-pick cap, dropped the pending early alert and rescanned the same stock in another sector | `PICK_STICKY_MARGIN` (5). The incumbent is only ever *held*: stale, below-floor or rolled over and it is dropped at once, so the rule can delay a switch but never prevent one |
+| 4 | bot 3 confirmed **every** name that fired on the close | 16 Nov: six pharma entries in 35 seconds where bot 1 announced three — the same pick was one risk factor on one bot and six on the other | `confirm_pass` collects all candidates, ranks them with the same `rank_candidates`, and enforces the same `entry_cap_room` / `take_entry_slot` on `pick_cap_key`. A capped name is resolved with its reason (`not taken — PHA long already has its entries`), not left to read "did not hold" |
+| 5 | bot 3 wrote its own position record | it had lost `sl0`, `risk` and `t_names`: target alerts read `T1 103.20` where bot 1 read `T1 R1 103.20`, and every later R was measured against a stop that had moved | both loops call `new_position` |
+| 6 | the catch-up window lived only in memory | each minute started a fresh 10-minute window, so a name whose feed lagged was retried until the pick changed | `catchup_due` writes its anchor to the ledger (and to `state`), so the window survives the minute — and the process |
+| 7 | `session.py` carried **dead entry guards** — `is_open_blocked`, `is_late_blocked`, `is_freeze_time`, `is_market_hours` — with `OPEN_BLOCK_MIN` / `NO_ENTRY_AFTER_MIN` / `FREEZE_AFTER_MIN` | nothing called them, so they read like a safeguard that does not exist; the master scanner's own windows (`BUY_W1 09:16–09:59` … `FIN_BUY 09:26–11:15`) are the rules that actually bound an entry | removed, with a note saying so. `OR_MINUTES` (used) stays |
+| 8 | `oi_backtest` fetched a 1-minute frame per bar and **threw it away**; three legacy modules carried unused imports and locals | a network round-trip per bar in a replay, for nothing — and the kind of residue that hides a real bug | the fetch is gone; `pyflakes` is now clean on every module |
+
+### The two fourth-pass proposals, now knobs
+
+| knob | default | old behaviour |
+|---|---|---|
+| `PICK_MIN_PERSIST` | `50` | `0` — no floor |
+| `PICK_STICKY_MARGIN` | `5` pp | `0` — switch on any margin |
+
+Both are settable in the workflow (`vars.*`), printed by `doctor`
+(`persist floor 50 · hold the incumbent by 5`) and shared by both loops. A day
+can be replayed with `PICK_MIN_PERSIST=0 PICK_STICKY_MARGIN=0` to compare it
+against the old pick.
+
+Full-correctness set for the sector pick:
+
+```
+SECTOR_MAX_LAG_BARS=2  PICK_RS_MARGIN=0.05  PICK_MIN_PERSIST=50  PICK_STICKY_MARGIN=5  RANK_BY_SECTOR_LEAD=1
+```
+
+### Not changed, and why
+
+* **`STRONG BULL 99` saturation** and **`rsi` returning NaN instead of Pine's 100
+  on a zero-loss window** are reported, not fixed: neither changes which name
+  alerts, and the second would change the score of a chart the parity harness
+  reproduces bar for bar.
+* **the six-entry morning itself** is the strategy's outcome, not plumbing. The
+  cap and the lead ranking change what the same signals cost; they do not
+  promise a better day.
+
+### Proof
+
+`pytest -q` → **313 passed**; `pyflakes` clean on `nse_scanner/` and `tests/`.
+New tests cover every row above: the pool side filter (a sector that gives back
+3% is a minus with persistence 93), the floor and its `0`, the sticky hold /
+clear switch / faded / stale / below-floor incumbent, `previous_pick` adjacency
+(only the candle 5 minutes earlier, never `WAIT`), bot 3's cap + lead ranking +
+pivot names + "not taken" cancel reason, the CatchupWindow window anchor, and
+the `new_position` record both bots now share.

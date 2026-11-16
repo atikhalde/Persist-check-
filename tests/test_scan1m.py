@@ -118,6 +118,104 @@ class Scan1mFixture(TestCase):
     def ledger(self):
         return state.load(self.dir / "scan1m.json")
 
+# ── the entry rules bot 3 shares with bot 1 ─────────────────────────────────
+class Bot3EntryRuleTests(Scan1mFixture):
+    """One pick is one risk factor on both bots, and the leader goes first.
+
+    Bot 3 used to confirm every name that fired on the close — on 16 Nov that
+    was six pharma entries where bot 1 announced three — and it wrote its own
+    trade record, which had silently lost the pivot names.
+    """
+
+    LAST = {"AAA": 100.4, "BBB": 103.0, "CCC": 100.6, "DDD": 100.2}
+    SECTOR_INTRA = 1.0
+
+    def setUp(self):
+        super().setUp()
+        self.universe["sectors"]["IT"]["stocks"] = ["AAA", "BBB", "CCC", "DDD"]
+        self.pick = {**self.pick, "intra": self.SECTOR_INTRA}
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)     # the whole 10:00 candle
+        self.engine.side_effect = self.scan_all
+        self.plan_for = lambda raw: base.TradePlan(
+            self.LAST[raw], self.LAST[raw], self.LAST[raw] - 1.0, 1.0,
+            self.LAST[raw] + 1.0, self.LAST[raw] + 2.0, self.LAST[raw] + 3.0,
+            ("R1", "R2", "R3"))
+        self.patches.append(patch.object(scan1m, "build_plan",
+                                         side_effect=lambda sig, frame, bar, daily: self.plan_for(sig.symbol)))
+        self.patches[-1].start()
+        self.addCleanup(self.patches[-1].stop)
+
+    def fetch(self, tickers, period, interval):
+        if interval != "5m":
+            return {t: self.minutes for t in tickers}
+        out = {}
+        for t in tickers:
+            c = self.LAST[t[:-3]]
+            idx = self.five.index
+            out[t] = pd.DataFrame({"Open": [100.0] * len(idx),
+                                   "High": [max(100.0, c)] * len(idx),
+                                   "Low": [min(100.0, c)] * len(idx),
+                                   "Close": [c] * len(idx),
+                                   "Volume": [100000.0] * len(idx)}, index=idx)
+        return out
+
+    def scan_all(self, raw, frame, daily, keep_all=False):
+        if frame.index[-1] != BAR:
+            return []
+        return [base.StockSignal(raw, 101, "BUY-EX", "BUY", BAR.strftime("%H:%M"),
+                                 self.LAST[raw], 70, "Strong", 20, 1, "test",
+                                 self.LAST[raw] - 1.0)]
+
+    def test_bot3_confirms_three_of_four_on_the_same_ceiling(self):
+        out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(self.ledger()["pick_entries"], {"IT long": 3})
+        self.assertIn("DDD@10:00", self.ledger()["stats"]["rejected"]["cap"])
+
+    def test_the_leader_is_confirmed_first(self):
+        # BBB is the furthest ahead of its sector (+2.0pp) at the lowest score.
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual([s["symbol"] for s in out], ["BBB"])
+        self.assertIn("AAA@10:00", self.ledger()["stats"]["rejected"]["cap"])
+
+    def test_the_trade_record_is_the_5m_one(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        pos = self.ledger()["positions"]["BBB"]
+        self.assertEqual(pos["t_names"], ["R1", "R2", "R3"])
+        self.assertEqual(pos["sl0"], self.LAST["BBB"] - 1.0)
+        self.assertEqual(pos["risk"], 1.0)
+
+    def test_the_confirmed_text_carries_the_sector_lead(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        texts = [c.args[0] for c in self.bot3.call_args_list]
+        self.assertTrue(any("lead +2.0pp vs sector" in t for t in texts), texts)
+
+    def test_the_lead_is_printed_only_when_the_ranking_is_on(self):
+        with patch.dict("os.environ", {"RANK_BY_SECTOR_LEAD": "0"}):
+            scan1m.confirm_pass(BAR, now=CLOSE)
+        texts = [c.args[0] for c in self.bot3.call_args_list]
+        self.assertEqual(len(texts), 3)
+        self.assertFalse(any("vs sector" in t for t in texts))     # exactly as bot 1
+
+    def test_the_catch_up_window_is_saved_with_the_ledger(self):
+        # It used to live only in memory: every minute started a fresh window, so
+        # a name whose feed lagged was retried until the pick changed or 15:30.
+        scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual(self.ledger()["catchup_pick"]["since"], BAR.isoformat())
+
+    def test_a_capped_out_projection_is_resolved_as_not_taken(self):
+        scan1m.run_minute(BAR, now=MIN1)          # one projection per name
+        self.assertEqual(len(self.ledger()["early"]), 4)
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
+            scan1m.confirm_pass(BAR, now=CLOSE)
+        book = self.ledger()["early"]
+        taken = [raw for raw, e in book.items() if e.get("result") == "confirmed"]
+        self.assertEqual(taken, ["BBB"])
+        self.assertTrue(all(e.get("result") == "cancelled"
+                            for raw, e in book.items() if raw != "BBB"))
+
+
 # ── the projection ──────────────────────────────────────────────────────────
 class Scan1mTests(Scan1mFixture):
     def test_projects_on_minute_one_and_only_to_bot3(self):
@@ -915,3 +1013,31 @@ class Bot3TelegramTests(TestCase):
             self.assertTrue(telegram.send("hi"))
         self.assertEqual(send_to.call_count, 1)
         self.assertEqual(send_to.call_args.kwargs["label"], "primary")
+
+
+class CatchupWindowTests(TestCase):
+    """Catch-ups run around a pick change, for ten minutes — and only then."""
+
+    pick = {"sector": "IT", "side": 1}
+
+    def bar(self, minutes):
+        return BAR + timedelta(minutes=minutes)
+
+    def test_the_window_is_anchored_to_the_first_minute_of_the_pick(self):
+        st = {}
+        self.assertTrue(scan1m.catchup_due(st, self.pick, self.bar(0)))
+        since = st["catchup_pick"]["since"]
+        self.assertTrue(scan1m.catchup_due(st, self.pick, self.bar(5)))
+        self.assertEqual(st["catchup_pick"]["since"], since)       # never re-anchored
+        self.assertTrue(scan1m.catchup_due(st, self.pick, self.bar(10)))
+        self.assertFalse(scan1m.catchup_due(st, self.pick, self.bar(11)))
+
+    def test_a_new_pick_opens_a_new_window(self):
+        st = {}
+        scan1m.catchup_due(st, self.pick, self.bar(0))
+        self.assertTrue(scan1m.catchup_due(st, {**self.pick, "sector": "FMCG"}, self.bar(30)))
+        self.assertEqual(st["catchup_pick"]["key"], "FMCG|1")
+
+    def test_the_switch_can_turn_it_off(self):
+        with patch.dict("os.environ", {"SCAN1M_LEADER_CATCHUP": "0"}):
+            self.assertFalse(scan1m.catchup_due({}, self.pick, self.bar(0)))

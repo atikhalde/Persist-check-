@@ -165,3 +165,118 @@ class PassedOverTests(TestCase):
         self.assertEqual(_lag_bars(bar + pd.Timedelta(minutes=10), bar), 0)   # never negative
         self.assertEqual(_lag_bars(None, bar), 0)
         self.assertEqual(_lag_bars(bar, None), 0)
+
+
+class PersistFloorTests(TestCase):
+    """A sector has to be persistent before it may be picked at all."""
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def pick(self, plus, **env):
+        from unittest.mock import patch
+        with patch.dict("os.environ", env):
+            return _complementary_pick(1, 80, "TREND UP", plus, [], 0.0, 0.5)
+
+    def test_a_shallow_sector_is_not_picked(self):
+        # The complementary path used to accept anything that was merely not
+        # fighting the market: no persistence floor at all, while SECTOR FOLLOW
+        # (used only when Nifty is NEUTRAL) demands 55.
+        plus = [self.snap("AUTO", persist_bull=42.0, rs=0.40),
+                self.snap("FMCG", persist_bull=61.0, rs=0.40)]
+        name, _, reason = self.pick(plus)
+        self.assertEqual(name, "FMCG")
+        self.assertIn("passed over AUTO (persist 42 < 50)", reason)
+
+    def test_the_floor_can_be_switched_off(self):
+        plus = [self.snap("AUTO", persist_bull=42.0, rs=0.40)]
+        name, _, reason = self.pick(plus, PICK_MIN_PERSIST="0")
+        self.assertEqual(name, "AUTO")
+        self.assertIn("score 42", reason)
+
+    def test_the_floor_is_between_the_old_behaviour_and_sector_follow(self):
+        from nse_scanner.market import pick_min_persist
+        from unittest.mock import patch
+        with patch.dict("os.environ", {}):
+            self.assertEqual(pick_min_persist(), 50.0)
+        with patch.dict("os.environ", {"PICK_MIN_PERSIST": "55"}):
+            self.assertEqual(pick_min_persist(), 55.0)
+        with patch.dict("os.environ", {"PICK_MIN_PERSIST": "junk"}):
+            self.assertEqual(pick_min_persist(), 50.0)
+
+
+class StickyPickTests(TestCase):
+    """Two sectors a couple of points apart must not trade the pick back and forth."""
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def pick(self, plus, prev, **env):
+        from nse_scanner.market import _sticky_pick
+        from unittest.mock import patch
+        with patch.dict("os.environ", env):
+            return _sticky_pick("FMCG", 1, "PERSIST + FMCG qualified (score 59)",
+                                plus, [], prev)
+
+    def test_the_incumbent_is_held_when_the_challenger_is_within_the_margin(self):
+        plus = [self.snap("FMCG", persist_bull=59.0, rs=0.40),
+                self.snap("PHA", persist_bull=56.0, rs=0.30)]
+        name, side, reason = self.pick(plus, {"name": "PHA", "side": 1})
+        self.assertEqual((name, side), ("PHA", 1))
+        self.assertIn("held", reason)
+        self.assertIn("FMCG 59 is +3.0, needs 5", reason)
+
+    def test_a_clear_challenger_takes_the_pick(self):
+        plus = [self.snap("FMCG", persist_bull=66.0, rs=0.40),
+                self.snap("PHA", persist_bull=56.0, rs=0.30)]
+        name, _, reason = self.pick(plus, {"name": "PHA", "side": 1})
+        self.assertEqual(name, "FMCG")
+        self.assertNotIn("held", reason)
+
+    def test_the_margin_can_be_switched_off(self):
+        plus = [self.snap("FMCG", persist_bull=57.0, rs=0.40),
+                self.snap("PHA", persist_bull=56.0, rs=0.30)]
+        name, _, _ = self.pick(plus, {"name": "PHA", "side": 1}, PICK_STICKY_MARGIN="0")
+        self.assertEqual(name, "FMCG")
+
+    def test_a_faded_incumbent_is_not_held(self):
+        # The incumbent must still pass the gate it passed when it was chosen.
+        plus = [self.snap("FMCG", persist_bull=59.0, rs=0.40),
+                self.snap("PHA", persist_bull=56.0, rs=-0.40)]      # rs now negative
+        name, _, _ = self.pick(plus, {"name": "PHA", "side": 1})
+        self.assertEqual(name, "FMCG")
+
+    def test_a_stale_incumbent_is_not_held(self):
+        plus = [self.snap("FMCG", persist_bull=59.0, rs=0.40),
+                self.snap("PHA", persist_bull=56.0, rs=0.30, stale=True, lag_bars=6)]
+        name, _, _ = self.pick(plus, {"name": "PHA", "side": 1})
+        self.assertEqual(name, "FMCG")
+
+    def test_an_incumbent_below_the_floor_is_not_held(self):
+        plus = [self.snap("FMCG", persist_bull=59.0, rs=0.40),
+                self.snap("PHA", persist_bull=30.0, rs=0.30)]
+        name, _, _ = self.pick(plus, {"name": "PHA", "side": 1})
+        self.assertEqual(name, "FMCG")
+
+    def test_a_side_change_or_a_wait_gives_no_incumbent(self):
+        plus = [self.snap("FMCG", persist_bull=59.0, rs=0.40)]
+        self.assertEqual(self.pick(plus, {"name": "PHA", "side": -1})[0], "FMCG")
+        self.assertEqual(self.pick(plus, {"name": "WAIT", "side": 0})[0], "FMCG")
+        self.assertEqual(self.pick(plus, None)[0], "FMCG")
+
+
+class PreviousPickTests(TestCase):
+    """The incumbent is the previous candle's pick — never an older one."""
+
+    def test_only_the_adjacent_candle_counts(self):
+        import pandas as pd
+        from nse_scanner.market import previous_pick
+        from nse_scanner.session import IST
+        bar = pd.Timestamp("2026-11-16 10:20", tz=IST)
+        self.assertEqual(previous_pick({"sector": "PHA", "side": 1,
+                                        "bar": "2026-11-16 10:15"}, bar),
+                         {"name": "PHA", "side": 1})
+        self.assertIsNone(previous_pick({"sector": "PHA", "side": 1,
+                                         "bar": "2026-11-16 09:00"}, bar))
+        self.assertIsNone(previous_pick({"sector": "WAIT", "side": 0,
+                                         "bar": "2026-11-16 10:15"}, bar))
+        self.assertIsNone(previous_pick(None, bar))
+        self.assertIsNone(previous_pick({"sector": "PHA", "side": 1}, bar))

@@ -170,6 +170,11 @@ jobs:
           SECTOR_MAX_LAG_BARS: ${{ vars.SECTOR_MAX_LAG_BARS || '2' }}
           # How far (pp) a sector may lag Nifty and still complement the pick.
           PICK_RS_MARGIN: ${{ vars.PICK_RS_MARGIN || '0.05' }}
+          # Persistence a sector needs before it may be picked at all (0 = no floor).
+          PICK_MIN_PERSIST: ${{ vars.PICK_MIN_PERSIST || '50' }}
+          # Points a challenger must beat the incumbent sector by to take the pick
+          # (0 = switch on any margin).
+          PICK_STICKY_MARGIN: ${{ vars.PICK_STICKY_MARGIN || '5' }}
           # A pivot closer than this to entry is resistance, not a target.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}

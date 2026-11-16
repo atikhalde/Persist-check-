@@ -64,6 +64,15 @@ def nifty():
     return pd.concat(out)
 
 
+def crashy(step: float, drop: float, tail: int = 6):
+    """A sector that led all morning and then gave it all back in ``tail`` bars."""
+    df = sector(step)
+    last = df.iloc[-tail:].copy()
+    for col in ("Open", "High", "Low", "Close"):
+        last[col] = last[col] * (1 - drop)
+    return pd.concat([df.iloc[:-tail], last])
+
+
 class StaleSectorTests(TestCase):
     """A sector index that stopped printing is scored, but never picked."""
 
@@ -115,3 +124,44 @@ class StaleSectorTests(TestCase):
         self.assertTrue(md.sectors["FMCG"]["stale"])
         self.assertEqual(md.sectors["FMCG"]["lag_bars"], 5)
         self.assertFalse(md.sectors["PHA"]["stale"])
+
+
+class PoolSideTests(TestCase):
+    """A sector that has rolled over is a short, however persistent it was.
+
+    The two pools used to be sorted by persistence and nothing else, so a sector
+    that spent the morning leading and then reversed sat at the top of PERSIST +
+    with a bearish side, and a BULL market could buy the reversal.
+    """
+
+    def world(self, drop: float):
+        n5 = nifty()
+        sectors = {"PHA": crashy(0.00020, drop),       # led all morning, then fell over
+                   "FMCG": sector(0.00005),            # steady
+                   "MET": sector(-0.00015)}            # falling all day
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        return n5, vix, sectors
+
+    def decide(self, drop: float, **env):
+        n5, vix, sectors = self.world(drop)
+        with patch.dict("os.environ", {"SECTOR_FOLLOW": "1", "PICK_RS_MARGIN": "0", **env}):
+            return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                              {k: daily(v) for k, v in sectors.items()})
+
+    def test_a_rolled_over_sector_is_a_minus_however_persistent(self):
+        md = self.decide(0.03)
+        plus = dict(md.persist_plus)
+        minus = dict(md.persist_minus)
+        self.assertNotIn("PHA", plus)
+        self.assertGreater(minus["PHA"], 90.0)     # never dropped for weakness
+        self.assertEqual(md.pick_side, 1)
+        self.assertNotEqual(md.pick_sector, "PHA")
+
+    def test_the_pools_never_share_a_name(self):
+        md = self.decide(0.03)
+        self.assertEqual(set(dict(md.persist_plus)) & set(dict(md.persist_minus)), set())
+
+    def test_a_steady_leader_is_still_a_plus(self):
+        md = self.decide(0.0)
+        self.assertEqual(md.persist_plus[0][0], "PHA")
+        self.assertEqual(md.pick_sector, "PHA")

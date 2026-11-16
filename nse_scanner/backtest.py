@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict
-from datetime import date, datetime
+from collections import Counter
+from datetime import date
 
 import pandas as pd
 
 from . import data
 from .data import sanitize_index_5m
 from .market import SECTOR_ORDER, run_market
-from .session import IST, session_date, to_ist
+from .session import session_date, to_ist
 from .stock import scan_stock, table_from_fires
 
 log = logging.getLogger("nse_scanner.backtest")

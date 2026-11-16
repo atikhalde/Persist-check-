@@ -47,8 +47,8 @@ Nifty 5m ──► commit_side (dir_state / concrete lock)
 | 2 | the pick can drop the most persistent sector for a **hair-thin RS reading**, and the block never said so (`PERSIST + FMCG …` with the leader silently gone) | medium-high — this is the churn that moved 16 Nov `PHA → FMCG` one candle later | **fixed** (`PICK_RS_MARGIN` + `passed over …`) |
 | 3 | the entry cap ranks by the **absolute** 0–100 `score`, whose "rs" leg is `close > previous close` (one bar, 15 of 100) — never the stock against its own sector | **high for the stated goal** — "best score" ≈ "most extended chart", not "the mover" | **fixed** (`RANK_BY_SECTOR_LEAD`, `lead` on the alert) |
 | 4 | `Live flow` never printed its side: 16 Nov showed `REALTY Q (85)` in a BULL block while REALTY was the **top of PERSIST −** | low, but it reads as the opposite of what it means | **fixed** (`REALTY▼`) |
-| 5 | the path that *trades* (`_complementary_pick`) is **laxer** than the fallback (`_follow_leaders`): no persistence minimum, no range position, no live-flow minimum | medium | **open** — proposed below |
-| 6 | no hysteresis on the pick: a 2-point persistence margin is enough to switch sector mid-trend | medium | **open** — proposed below |
+| 5 | the path that *trades* (`_complementary_pick`) is **laxer** than the fallback (`_follow_leaders`): no persistence minimum, no range position, no live-flow minimum | medium | **fixed** (`PICK_MIN_PERSIST`) — see the fifth pass in [`live-defects`](live-defects-2026-11-16.md) |
+| 6 | no hysteresis on the pick: a 2-point persistence margin is enough to switch sector mid-trend | medium | **fixed** (`PICK_STICKY_MARGIN`) — see the fifth pass in [`live-defects`](live-defects-2026-11-16.md) |
 | 7 | `_complementary_pick` only looks at `pool[:3]`; a leader ranked 4th is unpickable | low (the top 3 is the design) | documented, no change |
 | 8 | 14 stocks sit in 2–3 sectors (`SBIN` in FIN/PSUBK/BANK, `AXISBANK` in FIN/BANK …), so an alert's sector label depends on which pick was live | low | documented, no change |
 
@@ -186,7 +186,12 @@ and as the strongest bearish persistence in the other. Now `REALTY▼ Q (85)` /
 
 ---
 
-## Not fixed — proposals, in the order they would pay
+## Proposals — A and B are now implemented
+
+> A and B shipped behind knobs in the fifth pass of
+> [`live-defects-2026-11-16.md`](live-defects-2026-11-16.md#fifth-pass--the-whole-repo-and-the-two-proposals):
+> `PICK_MIN_PERSIST=50`, `PICK_STICKY_MARGIN=5`, both `0` = the behaviour described
+> below. C is still a note.
 
 **A. The path that trades is the laxer one.** `_complementary_pick` accepts any of
 the top 3 that is `rs >= -0.05`, `day_ret >= -0.05` and not the opposite side: no

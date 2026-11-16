@@ -82,13 +82,17 @@ class WorkflowParityTests(TestCase):
                     "MIN_TARGET_R", "MIN_TARGET_PCT", "EXIT_EMA9_BUFFER_PCT",
                     "EXIT_EMA9_BUFFER_R", "BREAKEVEN_AFTER_T1", "MARKET_CONF_DELTA",
                     # which sector is picked, and on how fresh a tape
-                    "SECTOR_MAX_LAG_BARS", "PICK_RS_MARGIN"):
+                    "SECTOR_MAX_LAG_BARS", "PICK_RS_MARGIN", "PICK_MIN_PERSIST",
+                    "PICK_STICKY_MARGIN",
+                    # one pick is one risk factor on both bots
+                    "MAX_ENTRIES_PER_PICK", "RANK_BY_SECTOR_LEAD"):
             self.assertIn(key, five, f"5m workflow lost {key}")
             self.assertIn(key, one, f"1m workflow lost {key} (a rule input)")
-        self.assertIn("MAX_ENTRIES_PER_PICK", five)      # entries are 5m-only
-        self.assertNotIn("MAX_ENTRIES_PER_PICK", one)
-        self.assertIn("RANK_BY_SECTOR_LEAD", five)       # ranking only matters with a cap
-        self.assertNotIn("RANK_BY_SECTOR_LEAD", one)
+        # The entry ceiling and its ranking are no longer 5m-only: bot 3 confirms
+        # entries for the same pick and must obey the same risk rule.
+        for key in ("MAX_ENTRIES_PER_PICK", "RANK_BY_SECTOR_LEAD"):
+            self.assertIn(key, five)
+            self.assertIn(key, one)
 
     def test_one_bot_three_on_the_second_loop(self):
         one = scan_step(ONE)["env"]
