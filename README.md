@@ -27,7 +27,7 @@ Data: **yfinance** NSE 5-minute bars. Session clock: **Asia/Kolkata**.
 ```
 MARKET BULL  conf 74% STRONG
 Nifty 24810.4  day +0.42%  intra +0.31%
-VIX 12.80 ↓ -3.10%   ADX 26   MTF 3/3
+VIX 12.80 ↓ -3.10%   ADX 26   MTF 3▲
 Breadth 11▲/4▼  TREND UP
 PERSIST +  IT 78 · PHA 71 · FMCG 64
 PERSIST −  AUTO 70 · MET 66 · MEDIA 61
@@ -35,6 +35,14 @@ SECTOR PICK: IT  BULL
 PERSIST + IT qualified (score 78)
 Action: SCAN LONG
 ```
+
+`MTF` shows **both counts** — `MTF 2▲/1▼` is two timeframes bullish, one bearish,
+`MTF 3▲` is all three. It used to print `MTF 2/3`, i.e. only the bullish count,
+which is ambiguous on a bear block: your chart's `MTF 2/3` beside `DIR BEAR` reads
+as *two of three agree with the bear*, while ours printed the complement (`MTF 1/3`)
+for the same tape. 16 Nov 14:41 was exactly that case. Both numbers at once is
+readable under either convention, and the direction decision never used the sign
+(`_dir_conf` takes `abs(bull − bear)`).
 
 **Stock entry** (only same side as the pick)
 

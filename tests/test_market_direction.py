@@ -1,6 +1,7 @@
 """Direction label vs committed side (the "Market NEUTRAL ... BUY" contradiction)."""
 from unittest import TestCase
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from nse_scanner.market import _complementary_pick, _direction_label
@@ -366,6 +367,43 @@ class WeakFollowTests(TestCase):
                                         SECTOR_FOLLOW_ON_WEAK="1"))
 
 
+class MtfLineTests(TestCase):
+    """`MTF 2/3` means two things; the alert must not print an ambiguous number.
+
+    The chart indicator prints it next to its direction row, where it reads as
+    "two of three agree with DIR"; this engine only ever stored the bullish
+    count, so a BEAR block printed the complement — 16 Nov 14:41 was
+    `DIR BEAR 44% Weak · MTF 2/3` on the indicator and `MTF 1/3` on the block.
+    """
+
+    def test_both_counts_are_shown_when_the_timeframes_split(self):
+        from nse_scanner.market import mtf_text
+        self.assertEqual(mtf_text(2), "MTF 2▲/1▼")
+        self.assertEqual(mtf_text(1), "MTF 1▲/2▼")     # the same tape as 2/3 on a BEAR row
+
+    def test_a_unanimous_mtf_needs_one_number(self):
+        from nse_scanner.market import mtf_text
+        self.assertEqual(mtf_text(3), "MTF 3▲")
+        self.assertEqual(mtf_text(0), "MTF 3▼")
+
+    def test_the_bear_block_shows_the_two_bearish_timeframes(self):
+        # The 14:41 block: DIR BEAR 44% WEAK, one timeframe bullish.
+        from nse_scanner.pipeline import format_market
+        md = SimpleNamespace(
+            pick_side=0, dir_label="BEAR", dir_conf=44, dir_tier="WEAK", commit_side=-1,
+            nifty=25217.0, nifty_day_ret=0.29, nifty_intra=0.10, vix=15.63, vix_chg=-6.75,
+            adx=15, mtf_bull=1, regime="TRANSITION", breadth_adv=2, breadth_dec=13,
+            persist_plus=[("FMCG", 93.0)],
+            persist_minus=[("PHA", 95.0), ("MET", 94.0), ("AUTO", 90.0)],
+            live_flow="", live_flow_side=0, live_flow_score=0, live_flow_qualified=False,
+            stale_sectors=[], pick_sector="WAIT", pick_reason="WAIT — test", action="WAIT",
+            bar_time="14:41")
+        text = format_market(md)
+        self.assertIn("MTF 1▲/2▼", text)             # both conventions readable
+        self.assertNotIn("MTF 1/3", text)            # never the bare, sign-blind form
+        self.assertIn("Breadth 2▲/13▼  TRANSITION", text)
+
+
 class DivergenceShortTests(TestCase):
     """Index up, breadth down — the one tape the one-sided rule cannot trade.
 
@@ -413,7 +451,7 @@ class DivergenceShortTests(TestCase):
         # persistent faller and nothing could be shorted. This is that bar.
         out = self.short(adv=9, dec=6, mtf=2, conf=35, minus=[self.faller(persist=76.0)])
         self.assertEqual((out["pick"], out["side"]), ("REALTY", -1))
-        self.assertIn("MTF 2/3", out["reason"])
+        self.assertIn("MTF 2▲/1▼", out["reason"])        # both counts, never "2/3"
         self.assertIn("conf 35%", out["reason"])
         self.assertNotIn("breadth", out["reason"])        # breadth was not the reason
 

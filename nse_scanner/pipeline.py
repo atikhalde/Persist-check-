@@ -164,6 +164,7 @@ def _intra_of(snap: dict | None) -> float | None:
 
 
 def format_market(md, prev_conf: int | None = None) -> str:
+    from .market import mtf_text
     side = "BULL" if md.pick_side == 1 else "BEAR" if md.pick_side == -1 else "FLAT"
     plus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_plus)
     minus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_minus)
@@ -205,7 +206,8 @@ def format_market(md, prev_conf: int | None = None) -> str:
     return (
         f"{head}\n"
         f"Nifty {md.nifty:,.1f}  day {md.nifty_day_ret:+.2f}%  intra {md.nifty_intra:+.2f}%\n"
-        f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   MTF {md.mtf_bull}/3\n"
+        f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   "
+        f"{mtf_text(md.mtf_bull)}\n"
         f"Breadth {md.breadth_adv}▲/{md.breadth_dec}▼  {md.regime}\n"
         f"PERSIST +  {plus}\n"
         f"PERSIST −  {minus}\n"

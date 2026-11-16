@@ -296,6 +296,8 @@ class DivergenceWiringTests(TestCase):
         self.assertIn("short on divergence", text)
         self.assertIn("SECTOR PICK:", text)
         self.assertIn("BEAR", text)
+        from nse_scanner.market import mtf_text
+        self.assertIn(mtf_text(md.mtf_bull), text)      # the block shows both MTF counts
 
 
 class DivergenceStudyTests(TestCase):

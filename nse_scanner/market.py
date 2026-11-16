@@ -549,6 +549,30 @@ def run_market(
     )
 
 
+def mtf_text(mtf_bull: int) -> str:
+    """``MTF 2▲/1▼`` — both counts, because ``MTF 2/3`` is ambiguous.
+
+    The chart indicator prints ``MTF 2/3`` next to its direction row, and those
+    three characters mean two different things depending on the convention: two
+    of three timeframes *agreeing with DIR*, or two of three *bullish*. This
+    engine only ever stored the bullish count, so on a BEAR block the alert
+    printed the complement of the number on the chart — 16 Nov 14:41 read
+    ``DIR BEAR 44% Weak · MTF 2/3`` on the indicator and would have read
+    ``MTF 1/3`` here: the same tape describing itself two ways.
+
+    Showing both counts cannot be misread under either convention, and it is the
+    number the engine's own ``_dir_conf`` uses (``abs(bull - bear)``, which is
+    blind to the sign).
+    """
+    bull = max(0, min(3, int(mtf_bull)))
+    bear = 3 - bull
+    if bear == 0:
+        return f"MTF {bull}▲"
+    if bull == 0:
+        return f"MTF {bear}▼"
+    return f"MTF {bull}▲/{bear}▼"
+
+
 def _direction_label(side: int, strong_bull: bool = False, strong_bear: bool = False) -> str:
     """Label for the side the engine actually trades.
 
@@ -1187,7 +1211,7 @@ def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus,
                 keep.persist_bear + pick_sticky_margin() > best.persist_bear:
             best, held = keep, True
     why = " · ".join(x for x in (
-        f"MTF {mtf_bull}/3" if mtf_bull < 3 else "",
+        mtf_text(mtf_bull) if mtf_bull < 3 else "",
         f"conf {dir_conf}%" if dir_conf < PICK_CONF_GOOD else "",
         f"breadth {breadth_adv}▲/{breadth_dec}▼" if narrow else "") if x)
     reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but {why}; "
