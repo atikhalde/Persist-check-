@@ -444,3 +444,69 @@ class DivergenceShortTests(TestCase):
 
     def test_no_bear_pool_is_no_trade(self):
         self.assertIsNone(self.short(minus=[]))
+
+
+class ConfScaledFloorTests(TestCase):
+    """The floor should rise as the confidence falls.
+
+    16 Nov 09:35: `MARKET BULL conf 56% BUILDING`, `PERSIST + PHA 56 · FMCG 54 ·
+    BANK 48` -> buy PHA at 56. The morning's persistent sector was REALTY
+    (66/76/69 on PERSIST −); the long side never got above 59 and the pharma
+    entries were given up within 40 minutes.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def floor(self, conf, **env):
+        from nse_scanner.market import persist_floor
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1", **env}):
+            return persist_floor(conf)
+
+    def pick(self, conf, plus, **env):
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1", **env}):
+            return _complementary_pick(1, conf, "TRANSITION", plus, [], 0.0, 0.5)
+
+    def test_the_flat_floor_is_the_default(self):
+        from nse_scanner.market import persist_floor
+        with patch.dict("os.environ", {}):
+            self.assertEqual(persist_floor(56), 50.0)
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "0"}):
+            self.assertEqual(persist_floor(56), 50.0)
+
+    def test_the_floor_scales_between_the_gate_and_a_good_confidence(self):
+        self.assertEqual(self.floor(55), 65.0)          # at the gate
+        self.assertEqual(self.floor(70), 50.0)          # a good day: no premium
+        self.assertEqual(self.floor(90), 50.0)          # never below the base
+        self.assertAlmostEqual(self.floor(56), 64.0, places=1)
+        self.assertAlmostEqual(self.floor(62.5), 57.5, places=1)
+
+    def test_a_marginal_confidence_call_needs_a_persistent_sector(self):
+        # the 09:35 bar: conf 56, best long 56 -> now refused
+        plus = [self.snap("PHA", persist_bull=56.0), self.snap("FMCG", persist_bull=54.0)]
+        name, side, reason = self.pick(56, plus)
+        self.assertIsNone(name)
+        self.assertEqual(side, 0)
+        self.assertIn("persist 56 < 64", reason)
+
+    def test_the_same_sector_is_taken_on_a_confident_bar(self):
+        plus = [self.snap("PHA", persist_bull=56.0)]
+        name, side, _ = self.pick(74, plus)
+        self.assertEqual((name, side), ("PHA", 1))
+
+    def test_a_strong_sector_still_passes_on_a_marginal_bar(self):
+        plus = [self.snap("FMCG", persist_bull=93.0)]
+        self.assertEqual(self.pick(56, plus)[0], "FMCG")
+
+    def test_the_premium_can_be_tuned(self):
+        plus = [self.snap("PHA", persist_bull=56.0)]
+        self.assertIsNone(self.pick(56, plus)[0])
+        self.assertEqual(self.pick(56, plus, PICK_LOWCONF_MIN_PERSIST="55")[0], "PHA")
+
+    def test_the_incumbent_is_held_against_the_same_floor(self):
+        from nse_scanner.market import _sticky_pick
+        inc = self.snap("PHA", persist_bull=56.0)
+        near = self.snap("FMCG", persist_bull=58.0)
+        with patch.dict("os.environ", {"PICK_CONF_SCALED_FLOOR": "1"}):
+            held = _sticky_pick("FMCG", 1, "PERSIST + FMCG", [near, inc], [], 
+                                {"name": "PHA", "side": 1}, floor=64.0)
+        self.assertEqual(held[0], "FMCG")      # the incumbent is below the floor: not held

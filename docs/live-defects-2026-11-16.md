@@ -550,8 +550,65 @@ and it can be specified.
 
 ### Proof
 
-`pytest -q` → **346 passed**. New: the stand-aside header (and that a traded
+`pytest -q` → **353 passed**. New: the stand-aside header (and that a traded
 block keeps `MARKET BULL conf …`), the movers line, the `conf 41 < 55` gate text,
 and seven cases on `_follow_fallback` — default-off, the knob on, NEUTRAL
 unchanged, weak BEAR refused, no override of a real pick, a dull sector still
 refused, `SECTOR_FOLLOW=0` still master.
+
+### The "persist test" — the three morning blocks, read against each other
+
+The 09:15 / 09:30 / 09:35 feed, same morning as the 11:55 block:
+
+| bar | label / conf | breadth | PERSIST + | PERSIST − | pick |
+|---|---|---|---|---|---|
+| 09:15 | NEUTRAL 29 WEAK | 10▲/5▼ | PSUBK 59 · PHA 43 · CDUR 42 | **REALTY 66** · MET 54 · PSE 50 | WAIT |
+| 09:30 | BULL 35 WEAK | 9▲/6▼ | PSUBK 50 · PHA 50 · BANK 42 | **REALTY 76** · MET 65 · DEF 59 | WAIT |
+| 09:35 | BULL 56 BUILDING | 8▲/7▼ | **PHA 56** · FMCG 54 · BANK 48 | **REALTY 69** · DEF 66 · PSE 63 | **PHA** |
+| 11:55 | BULL 41 WEAK | 5▲/10▼ | **FMCG 93** · BANK 44 · FIN 32 | **REALTY 91** · AUTO 86 · DEF 83 | WAIT |
+
+Three things the test shows, and only one of them is a defect.
+
+**1. REALTY was the one persistent sector of the day, and the engine was right
+not to trade it.** Top of `PERSIST −` at every bar (66 → 76 → 69 → 91), live flow
+on it at 09:30 and 09:35, and it kept falling. It is the cleanest reading in the
+whole feed. It was also untradeable: the index was `BULL` at every one of those
+bars, and the pick has to agree with the index. The divergence rule
+(`DIVERGENCE_SHORT`) would not have fired either — breadth was **positive** all
+morning (10▲/5▼, 9▲/6▼, 8▲/7▼); it only looks at the 5▲/10▼ tape that arrived
+by 11:55. So on this morning nothing in the current design, on or off, shorts
+REALTY. That is the one-sided rule doing exactly what it was asked to do.
+
+**2. The long side was never persistent, and 09:35 bought the best of a weak
+bunch.** The `PERSIST +` top went 59 → 50 → 56 while the floor was 50. At 09:35
+the pick was `PERSIST + PHA persistent (score 56)` — the label says *persistent*,
+not *qualified*, which is the engine being honest: PHA was not flow-aligned, and
+56 is six points over a 50 floor. The same pharma names were given up within 40
+minutes at the day's high (third pass). This is the floor, not the measurement.
+
+**3. The three paths sat on a gradient and only one number knew it.** 50 for the
+complementary pick, 55 for `SECTOR FOLLOW`, 65 for a weak day reads as "the less
+index confirmation, the more the sector has to prove" — coherent. But the
+complementary floor was flat, so a **conf 56** bar was treated exactly like a
+**conf 96** bar. `PICK_CONF_SCALED_FLOOR` (default **0**) fixes the gradient:
+`PICK_MIN_PERSIST` (50) at conf ≥ 70, `PICK_LOWCONF_MIN_PERSIST` (65) at the 55
+gate, linear between. On the 09:35 bar the floor becomes 64, and:
+
+```
+WAIT — persist #PHA does not complement BULL market · passed over PHA (persist 56 < 64)
+```
+
+The morning's only long entry disappears; FMCG 93 still passes on any bar with
+conf ≥ 55. The incumbent is validated against the same floor, so a pick made at
+conf 74 is dropped — not held — once the confidence falls to the gate.
+
+**Not changed:** the 09:30 block reads `Breadth 9▲/6▼ TREND UP` while the header
+says `WEAK` and the action is `WAIT`. `regime` is a breadth/ADX description, not a
+trade signal, and the header no longer announces a direction it will not use
+(`MARKET STAND ASIDE  BULL lean · conf 35% WEAK`). Considered, left alone.
+
+**Also noted:** at 09:15 `persist` is built on a single bar (30% of it is the day
+move, 25% the position in a one-bar range), so `PSUBK 59` at 09:15 carries the same
+authority on the block as `FMCG 93` at 11:55. The 50/64 floor and the conf-55 gate
+are what keep the first bar from being traded; a "few bars so far" marker on the
+block would be a display nicety, not a fix.

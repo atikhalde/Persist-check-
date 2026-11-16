@@ -183,6 +183,10 @@ jobs:
           # shorted (mirrored gates). 0 = the pick must agree with Nifty.
           DIVERGENCE_SHORT: ${{ vars.DIVERGENCE_SHORT || '0' }}
           DIVERGE_MIN_PERSIST: ${{ vars.DIVERGE_MIN_PERSIST || '65' }}
+          # 1 = the persist floor rises as the confidence falls (50 at conf 70,
+          # 65 at the conf-55 gate). 0 = a flat floor.
+          PICK_CONF_SCALED_FLOOR: ${{ vars.PICK_CONF_SCALED_FLOOR || '0' }}
+          PICK_LOWCONF_MIN_PERSIST: ${{ vars.PICK_LOWCONF_MIN_PERSIST || '65' }}
           # A pivot closer than this to entry is resistance, not a target.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}

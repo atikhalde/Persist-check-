@@ -75,6 +75,10 @@ PICK_MIN_CONF = 55
 # A divergence day: the index is up but the sectors are not (16 Nov 11:55 was
 # Nifty +0.44% with 5 advancing sectors against 10 falling).
 DIVERGE_SPREAD = 2
+# With PICK_CONF_SCALED_FLOOR the persistence floor rises as the confidence
+# falls: pick_min_persist() at this confidence, PICK_LOWCONF_MIN_PERSIST at the
+# 55 gate. 16 Nov 09:35 picked a sector at 56 on a conf-56 bar.
+PICK_CONF_GOOD = 70
 CONCRETE_COMMIT = 2
 CONCRETE_MIN_CONF = 65
 CONCRETE_WARMUP = 3
@@ -483,7 +487,8 @@ def run_market(
     # Persistence is a smoothed score: without this, two sectors a couple of
     # points apart trade the pick back and forth on consecutive candles.
     pick, pick_side, reason = _sticky_pick(
-        pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps
+        pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps,
+        floor=persist_floor(dir_conf),
     )
 
     action = "WAIT"
@@ -922,7 +927,7 @@ def _complementary_pick(commit_side, dir_conf, regime, plus, minus, vix_chg, n_d
     pool = plus if commit_side == 1 else minus
     want_side = commit_side
     margin = max(0.0, pick_rs_margin())
-    floor = max(0.0, pick_min_persist())
+    floor = persist_floor(dir_conf)
     passed: list[str] = []
     for s in pool[:3]:
         ok, why = _complements(s, want_side, margin)
@@ -1003,6 +1008,49 @@ def pick_min_persist() -> float:
         return float(os.environ.get("PICK_MIN_PERSIST", "50"))
     except ValueError:
         return 50.0
+
+
+def conf_scaled_floor() -> bool:
+    """Does the persistence floor rise as the confidence falls (``0``)?
+
+    The three paths already sat on a gradient — 50 for the complementary pick,
+    55 for ``SECTOR FOLLOW``, 65 for a weak day — which reads as "the less index
+    confirmation, the more the sector has to prove". Only the first number was
+    fixed, so on 16 Nov 09:35 a sector at persist 56 was bought on a conf-56 bar:
+    the best of a weak bunch, on the morning the persistent sector was REALTY
+    (66/76/69 on PERSIST −) and the long side never got above 59.
+
+    With this on, the complementary floor moves along the same gradient:
+    ``pick_min_persist()`` at ``PICK_CONF_GOOD`` (70) and up to
+    ``PICK_LOWCONF_MIN_PERSIST`` (65) at the 55 gate. Default ``0`` = flat floor.
+    """
+    return os.environ.get("PICK_CONF_SCALED_FLOOR", "0") != "0"
+
+
+def lowconf_min_persist() -> float:
+    """Floor at the confidence gate when the floor is confidence-scaled (65)."""
+    try:
+        return float(os.environ.get("PICK_LOWCONF_MIN_PERSIST", "65"))
+    except ValueError:
+        return 65.0
+
+
+def persist_floor(dir_conf: int | None = None) -> float:
+    """Persistence the picked sector needs at this confidence.
+
+    ``PICK_MIN_PERSIST`` (50) flat by default; with ``PICK_CONF_SCALED_FLOOR=1``
+    it interpolates to ``PICK_LOWCONF_MIN_PERSIST`` (65) at the 55 gate.
+    ``dir_conf=None`` returns the flat floor (callers with no confidence at hand).
+    """
+    base = max(0.0, pick_min_persist())
+    if not conf_scaled_floor() or base <= 0 or dir_conf is None:
+        return base
+    top = max(base, lowconf_min_persist())
+    if dir_conf >= PICK_CONF_GOOD:
+        return base
+    span = max(1, PICK_CONF_GOOD - PICK_MIN_CONF)
+    frac = max(0.0, min(1.0, (PICK_CONF_GOOD - dir_conf) / span))
+    return base + (top - base) * frac
 
 
 def pick_sticky_margin() -> float:
@@ -1141,7 +1189,7 @@ def _find_sector(name: str, want_side: int, plus, minus, snaps=None):
     return None
 
 
-def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None):
+def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None, floor=None):
     """Hold the incumbent pick unless a challenger clearly beats it.
 
     ``prev`` is the pick in force on the previous candle (``{"name", "side"}``).
@@ -1165,7 +1213,7 @@ def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None):
     if not ok:
         return pick, pick_side, reason
     inc_score = _persist_of(incumbent, side)
-    if inc_score < max(0.0, pick_min_persist()):
+    if inc_score < (max(0.0, pick_min_persist()) if floor is None else floor):
         return pick, pick_side, reason
     new_score = _persist_of(challenger, pick_side)
     if new_score - inc_score >= margin:
