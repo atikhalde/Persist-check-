@@ -1086,6 +1086,91 @@ class AlertInventoryTests(TestCase):
         self.assertIn("Open at the close — no exit alert yet: BANKINDIA 155.12", text)
 
 
+class PendingBookKeepingTests(TestCase):
+    """'not checked' describes the open book — it cannot outlive it.
+
+    The list was set when a trade's candles were missing and never cleared, so a
+    session whose last position had already closed still printed
+    ``not checked this session (no 5m candle): PNB`` in the 15:33 summary.
+    """
+
+    def st(self, positions):
+        return {"session": "2026-11-17", "alerts": {}, "sent": {},
+                "positions": positions, "stats": {"candles": 3, "picks": 1}}
+
+    def trade(self):
+        return {"side": "BUY", "entry": 100.0, "sl": 99.0,
+                "entry_bar": "2026-11-17T10:00:00+05:30",
+                "last_bar": "2026-11-17T10:00:00+05:30"}
+
+    def test_a_closed_book_forgets_what_was_unchecked(self):
+        st = self.st({"PNB": self.trade()})
+        st["stats"]["pending"] = ["PNB"]
+        pipeline._track_positions(st, BAR, "7d", send=self.send_none, save=lambda _: None)
+        self.assertNotIn("pending", st["stats"])
+        self.assertNotIn("not checked", pipeline.format_summary(st))
+
+    def test_an_empty_book_needs_no_save_to_forget_it(self):
+        st = self.st({})
+        st["stats"]["pending"] = ["PNB"]
+        pipeline._track_positions(st, BAR, "7d", send=self.send_none, save=lambda _: None)
+        self.assertNotIn("pending", st["stats"])
+        self.assertIn("Open at the close: none", pipeline.format_summary(st))
+
+    @staticmethod
+    def send_none(text, dry_run=False):
+        return True
+
+
+class SummaryInvariantTests(TestCase):
+    """The counters a reader can check with a pencil must balance.
+
+    The 17 Nov pair failed this: ``with a sector pick 62`` against a sector line
+    summing to 66, because the follow sectors were counted in the pick's book.
+    """
+
+    def test_the_sector_book_sums_to_the_picks(self):
+        from nse_scanner import scan1m
+        stats = {}
+        for i, pick in enumerate([
+                {"sector": "PSUBK", "side": 1, "follow": False, "extra": ["FMCG"],
+                 "bar": "2026-11-17 09:20"},
+                {"sector": "PSUBK", "side": 1, "follow": False, "extra": [],
+                 "bar": "2026-11-17 09:25"},
+                {"sector": "WAIT", "side": 0, "extra": [], "bar": "2026-11-17 09:30"}]):
+            scan1m._count_candle(stats, pick)
+        self.assertEqual(stats["candles"], 3)
+        self.assertEqual(stats["picks"], 2)
+        self.assertEqual(sum(stats["sectors"].values()), stats["picks"])
+        self.assertEqual(stats["extra"], {"FMCG": 1})
+
+    def test_one_candle_is_counted_once_however_often_it_is_judged(self):
+        from nse_scanner import scan1m
+        stats = {}
+        pick = {"sector": "PSUBK", "side": 1, "follow": False, "extra": [],
+                "bar": "2026-11-17 09:20"}
+        for _ in range(4):                    # projection pass, retries, confirm pass
+            scan1m._count_candle(stats, pick)
+        self.assertEqual((stats["candles"], stats["picks"]), (1, 1))
+
+    def test_entries_never_exceed_what_the_cap_allows_per_pick(self):
+        st = {"pick_entries": {}}
+        key = pipeline.pick_cap_key("IT", 1)
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "3"}):
+            for _ in range(3):
+                self.assertTrue(pipeline.entry_cap_room(st, key))
+                pipeline.take_entry_slot(st, key)
+            self.assertFalse(pipeline.entry_cap_room(st, key))
+            self.assertTrue(pipeline.entry_cap_room(st, pipeline.pick_cap_key("PHA", 1)))
+
+    def test_the_two_loops_charge_the_cap_to_the_same_keys(self):
+        # One sector on one side is one risk factor, and the key is built from the
+        # sector the name lives in — never from the pick it was scanned under.
+        self.assertEqual(pipeline.pick_cap_key("CDUR", 1), "CDUR long")
+        self.assertEqual(pipeline.pick_cap_key("FMCG", -1), "FMCG short")
+        self.assertNotEqual(pipeline.pick_cap_key("CDUR", 1), pipeline.pick_cap_key("FMCG", 1))
+
+
 class TradeRecordTests(TestCase):
     """Both bots write one trade record, so both name the pivots they hit."""
 
