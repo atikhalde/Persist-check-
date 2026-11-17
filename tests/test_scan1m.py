@@ -2,6 +2,7 @@
 import contextlib
 import io
 import inspect
+import os
 from datetime import timedelta
 from pathlib import Path
 from unittest import TestCase
@@ -611,6 +612,18 @@ class SummaryCounterTests(TestCase):
                                                    "BUY", BAR, CLOSE, None))
 
 
+def market_md(**over):
+    """The full MarketDecision shape ``market_alert`` needs, with the fields it reads."""
+    base_fields = dict(
+        dir_state=1, dir_label="BULL", dir_conf=74, dir_tier="Strong", nifty=25000.0,
+        nifty_day_ret=0.6, nifty_intra=0.2, vix=13.2, vix_chg=-1.5, adx=27.0, mtf_bull=3,
+        breadth_adv=28, breadth_dec=12, regime="TREND", persist_plus=[("IT", 82.0)],
+        persist_minus=[("PSU", 12.0)], live_flow="BUY", live_flow_qualified=True,
+        live_flow_score=71.0, pick_sector="IT", pick_side=1, pick_reason="PERSIST + IT",
+        action="SCAN LONG", bar_time="2026-11-09 10:00")
+    return SimpleNamespace(**{**base_fields, **over})
+
+
 class AlertParityTests(Scan1mFixture):
     """Bot 3 gets the whole 5m alert set, not just entries."""
 
@@ -680,6 +693,21 @@ class AlertParityTests(Scan1mFixture):
         self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))   # unchanged: silent
         self.bot3.assert_not_called()
 
+    def test_a_confidence_slide_is_reported_like_bot_1(self):
+        """16 Nov slid 99% -> 67% with no message while three entries were taken."""
+        md = market_md(dir_conf=99)
+        st = {"session": str(BAR.date()), "sent": {}, "stats": {}}
+        scan1m.market_alert(st, {"bar": md.bar_time})
+        self.bot3.reset_mock()
+        scan1m._md_cache[md.bar_time] = market_md(dir_conf=87)      # 12 points
+        with patch.dict("os.environ", {"MARKET_CONF_DELTA": "10"}):
+            self.assertTrue(scan1m.market_alert(st, {"bar": md.bar_time}))
+        self.assertIn("87", self.bot3.call_args.args[0])
+        self.bot3.reset_mock()
+        scan1m._md_cache[md.bar_time] = market_md(dir_conf=80)      # 7 points
+        with patch.dict("os.environ", {"MARKET_CONF_DELTA": "10"}):
+            self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))
+
 
 class KnobTests(Scan1mFixture):
     """The three knobs an operator actually turns."""
@@ -724,9 +752,21 @@ class KnobTests(Scan1mFixture):
         self.minutes = one_minute(0, 1, 2, 3, 4, 5)
         self.fires = False
         self.bot3.reset_mock()
-        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        with patch.dict("os.environ", {"SCAN1M_CANCEL_MESSAGE": "0"}):
+            self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
         self.bot3.assert_not_called()
         self.assertEqual(self.ledger()["early"]["ABC"]["result"], "cancelled")
+
+    def test_a_cancelled_projection_is_reported_by_default(self):
+        """17 Nov cancelled three REALTY projections and said nothing about any."""
+        env = {k: v for k, v in os.environ.items() if k != "SCAN1M_CANCEL_MESSAGE"}
+        with patch.dict("os.environ", env, clear=True):
+            self.assertTrue(scan1m.cancel_message())
+            self.assertEqual(len(scan1m.run_minute(BAR, now=MIN1)), 1)     # projected
+            self.minutes = one_minute(0, 1, 2, 3, 4, 5)
+            self.fires = False                                             # close fails
+            self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        self.assertIn("EARLY CANCELLED", self.bot3.call_args.args[0])
 
 
 class RetryTests(Scan1mFixture):

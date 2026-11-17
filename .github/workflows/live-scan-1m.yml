@@ -187,7 +187,8 @@ jobs:
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also report a projection that did not survive the close.
-          SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
+          # 1 = report a projection that does not survive the close (default).
+          SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '1' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}
           # A sector's leader usually fires BEFORE its sector is picked, so the
           # scan rejects it as "earlier" and it stays silent while the followers
