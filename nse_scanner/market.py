@@ -930,12 +930,19 @@ def _follow_fallback(pick, commit_side, dir_conf, plus):
     leaders = _follow_leaders(plus, need)
     if not leaders:
         return None
+    # Each extra sector brings its own MAX_ENTRIES_PER_PICK budget (the cap is
+    # keyed sector+side), so a NEUTRAL follow scans two sectors for six entries:
+    # 17 Nov 09:25 fired FMCG 73 and CDUR 65 on one 49%-confident candle.
+    # SECTOR_FOLLOW_EXTRAS=0 scans the picked sector only — measured neutral to
+    # negative on that session (−0.4R: it drops −2.0R of losses *and* +2.8R of
+    # profit), so the default stays as it was until a replay says otherwise.
+    extras = [s.name for s in leaders[1:]] if follow_extras() else []
     return {
         "pick": leaders[0].name,
         "side": 1,
         "action": "SCAN LONG",
         "reason": _follow_reason(leaders, note),
-        "extra": [s.name for s in leaders[1:]],
+        "extra": extras,
         "aligned": [s.name for s in leaders if s.qualified],
     }
 
@@ -996,7 +1003,16 @@ def previous_pick(scan: dict | None, bar) -> dict | None:
         was = was.tz_localize(now.tzinfo) if was.tzinfo is None else was.tz_convert(now.tzinfo)
         now = now.tz_localize(was.tzinfo) if now.tzinfo is None else now
     if was != now - pd.Timedelta(minutes=5):
-        return None
+        if not pick_sticky_log():
+            return None
+        # The slot holds this candle itself (the early pass wrote it). The candle
+        # before it is still on record, so the margin does not have to lapse.
+        prev = (scan.get("log") or {}).get((now - pd.Timedelta(minutes=5)).isoformat())
+        if not isinstance(prev, dict):
+            return None
+        if prev.get("name") in (None, "", "WAIT") or prev.get("side") not in (1, -1):
+            return None
+        return {"name": prev["name"], "side": int(prev["side"])}
     return {"name": scan["sector"], "side": int(scan["side"])}
 
 
@@ -1277,6 +1293,44 @@ def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None, floor=N
             f"{pick} {new_score:.0f} is {new_score - inc_score:+.1f}, "
             f"needs {margin:.0f} to take the pick")
     return name, side, held
+
+
+def follow_extras() -> bool:
+    """Scan every follow leader's sector, not just the picked one (1).
+
+    ``0`` scans the picked sector only (see ``_follow_fallback``).
+    """
+    return os.environ.get("SECTOR_FOLLOW_EXTRAS", "1").strip() != "0"
+
+
+def pick_sticky_log() -> bool:
+    """Key the incumbent by bar, so one candle cannot answer twice (0).
+
+    The early pass writes its verdict for the forming candle into the slot the
+    close pass reads as "the candle before this one", so the close pass loses the
+    incumbent and decides on raw score: 17 Nov 09:45 printed REALTY (held, needs
+    5) and then PSUBK, five seconds apart. With this on, the incumbent is looked
+    up in a per-bar log and the margin always applies.
+
+    **Off by default, deliberately.** On 17 Nov the consistent answer was to hold
+    REALTY 96 against PSUBK 97 — and PSUBK's BANKINDIA was the day's best trade
+    (+4.1R). A determinism fix that costs 4R on the only measured session is not
+    a fix until a replay says otherwise; see ``docs/audit-2026-11-17-02.md``.
+    """
+    return os.environ.get("PICK_STICKY_LOG", "0").strip() == "1"
+
+
+def record_pick(scan: dict | None, bar, name: str | None, side: int) -> dict:
+    """``scan["log"]`` with this bar's pick added — the per-bar incumbent trail."""
+    log = dict((scan or {}).get("log") or {})
+    try:
+        key = pd.Timestamp(bar).isoformat()
+    except (TypeError, ValueError):
+        return log
+    log[key] = {"name": name or "WAIT", "side": int(side or 0)}
+    for stale in sorted(log)[:-48]:
+        log.pop(stale, None)
+    return log
 
 
 def lapsed_stickiness(scan: dict | None, bar) -> str:

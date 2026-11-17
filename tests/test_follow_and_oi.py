@@ -154,3 +154,22 @@ class OpenInterestTests(TestCase):
         self.setUp()
         self.csv.write_text("symbol,timestamp,oi,close\nABC,2026-11-09 10:00,not-a-number,1\n")
         self.assertEqual(len(self.run_mode("require")["signals"]), 1)
+
+
+class FollowExtraScanTests(TestCase):
+    """The 5m follow scans what the pick decided, extras included or not."""
+
+    market_at_bar = base.LiveAlertTests.market_at_bar
+
+    def setUp(self):
+        base.LiveAlertTests.setUp(self)
+        self.uni["sectors"]["PHA"] = {"index": "P", "stocks": ["ABC", "PQR"]}
+        self.uni["sectors"]["ENE"] = {"index": "E", "stocks": ["XYZ", "ABC"]}
+
+    def test_a_follow_without_extras_scans_one_sector(self):
+        self.md.dir_state, self.md.dir_label, self.md.dir_conf = 0, "NEUTRAL", 52
+        self.md.pick_sector, self.md.extra_sectors = "PHA", []
+        self.md.pick_reason = "SECTOR FOLLOW — Nifty NEUTRAL, PHA leads"
+        pipeline.run_once()
+        self.assertEqual([c.args[0] for c in self.scan.call_args_list], ["ABC", "PQR"])
+        self.assertEqual(state.load()["scan"]["extra"], [])

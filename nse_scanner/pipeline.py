@@ -11,7 +11,8 @@ from math import isfinite
 import pandas as pd
 
 from . import data, state, telegram
-from .market import lapsed_stickiness, previous_pick, run_market, SECTOR_ORDER
+from .market import (lapsed_stickiness, pick_sticky_log, previous_pick,
+                     record_pick, run_market, SECTOR_ORDER)
 from .oi_data import CSV_OIReader, StubOIReader
 from .oi_filter import should_take_entry
 from .session import IST, now_ist, session_date, to_ist
@@ -52,6 +53,22 @@ def max_entries_per_pick() -> int:
     except ValueError:
         return 3
     return value if value >= 0 else 3
+
+
+def scan_require_target() -> bool:
+    """Refuse a 5m entry with no pivot target at all (1).
+
+    17 Nov: HINDUNILVR was entered ``T2 N/A · T3 N/A`` (−0.6R) and DABUR
+    ``T1 N/A · T2 N/A · T3 N/A`` (−0.8R) — two of the day's ten entries had no
+    exit level at all. ``MIN_TARGET_R`` refuses a target that is too close; this
+    refuses the absence of one, which is bot 3's rule (``SCAN1M_REQUIRE_TARGET``).
+    ``0`` restores the old rule.
+    """
+    return os.environ.get("SCAN5M_REQUIRE_TARGET", "1").strip() != "0"
+
+
+def _plan_has_target(plan) -> bool:
+    return any(getattr(plan, key, None) is not None for key in ("t1", "t2", "t3"))
 
 
 def rank_by_sector_lead() -> bool:
@@ -1087,6 +1104,13 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
     extra = list(getattr(md, "extra_sectors", None) or ()) if scanning else []
     pick_snap = (getattr(md, "sectors", None) or {}).get(md.pick_sector) or {}
+    # The per-bar incumbent trail (PICK_STICKY_LOG=1 only): with it, the early
+    # pass writing this candle cannot erase the candle before it.
+    pick_log = {}
+    if pick_sticky_log():
+        pick_log = record_pick(st.get("scan"), md.bar_time,
+                               md.pick_sector if scanning else "WAIT",
+                               md.pick_side if scanning else 0)
     st["scan"] = {"bar": md.bar_time, "sector": md.pick_sector if scanning else "WAIT",
                   "side": md.pick_side if scanning else 0,
                   "label": md.dir_label, "conf": md.dir_conf,
@@ -1094,6 +1118,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                   # the sector index's move from its own open: bot 3 ranks and
                   # labels its entries on the same number as bot 1
                   "intra": _intra_of(pick_snap)}
+    if pick_log:
+        st["scan"]["log"] = pick_log
 
     if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
@@ -1245,6 +1271,13 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
                 _cancel_early(st, raw, early, "had no valid EMA9 stop",
+                              close=float(df5["Close"].iloc[-1]))
+            continue
+        if not allow_stale and scan_require_target() and not _plan_has_target(plan):
+            log.warning("SKIP %s @ %s: no pivot target (T1/T2/T3 N/A)", raw, best.time)
+            _note_reject(st, "no_target", raw, f"{raw} {best.time}", per_bar=best.time)
+            if early:
+                _cancel_early(st, raw, early, "had no pivot target — nothing to exit at",
                               close=float(df5["Close"].iloc[-1]))
             continue
         best.price = plan.entry

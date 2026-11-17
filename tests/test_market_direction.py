@@ -642,3 +642,62 @@ class StickyLapseNoteTests(TestCase):
 
     def test_an_empty_ledger_has_nothing_to_hold(self):
         self.assertEqual(lapsed_stickiness(None, pd.Timestamp("2026-11-17 09:45")), "")
+
+
+class StickyLogTests(TestCase):
+    """Where the incumbent for PICK_STICKY_MARGIN comes from (PICK_STICKY_LOG).
+
+    17 Nov 09:45: the early pass wrote the forming candle into the slot
+    ``previous_pick`` reads as "the candle before it", so the close pass found no
+    incumbent and took PSUBK 97 over REALTY 96 — the same candle, two answers.
+    """
+
+    def scan(self):
+        from nse_scanner.market import record_pick
+        scan = {"bar": "2026-11-17 09:45", "sector": "REALTY", "side": 1}
+        scan["log"] = record_pick(scan, pd.Timestamp("2026-11-17 09:45"), "REALTY", 1)
+        scan["log"] = record_pick(scan, pd.Timestamp("2026-11-17 09:40"), "REALTY", 1)
+        return scan
+
+    def prev(self, **env):
+        from nse_scanner.market import previous_pick
+        with patch.dict("os.environ", env):
+            return previous_pick(self.scan(), pd.Timestamp("2026-11-17 09:45"))
+
+    def test_the_log_supplies_the_incumbent_the_slot_lost(self):
+        self.assertEqual(self.prev(PICK_STICKY_LOG="1"), {"name": "REALTY", "side": 1})
+
+    def test_the_default_still_reads_the_last_candle_only(self):
+        self.assertIsNone(self.prev())
+
+    def test_a_wait_bar_in_the_log_is_not_an_incumbent(self):
+        from nse_scanner.market import record_pick
+        scan = {"bar": "2026-11-17 09:45", "sector": "WAIT", "side": 0}
+        scan["log"] = record_pick(scan, pd.Timestamp("2026-11-17 09:40"), "WAIT", 0)
+        from nse_scanner.market import previous_pick
+        with patch.dict("os.environ", {"PICK_STICKY_LOG": "1"}):
+            self.assertIsNone(previous_pick(scan, pd.Timestamp("2026-11-17 09:45")))
+
+
+class FollowExtrasTests(TestCase):
+    """A follow scans every leader's sector — or only the one it picked.
+
+    17 Nov 09:25: MARKET NEUTRAL 49% + SECTOR FOLLOW fired six entries on one
+    candle, three from FMCG 73 and three from CDUR 65, because each extra sector
+    brings its own MAX_ENTRIES_PER_PICK budget.
+    """
+
+    snap = staticmethod(SectorFollowTests.snap)
+
+    def follow(self, **env):
+        from nse_scanner.market import _follow_fallback
+        plus = [self.snap(), self.snap("ENE", persist_bull=88)]
+        with patch.dict("os.environ", env):
+            return _follow_fallback(None, 0, 0, plus)
+
+    def test_both_leaders_are_scanned_by_default(self):
+        self.assertEqual(self.follow()["extra"], ["ENE"])
+
+    def test_the_picked_sector_alone_when_the_knob_is_off(self):
+        follow = self.follow(SECTOR_FOLLOW_EXTRAS="0")
+        self.assertEqual((follow["pick"], follow["extra"]), ("PHA", []))

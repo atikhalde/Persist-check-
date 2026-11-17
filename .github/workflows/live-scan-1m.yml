@@ -181,6 +181,11 @@ jobs:
           # to announce six names where bot 1 announced three).
           MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
           RANK_BY_SECTOR_LEAD: ${{ vars.RANK_BY_SECTOR_LEAD || '1' }}
+          # Bot 3 reads the 5m pick, so the 5m entry rules are forwarded too: the
+          # two loops must agree on the sector, the stock and the ceiling.
+          SCAN5M_REQUIRE_TARGET: ${{ vars.SCAN5M_REQUIRE_TARGET || '1' }}
+          PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
+          SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also report a projection that did not survive the close.
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '0' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}

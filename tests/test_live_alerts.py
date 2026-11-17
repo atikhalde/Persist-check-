@@ -35,6 +35,12 @@ def quiet_bars(*times, close=100.0, high=100.01, low=99.99):
                          "Volume": [1000] * len(times)}, index=pd.DatetimeIndex(times))
 
 
+def daily_bar(day):
+    """A previous session with an 8-point range, so pivots sit a % from 100."""
+    return pd.DataFrame({"Open": [100.0], "High": [104.0], "Low": [96.0], "Close": [100.0],
+                         "Volume": [1000]}, index=pd.DatetimeIndex([day]))
+
+
 def signal(time="10:00", code=101, side="BUY"):
     return StockSignal("ABC", code, "BUY-EX", side, time, 100.0, 65,
                        "Strong", 20, 1, "test", 99.0)
@@ -82,6 +88,13 @@ class EntryCapTests(TestCase):
             patch.object(pipeline, "scan_stock", side_effect=self.scan),
             patch.object(pipeline.telegram, "send", return_value=True),
             patch.object(pipeline, "_unsettled", return_value=(set(), False)),
+            # A real daily frame: ``pivot_basis`` needs a *previous* session, and
+            # the stock feed above answers interval="1d" with 5m bars from today,
+            # which left every fixture plan with T1/T2/T3 N/A. Since
+            # SCAN5M_REQUIRE_TARGET those plans are (correctly) refused. Appended
+            # last on purpose: the tests index ``self.mocks``.
+            patch.object(pipeline.data, "fetch_daily", side_effect=lambda tickers, period: {
+                t: daily_bar(BAR - timedelta(days=1)) for t in tickers}),
         ]
         self.mocks = [p.start() for p in self.contexts]
         for p in self.contexts:
@@ -165,6 +178,13 @@ class SectorLeadRankingTests(TestCase):
             patch.object(pipeline, "scan_stock", side_effect=self.scan),
             patch.object(pipeline.telegram, "send", return_value=True),
             patch.object(pipeline, "_unsettled", return_value=(set(), False)),
+            # A real daily frame: ``pivot_basis`` needs a *previous* session, and
+            # the stock feed above answers interval="1d" with 5m bars from today,
+            # which left every fixture plan with T1/T2/T3 N/A. Since
+            # SCAN5M_REQUIRE_TARGET those plans are (correctly) refused. Appended
+            # last on purpose: the tests index ``self.mocks``.
+            patch.object(pipeline.data, "fetch_daily", side_effect=lambda tickers, period: {
+                t: daily_bar(BAR - timedelta(days=1)) for t in tickers}),
         ]
         self.mocks = [p.start() for p in self.contexts]
         for p in self.contexts:
@@ -345,6 +365,13 @@ class LiveAlertTests(TestCase):
             # realistic 1m stream: treat the feed as settled (see test_early_alerts
             # for the half-published-candle rules themselves).
             patch.object(pipeline, "_unsettled", return_value=(set(), False)),
+            # A real daily frame: ``pivot_basis`` needs a *previous* session, and
+            # the stock feed above answers interval="1d" with 5m bars from today,
+            # which left every fixture plan with T1/T2/T3 N/A. Since
+            # SCAN5M_REQUIRE_TARGET those plans are (correctly) refused. Appended
+            # last on purpose: the tests index ``self.mocks``.
+            patch.object(pipeline.data, "fetch_daily", side_effect=lambda tickers, period: {
+                t: daily_bar(BAR - timedelta(days=1)) for t in tickers}),
         ]
         self.mocks = [p.start() for p in self.contexts]
         for p in self.contexts:
@@ -515,8 +542,11 @@ class LiveAlertTests(TestCase):
         self.md.pick_side, self.md.dir_state, self.md.dir_label = -1, -1, "BEAR"
         self.scan.return_value = [signal(side="SELL", code=201)]
         entry = pipeline.run_once()["signals"][0]
+        # A real daily frame is now in the fixture (SCAN5M_REQUIRE_TARGET needs a
+        # pivot basis to exist for the entry to be allowed at all), so the short
+        # has its three levels instead of three N/As.
         self.assertEqual((entry["price"], entry["sl"], entry["t1"], entry["t2"], entry["t3"]),
-                         (100.0, 100.02, None, None, None))
+                         (100.0, 100.02, 96.0, 92.0, 88.0))
         self.now = BAR + timedelta(minutes=11)
         self.md.pick_sector, self.md.action, self.md.pick_side = "WAIT", "WAIT", 0
         trailing = quiet_bars(*self.times, high=100.0, low=99.5)
@@ -530,7 +560,8 @@ class LiveAlertTests(TestCase):
     def test_passing_all_pivot_targets_does_not_exit_before_ema_close(self):
         pipeline.run_once()
         st = state.load()
-        st["positions"]["ABC"].update(t1=100.1, t2=100.2, t3=100.3)
+        st["positions"]["ABC"].update(t1=100.1, t2=100.2, t3=100.3,
+                                      t_names=[None, None, None])
         state.save(st)
         self.now = BAR + timedelta(minutes=11)
         trailing = quiet_bars(*self.times)
@@ -978,6 +1009,33 @@ class LiveAlertTests(TestCase):
         self.assertNotIn("wide basis day", text)
         self.assertNotIn("⚠", text)
         self.assertIn("Pivot basis 09 Nov", text)
+
+
+class TargetGateTests(LiveAlertTests):
+    """No pivot target at all means no entry (SCAN5M_REQUIRE_TARGET).
+
+    17 Nov: HINDUNILVR was entered ``T2 N/A · T3 N/A`` (−0.6R) and DABUR
+    ``T1 N/A · T2 N/A · T3 N/A`` (−0.8R). Both had no exit level; bot 3 has
+    refused that since the 1m round, bot 1 did not.
+    """
+
+    def settings(self, **env):
+        return patch.dict("os.environ", {"MIN_TARGET_R": "999", **env})
+
+    def test_an_entry_without_a_target_is_refused_and_reported(self):
+        with self.settings():
+            self.assertEqual(pipeline.run_once()["signals"], [])
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertIn("ABC@10:00", state.load()["stats"]["rejected"]["no_target"])
+        self.assertEqual([c for c in self.send.call_args_list if c.args[0].startswith("stock")], [])
+
+    def test_the_old_rule_can_be_restored(self):
+        with self.settings(SCAN5M_REQUIRE_TARGET="0"):
+            self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+        self.assertIn("ABC", state.load()["positions"])
+
+    def test_a_plan_with_a_target_is_untouched(self):
+        self.assertEqual(len(pipeline.run_once()["signals"]), 1)
 
 
 class TradeRecordTests(TestCase):
