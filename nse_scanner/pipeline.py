@@ -432,11 +432,26 @@ _REJECT_TEXT = (
 
 
 def _summary_sectors(x: dict) -> str:
+    """Candles per picked sector — the pick only, once per candle.
+
+    A follow scan *also* scans the other leaders' sectors, and those used to be
+    counted in the same book: 17 Nov's 5m block read ``PSUBK 27 · REALTY 26 ·
+    BANK 5 · CDUR 3 · FMCG 2 · REALTY 2 · PSUBK 1`` against ``with a sector pick
+    62`` — 66 counts for 62 candles, and bot 3 (which counted the pick alone)
+    reported the same day as 62. Two blocks, two arithmetics, one label. The
+    pick is counted once; what it dragged along is a separate clause.
+    """
     picked = x.get("sectors") or {}
     if not picked:
         return "Sectors picked: none — the market said WAIT on every scanned candle"
     parts = [f"{name} {n}" for name, n in sorted(picked.items(), key=lambda kv: -kv[1])]
-    return "Sectors picked (candles): " + " · ".join(parts)
+    line = "Sectors picked (candles): " + " · ".join(parts)
+    extra = x.get("extra") or {}
+    if extra:
+        line += (" · followed: "
+                 + " · ".join(f"{name} {n}" for name, n in
+                              sorted(extra.items(), key=lambda kv: (-kv[1], kv[0]))))
+    return line
 
 
 def _summary_rejects(st: dict) -> str:
@@ -1184,9 +1199,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             side = "long" if md.pick_side == 1 else "short"
             tag = ", follow" if _follow_tag(md) else ""
             book = st["stats"].setdefault("sectors", {})
-            for name in [md.pick_sector, *extra]:
-                key = f"{name} {side}{tag}"
-                book[key] = book.get(key, 0) + 1
+            key = f"{md.pick_sector} {side}{tag}"
+            book[key] = book.get(key, 0) + 1          # the pick, once per candle
+            followed = st["stats"].setdefault("extra", {})
+            for name in extra:                        # what it dragged along
+                followed[name] = followed.get(name, 0) + 1
 
     # market / sector change alerts
     prev_m = st.get("market") or {}

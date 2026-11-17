@@ -57,7 +57,9 @@ class FollowScanTests(TestCase):
             self.assertEqual(pipeline.run_once()["signals"], [])
         text = pipeline.format_summary(state.load())
         self.assertIn("Candles scanned 1 of 75 · with a sector pick 1", text)
-        self.assertIn("Sectors picked (candles): PHA long, follow 1 · ENE long, follow 1", text)
+        # The pick is counted once per candle; the sector it dragged along is a
+        # separate clause, so the numbers add up to "with a sector pick 1".
+        self.assertIn("Sectors picked (candles): PHA long, follow 1 · followed: ENE 1", text)
         self.assertIn("Signals not alerted: 2 fired before their sector was picked "
                       "(ABC 09:30, XYZ 09:40) · 2 on the opposite side to the pick "
                       "(PQR 10:00, XYZ 10:00)", text)

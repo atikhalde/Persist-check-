@@ -201,6 +201,26 @@ class Bot3EntryRuleTests(Scan1mFixture):
         self.assertEqual(len(texts), 3)
         self.assertFalse(any("vs sector" in t for t in texts))     # exactly as bot 1
 
+    def test_the_cap_is_charged_to_the_names_own_sector(self):
+        """A follow scan must not charge an extra sector's names to the pick.
+
+        17 Nov: bot 3 refused BLUESTARCO (CDUR) as "the pick already had its
+        entries" from the FMCG budget, while bot 1 — which keys the cap per
+        candidate's sector — took it for +2.8R.
+        """
+        self.universe["sectors"]["PHA"] = {"index": "PHA-I", "stocks": ["EEE"]}
+        self.pick = {**self.pick, "extra": ["PHA"]}
+        self.LAST["EEE"], self.SECTOR_INTRA = 101.0, 1.0
+        st = {"session": str(BAR.date()), "sent": {}, "positions": {}, "early": {},
+              "stats": {}, "pick_entries": {"IT long": 3}}   # the pick is full
+        state.save(st, self.dir / "scan1m.json")
+        with patch.object(scan1m, "_scan_list", return_value={"AAA": "IT", "EEE": "PHA"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual([s["symbol"] for s in out], ["EEE"])
+        self.assertIn("AAA@10:00", self.ledger()["stats"]["rejected"]["cap"])
+        self.assertIn("EEE", self.ledger()["sent"])
+        self.assertEqual(self.ledger()["pick_entries"], {"IT long": 3, "PHA long": 1})
+
     def test_the_catch_up_window_is_saved_with_the_ledger(self):
         # It used to live only in memory: every minute started a fresh window, so
         # a name whose feed lagged was retried until the pick changed or 15:30.
@@ -707,6 +727,41 @@ class AlertParityTests(Scan1mFixture):
         scan1m._md_cache[md.bar_time] = market_md(dir_conf=80)      # 7 points
         with patch.dict("os.environ", {"MARKET_CONF_DELTA": "10"}):
             self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))
+
+
+class SummarySectorArithmeticTests(TestCase):
+    """The sector line has one definition, and the counts add up to the header.
+
+    17 Nov, same day, same field: bot 1 read ``PSUBK 27 · REALTY 26 · BANK 5 ·
+    CDUR 3 · FMCG 2 · REALTY 2 · PSUBK 1`` (66 counts) against ``with a sector
+    pick 62``, bot 3 read 62 — because bot 1 counted the follow sectors inside
+    the pick's book and bot 3 did not.
+    """
+
+    def test_the_pick_is_counted_once_and_the_follows_separately(self):
+        from nse_scanner.pipeline import _summary_sectors
+        line = _summary_sectors({"sectors": {"PSUBK long": 27, "REALTY long": 26,
+                                             "BANK long": 5, "CDUR long, follow": 3},
+                                 "extra": {"FMCG": 2, "REALTY": 2, "PSUBK": 1}})
+        self.assertIn("PSUBK long 27", line)
+        self.assertIn("· followed: FMCG 2 · REALTY 2 · PSUBK 1", line)
+        # 27 + 26 + 5 + 3 = 61 picked candles, and the follows are not candles.
+        picked = sum(v for k, v in {"PSUBK long": 27, "REALTY long": 26,
+                                    "BANK long": 5, "CDUR long, follow": 3}.items())
+        self.assertEqual(picked, 61)
+
+    def test_both_loops_book_the_same_keys(self):
+        book = {"sectors": {}, "extra": {}}
+        pick = {"sector": "PSUBK", "side": 1, "follow": False, "extra": ["FMCG"],
+                "bar": "2026-11-17 09:20"}
+        scan1m._count_candle(book, pick)
+        self.assertEqual(book["sectors"], {"PSUBK long": 1})
+        self.assertEqual(book["extra"], {"FMCG": 1})
+
+    def test_a_candle_without_a_pick_counts_nothing_but_the_candle(self):
+        book = {"sectors": {}, "extra": {}}
+        scan1m._count_candle(book, {"sector": "WAIT", "side": 0, "bar": "2026-11-17 09:25"})
+        self.assertEqual((book["candles"], book["picks"], book["sectors"]), (1, 0, {}))
 
 
 class KnobTests(Scan1mFixture):
