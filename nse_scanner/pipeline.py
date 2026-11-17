@@ -11,7 +11,7 @@ from math import isfinite
 import pandas as pd
 
 from . import data, state, telegram
-from .market import previous_pick, run_market, SECTOR_ORDER
+from .market import lapsed_stickiness, previous_pick, run_market, SECTOR_ORDER
 from .oi_data import CSV_OIReader, StubOIReader
 from .oi_filter import should_take_entry
 from .session import IST, now_ist, session_date, to_ist
@@ -1058,6 +1058,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         sector_5,
         sector_d,
         prev_pick=previous_pick(st.get("scan"), last),
+        sticky_note=lapsed_stickiness(st.get("scan"), last),
     )
     log.info(
         "market %s conf=%s pick=%s action=%s @ %s",

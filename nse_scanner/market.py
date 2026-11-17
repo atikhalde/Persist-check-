@@ -254,6 +254,7 @@ def run_market(
     sector_5: dict[str, pd.DataFrame],
     sector_d: dict[str, pd.DataFrame],
     prev_pick: dict | None = None,
+    sticky_note: str = "",
 ) -> MarketDecision:
     nifty_5 = sanitize_index_5m(nifty_5)
     sector_5 = {k: sanitize_index_5m(v) for k, v in (sector_5 or {}).items()}
@@ -490,6 +491,10 @@ def run_market(
         pick, pick_side, reason, persist_plus, persist_minus, prev_pick, snaps,
         floor=persist_floor(dir_conf),
     )
+    if sticky_note and prev_pick is None:
+        # The margin could not be applied because the incumbent is unreadable,
+        # not because there was none. Say which.
+        reason = f"{reason}{sticky_note}"
 
     action = "WAIT"
     if pick and pick_side == 1 and commit_side == 1:
@@ -1272,6 +1277,32 @@ def _sticky_pick(pick, pick_side, reason, plus, minus, prev, snaps=None, floor=N
             f"{pick} {new_score:.0f} is {new_score - inc_score:+.1f}, "
             f"needs {margin:.0f} to take the pick")
     return name, side, held
+
+
+def lapsed_stickiness(scan: dict | None, bar) -> str:
+    """Why an incumbent pick could not be held on ``bar`` (``""`` if there was one).
+
+    ``previous_pick`` needs the candle *immediately before* ``bar``. The early
+    (pre-close) pass writes its verdict for the forming candle into the same
+    ledger slot the close pass reads as "the candle before this one", so the
+    second look at one candle finds the slot already holding ``bar`` and drops
+    the incumbent — the sticky margin silently stops applying and the pick can
+    flip inside a single candle. 17 Nov 09:45: REALTY 96 was held at 09:44 and
+    PSUBK 97 took the pick at 09:50 on the same candle, printing two market
+    blocks five seconds apart. A flip that says nothing is indistinguishable
+    from a bug; this note is the difference.
+    """
+    scan = scan or {}
+    if scan.get("sector") in (None, "", "WAIT") or scan.get("side") not in (1, -1):
+        return ""
+    try:
+        was, now = pd.Timestamp(scan.get("bar")), pd.Timestamp(bar)
+    except (TypeError, ValueError):
+        return ""
+    if was != now:
+        return ""
+    return (f" · {scan['sector']} not held — this candle's pick was already "
+            f"written, so the candle before it is gone")
 
 
 def pick_rs_margin() -> float:

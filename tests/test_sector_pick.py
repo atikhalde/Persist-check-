@@ -357,3 +357,29 @@ class DivergenceStudyTests(TestCase):
         self.assertIn("REALTY", text)
         self.assertIn("kept falling", text)
         self.assertIn("no divergence bar", render_divergence([], "2026-11-16"))
+
+
+class StickyLapseOnThePickLineTests(TestCase):
+    """The note reaches ``pick_reason`` — and only when the incumbent was lost."""
+
+    def world(self):
+        n5 = nifty()
+        sectors = {"PHA": sector(0.00005), "FMCG": sector(0.00020, tail_bars=6),
+                   "MET": sector(-0.00015)}
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        return n5, vix, sectors
+
+    def decide(self, **kw):
+        n5, vix, sectors = self.world()
+        with patch.dict("os.environ", {"SECTOR_FOLLOW": "1"}):
+            return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                              {k: daily(v) for k, v in sectors.items()}, **kw)
+
+    def test_the_note_is_appended_when_no_incumbent_was_readable(self):
+        md = self.decide(prev_pick=None, sticky_note=" · REALTY not held — gone")
+        self.assertIn("REALTY not held", md.pick_reason)
+
+    def test_the_note_is_not_appended_when_an_incumbent_existed(self):
+        md = self.decide(prev_pick={"name": "PHA", "side": 1},
+                         sticky_note=" · REALTY not held — gone")
+        self.assertNotIn("REALTY not held", md.pick_reason)

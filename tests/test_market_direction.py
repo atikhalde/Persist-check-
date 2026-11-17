@@ -1,10 +1,12 @@
 """Direction label vs committed side (the "Market NEUTRAL ... BUY" contradiction)."""
 from unittest import TestCase
 
+import pandas as pd
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from nse_scanner.market import _complementary_pick, _direction_label
+from nse_scanner.market import _complementary_pick, _direction_label, lapsed_stickiness
 
 
 class DirectionLabelTests(TestCase):
@@ -612,3 +614,31 @@ class ConfScaledFloorTests(TestCase):
             held = _sticky_pick("FMCG", 1, "PERSIST + FMCG", [near, inc], [], 
                                 {"name": "PHA", "side": 1}, floor=64.0)
         self.assertEqual(held[0], "FMCG")      # the incumbent is below the floor: not held
+
+
+class StickyLapseNoteTests(TestCase):
+    """A skipped sticky hold says so, instead of flipping the pick in silence.
+
+    17 Nov 09:45: the early pass held REALTY 96 on the forming 09:45 candle, the
+    close pass took PSUBK 97 on the same candle, and two market blocks printed
+    five seconds apart with no word about why the margin had stopped applying.
+    ``previous_pick`` needs the candle before ``bar``; the early pass had already
+    written ``bar`` into that slot.
+    """
+
+    def test_a_scan_for_this_candle_loses_the_incumbent(self):
+        scan = {"bar": "2026-11-17 09:45", "sector": "REALTY", "side": 1}
+        note = lapsed_stickiness(scan, pd.Timestamp("2026-11-17 09:45"))
+        self.assertIn("REALTY not held", note)
+        self.assertIn("already", note)
+
+    def test_the_candle_before_it_is_a_usable_incumbent(self):
+        scan = {"bar": "2026-11-17 09:40", "sector": "REALTY", "side": 1}
+        self.assertEqual(lapsed_stickiness(scan, pd.Timestamp("2026-11-17 09:45")), "")
+
+    def test_a_wait_bar_has_nothing_to_hold(self):
+        scan = {"bar": "2026-11-17 09:45", "sector": "WAIT", "side": 0}
+        self.assertEqual(lapsed_stickiness(scan, pd.Timestamp("2026-11-17 09:45")), "")
+
+    def test_an_empty_ledger_has_nothing_to_hold(self):
+        self.assertEqual(lapsed_stickiness(None, pd.Timestamp("2026-11-17 09:45")), "")
