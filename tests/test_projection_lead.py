@@ -592,6 +592,29 @@ class RetryAndSettleTests(TestCase):
                                            PLAN, BAR, MIN1, minute=1)
         self.assertIn("pick: last close (no projection this minute)", fallback)
 
+    # --- the alert names the stock's own sector ----------------------------
+    def test_a_name_from_the_follow_sector_is_not_called_the_pick(self):
+        # 17 Nov: SUNTV (MEDIA) was announced as "Sector REALTY" because REALTY
+        # was the pick and MEDIA was one of the `also scanning` sectors.
+        pick = {"sector": "REALTY", "label": "NEUTRAL", "conf": 63, "projected": True}
+        text = scan1m.format_projected(signal(), pick, PLAN, BAR, MIN1, minute=1,
+                                       sector="MEDIA")
+        self.assertIn("Sector <b>MEDIA</b>  (scanned with REALTY)", text)
+        self.assertNotIn("Sector <b>REALTY</b>", text)
+
+    def test_a_name_in_the_picked_sector_says_it_once(self):
+        pick = {"sector": "REALTY", "label": "NEUTRAL", "conf": 63, "projected": True}
+        text = scan1m.format_projected(signal(), pick, PLAN, BAR, MIN1, minute=1,
+                                       sector="REALTY")
+        self.assertIn("Sector <b>REALTY</b>  |", text)
+        self.assertNotIn("scanned with", text)
+
+    def test_the_late_leader_does_the_same(self):
+        pick = {"sector": "REALTY", "label": "NEUTRAL", "conf": 61}
+        hit = {"sig": signal(), "plan": PLAN, "price": PLAN.entry, "r": 0.2, "age": 4.0}
+        text = scan1m.format_catchup("BANKBARODA", hit, pick, BAR, MIN1, sector="PSUBK")
+        self.assertIn("Sector <b>PSUBK</b>  (scanned with REALTY)", text)
+
     def test_the_fallback_is_logged_once_per_candle(self):
         scan1m._pick_notes.clear()
         with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:

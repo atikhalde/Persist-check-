@@ -711,13 +711,30 @@ def _pick_source(scan: dict) -> str:
         else "pick: last close (no projection this minute)"
 
 
-def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int) -> str:
+def _sector_text(own: str | None, picked: str | None) -> str:
+    """The stock's *own* sector, and the picked one when they differ.
+
+    17 Nov announced ten MEDIA names as "Sector REALTY", and PSUBK banks the same
+    way: the text printed the **pick's** sector for every name in the scan list,
+    and that list also holds the ``also scanning …`` sectors. A name that is not
+    in the sector printed above it makes the alert unreadable, and it hides the
+    one thing the reader needs — that the scan is wider than the pick.
+    """
+    own = own or picked or ""
+    if own and picked and own != picked:
+        return f"Sector <b>{own}</b>  (scanned with {picked})"
+    return f"Sector <b>{own}</b>"
+
+
+def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int,
+                     sector: str | None = None) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close = bar + timedelta(minutes=BAR_MINUTES)
     left = max(0, int((close - now).total_seconds()))
     return (
         f"⚡ {arrow} <b>EARLY {sig.side}</b> (1m projection) | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{scan.get('sector')}</b>  |  Market {scan.get('label')} ({scan.get('conf')}%)"
+        f"{_sector_text(sector, scan.get('sector'))}"
+        f"  |  Market {scan.get('label')} ({scan.get('conf')}%)"
         f"  ·  {_pick_source(scan)}\n"
         f"Price now <b>{plan.entry:.2f}</b>  ·  5m bar {bar:%H:%M}–{close:%H:%M} still forming\n"
         f"<b>{left // 60}m {left % 60:02d}s left</b> — projected from 1m prints up to {now:%H:%M}\n"
@@ -931,7 +948,8 @@ def _fire_bar(bar: datetime, hhmm: str) -> datetime | None:
     return bar.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
-def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime) -> str:
+def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime, *,
+                   sector: str | None = None) -> str:
     """One labelled message; unmistakably not an entry alert."""
     sig, plan = hit["sig"], hit["plan"]
     arrow = "🟢" if sig.side == "BUY" else "🔴"
@@ -942,7 +960,7 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
     target = _targets(plan)
     return (
         f"⏰ {arrow} <b>LATE LEADER {sig.side}</b> — fired before its sector was picked\n"
-        f"<b>{raw}</b> · sector <b>{pick.get('sector')}</b>  |  "
+        f"<b>{raw}</b> · {_sector_text(sector, pick.get('sector'))}  |  "
         f"Market {pick.get('label')} ({pick.get('conf')}%)\n"
         f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
         f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
@@ -1111,7 +1129,8 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
             _no_projection(raw, "at_close")
             continue
         best.price, best.sl = plan.entry, plan.sl
-        text = format_projected(best, pick, plan, bar, stamp, minute=minute)
+        text = format_projected(best, pick, plan, bar, stamp, minute=minute,
+                                sector=sector_of.get(raw))
         if not telegram.send_bot3(text, dry_run=_dry()):
             continue
         prev = book.get(raw) or {}
@@ -1132,14 +1151,16 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         out.append({**best.__dict__, "early": True, "minute": minute})
         projected_now.add(raw)
 
-    out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now))
+    out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now,
+                         sector_of=sector_of))
     if skips or catching:
         save_ledger(st)              # the summary reports these counts
     return out
 
 
 def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: dict,
-              daily: dict, bar: datetime, now: datetime) -> list[dict]:
+              daily: dict, bar: datetime, now: datetime, *,
+              sector_of: dict | None = None) -> list[dict]:
     """Send the labelled LATE LEADER messages for this minute (bot 3 only)."""
     if not catching:
         return []
@@ -1161,7 +1182,9 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
                 skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
                 skips[why["why"]] = skips.get(why["why"], 0) + 1
             continue
-        if not telegram.send_bot3(format_catchup(raw, hit, pick, bar, now), dry_run=_dry()):
+        if not telegram.send_bot3(format_catchup(raw, hit, pick, bar, now,
+                                                 sector=(sector_of or {}).get(raw)),
+                                  dry_run=_dry()):
             continue
         caught[raw] = {"bar": bar.isoformat(), "session": str(bar.date()),
                        "fired": hit["sig"].time, "side": hit["sig"].side,
