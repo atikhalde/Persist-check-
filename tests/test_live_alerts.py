@@ -860,7 +860,14 @@ class LiveAlertTests(TestCase):
             pipeline._track_positions(state.load(), BAR, "7d", send=self.send, save=state.save)
         self.assertTrue(any("is not today's" in line for line in logs.output))
         self.assertEqual(state.load()["positions"], {})
-        self.assertFalse(self.send.called)
+        # It never gets a hit alert — but it is still the user's position, so the
+        # drop is announced once instead of happening in a log file.
+        self.assertEqual(self.send.call_count, 1)
+        text = self.send.call_args.args[0]
+        self.assertIn("TRADE ABANDONED", text)
+        self.assertIn("PNB", text)
+        self.assertIn("2026-11-11", text)
+        self.assertNotIn("TARGET HIT", text)
 
     # --- the stop protects a hit target (16 Nov: all three gave it back) -----
     def _extra_bar(self, stock, *, minutes=10):
@@ -1036,6 +1043,47 @@ class TargetGateTests(LiveAlertTests):
 
     def test_a_plan_with_a_target_is_untouched(self):
         self.assertEqual(len(pipeline.run_once()["signals"]), 1)
+
+
+class AlertInventoryTests(TestCase):
+    """Every state a trade can end a session in has a line that says so.
+
+    The audit that produced this class went looking for the messages nobody
+    sends: a trade still open at 15:30, a trade dropped the next morning, a name
+    the pick named but never scanned, an open trade whose candles never arrived.
+    """
+
+    def summary(self, **stats):
+        base = {"candles": 75, "picks": 10, "rejected": {}}
+        return pipeline.format_summary({"session": "2026-11-17",
+                                        "stats": {**base, **stats}, "positions": {}})
+
+    def test_the_summary_names_the_trades_with_no_exit_alert(self):
+        text = pipeline.format_summary({
+            "session": "2026-11-17", "stats": {"candles": 75, "picks": 10},
+            "positions": {"LODHA": {"side": "BUY", "entry": 1208.2, "sl": 1208.2}}})
+        self.assertIn("Open at the close — no exit alert yet: LODHA 1208.20 (stop 1208.20)", text)
+
+    def test_a_flat_book_says_so_instead_of_saying_nothing(self):
+        self.assertIn("Open at the close: none", self.summary())
+
+    def test_an_unchecked_trade_is_named_with_the_reason(self):
+        self.assertIn("not checked this session (no 5m candle): PNB",
+                      self.summary(pending=["PNB"]))
+
+    def test_a_name_the_pick_named_but_could_not_be_scanned_is_reported(self):
+        text = self.summary(rejected={
+            "no_data": {"X@09:20": "X 09:20"},
+            "scan_error": {"Y@09:25": "Y 09:25"}})
+        self.assertIn("1 had no 5m candle to scan (X 09:20)", text)
+        self.assertIn("1 could not be scanned (Y 09:25)", text)
+
+    def test_the_1m_summary_carries_the_same_open_line(self):
+        from nse_scanner import scan1m
+        text = scan1m.format_summary({
+            "session": "2026-11-17", "stats": {"candles": 10, "picks": 4},
+            "positions": {"BANKINDIA": {"side": "BUY", "entry": 155.12, "sl": 155.12}}})
+        self.assertIn("Open at the close — no exit alert yet: BANKINDIA 155.12", text)
 
 
 class TradeRecordTests(TestCase):
