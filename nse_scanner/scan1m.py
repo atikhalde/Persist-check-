@@ -143,7 +143,15 @@ def market_source() -> str:
 
 
 def cancel_message() -> bool:
-    return os.environ.get("SCAN1M_CANCEL_MESSAGE", "0") == "1"
+    """Say it when a projection did not survive the close (1).
+
+    17 Nov: three REALTY projections were cancelled — the 5m block had dropped
+    the pick to WAIT while the bar still read REALTY — and the user saw none of
+    them; the only trace was a counter in the summary. An unconfirmed heads-up
+    that quietly disappears is the worst of both worlds: it asked for attention
+    and then never said whether to act. ``0`` restores silence (still counted).
+    """
+    return os.environ.get("SCAN1M_CANCEL_MESSAGE", "1") != "0"
 
 
 def want_summary() -> bool:
@@ -535,13 +543,22 @@ def market_alert(st: dict, pick: dict | None) -> bool:
     md = _md_cache.get((pick or {}).get("bar") or "")
     if md is None:
         return False
+    from .pipeline import _conf_delta
+
     prev_m = st.get("market") or {}
     prev_s = st.get("sector") or {}
     market_changed = prev_m.get("dir_state") != md.dir_state or prev_m.get("label") != md.dir_label
     sector_changed = prev_s.get("name") != md.pick_sector or prev_s.get("side") != md.pick_side
-    if not (market_changed or sector_changed):
+    # The same trigger bot 1 has had since 16 Nov: 99% slid to 67% without a
+    # message while three entries were taken, because only the label and the pick
+    # were being watched. When this loop owns the market message, it has to watch
+    # the number too.
+    prev_conf = prev_m.get("conf")
+    conf_moved = (prev_conf is not None and _conf_delta() > 0
+                  and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta())
+    if not (market_changed or sector_changed or conf_moved):
         return False
-    if not telegram.send_bot3(format_market(md), dry_run=_dry()):
+    if not telegram.send_bot3(format_market(md, prev_conf), dry_run=_dry()):
         return False
     st["market"] = {"dir_state": md.dir_state, "label": md.dir_label,
                     "conf": md.dir_conf, "regime": md.regime}

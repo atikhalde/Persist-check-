@@ -318,8 +318,11 @@ Confirmed entry follows at the 10:35 close if the candle holds
 * **Early and confirmed.** The projection is sent as soon as it appears; at the
   candle's close the completed candle is judged again and the normal entry alert
   follows on the same bot (with `✅ CONFIRMED — projected 10:31:05 @ 135.70` in
-  front when the projection held). A projection that does not hold is dropped
-  **silently** (`SCAN1M_CANCEL_MESSAGE=1` to report it instead).
+  front when the projection held). A projection that does not hold is reported:
+  `❌ EARLY CANCELLED — BUY ABC · projected 10:31:05 @ 135.70 · close 135.20
+  (−0.37%) · not checked — the pick dropped to WAIT` — an unconfirmed heads-up
+  that quietly disappears asked for attention and then never said whether to act
+  (`SCAN1M_CANCEL_MESSAGE=0` restores silence, still counted in the summary).
 * **The pick is projected too (2026-11-16).** The forming candle is not judged
   on the *previous* candle's sector pick any more: `projected_market` rebuilds
   Nifty, VIX and every sector index the same way and runs the unchanged
@@ -385,13 +388,13 @@ bot-3 twin, produced by the same code:
 | message | 5m scan (bot 1/2) | 1m scan (bot 3) |
 |---|---|---|
 | start of session | `NSE live scanner started (5m …)` once | `1m projected scan started (bot 3 …)` once |
-| MARKET / SECTOR change | `format_market(md)` when direction or pick moves | the same text, when this loop decided the market (`own`/`auto`) |
+| MARKET / SECTOR change | `format_market(md)` when direction, pick or confidence (`MARKET_CONF_DELTA`) moves | the same text **and the same three triggers**, when this loop decided the market (`own`/`auto`) |
 | projected entry | `EARLY` heads-up 60 s before the close | `⚡ EARLY … (1m projection)`, up to 4 min before |
 | entry | `format_stock` + OI line, at most `MAX_ENTRIES_PER_PICK` per pick, leader first | the same text, with `✅ CONFIRMED` in front — same ceiling, same ranking: a name that does not clear it is told so (`not taken — IT long already has its entries`), never projected and then dropped |
 | 🎯 TARGET HIT / 🛑 SL HIT / 🔔 EMA9 EXIT | `_track_positions` | **the same function** — `pipeline._track_positions(..., send=bot 3, save=1m ledger)` |
 | ⚠ feed delayed | one notice per session on bot 1 | the same notice on bot 3 |
 | ⏰ LATE LEADER | never | the sector's leader fired before its sector was picked: once, labelled, bounded (`SCAN1M_LEADER_CATCHUP`) |
-| ❌ early cancelled | only when `EARLY_…` reports it | only when `SCAN1M_CANCEL_MESSAGE=1` |
+| ❌ early cancelled | only when `EARLY_…` reports it | on, one line per projection that does not survive the close (`SCAN1M_CANCEL_MESSAGE=0` → silent) |
 | ⚠ TRADE ABANDONED | a position from an earlier session is dropped (`pipeline._track_positions`) | the same function |
 | 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
 
@@ -468,7 +471,7 @@ the workflow set them as repository *Variables*, no commit needed):
 | variable | default | what it does |
 |---|---|---|
 | `SCAN1M_FIRST_MINUTE` | `1` | first minute of the 5m candle that may alert: `1` = up to 4 min early, `4` = 1 min early. Later minutes project fewer, better candles (clamped to 1–4) |
-| `SCAN1M_CANCEL_MESSAGE` | `0` | `1` = send `❌ EARLY CANCELLED — BUY ABC · projected 10:31:05 @ 135.70 · close 135.20 (−0.37%)` instead of dropping the projection silently |
+| `SCAN1M_CANCEL_MESSAGE` | `1` | send `❌ EARLY CANCELLED — BUY ABC · projected 10:31:05 @ 135.70 · close 135.20 (−0.37%)` when a projection does not survive the close. 17 Nov cancelled three REALTY projections (the 5m block had dropped the pick to WAIT while the bar still read REALTY) and none were reported. `0` = silent, still counted in the summary |
 | `SCAN1M_MARKET_SOURCE` | `auto` | `ledger` = reuse the 5m scan's pick from `state/scan_state.json` (same sector and side, no market fetch — needs that file on this machine); `own` = decide the market here with the same engine (what the workflow uses); `auto` = ledger first, own as fallback. In `ledger` mode a missing or stale 5m ledger says so in the log, once per candle, instead of doing nothing |
 | `SCAN1M_EARLY_PER_DAY` | `1` | projected alerts per stock per session. A projection that did **not** survive its close is not spent: it may be retried on a later candle of the same session |
 | `SCAN1M_EARLY_RETRIES` | `2` | how many of those re-projections a name gets after a cancellation. `0` restores the old one-shot rule (one bad candle silenced the name for the day, and its later alerts were same-second duplicates of bot 1) |
