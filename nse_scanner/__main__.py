@@ -216,13 +216,19 @@ def _doctor() -> int:
     lead = ("(pick projected from the forming candle)" if source != "ledger"
             else "(no projection — the ledger holds closed candles only)")
     from .trade import (breakeven_after_t1, min_target_pct, min_target_r)
-    from .pipeline import max_entries_per_pick, rank_by_sector_lead, _conf_delta
+    from .pipeline import (max_entries_per_pick, rank_by_sector_lead,
+                           scan_require_target, _conf_delta)
     from .market import pick_min_persist, pick_rs_margin, pick_sticky_margin, sector_max_lag_bars
+    from .market import follow_extras, pick_sticky_log
     print(f"5m alert rules: max {max_entries_per_pick() or 'no'} entries per pick · "
           f"ranked by {'sector lead' if rank_by_sector_lead() else 'score'} · "
           f"targets >= {min_target_r():.1f}R / {min_target_pct():.2f}% · "
           f"market block on a {_conf_delta()}-point conf move · "
           f"breakeven stop after T1 {'on' if breakeven_after_t1() else 'off'}")
+    print(f"5m entry rules: entries without a pivot target "
+          f"{'refused' if scan_require_target() else 'taken'} · "
+          f"follow scans {'every leader' if follow_extras() else 'the picked sector only'} · "
+          f"incumbent pick read from {'a per-bar log' if pick_sticky_log() else 'the last candle'}")
     lag = sector_max_lag_bars()
     from .market import (conf_scaled_floor, divergence_short, diverge_min_persist,
                          follow_on_weak, lowconf_min_persist, weak_follow_min_persist)

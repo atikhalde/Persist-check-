@@ -209,6 +209,16 @@ jobs:
           PICK_LOWCONF_MIN_PERSIST: ${{ vars.PICK_LOWCONF_MIN_PERSIST || '65' }}
           # A pivot closer than this to entry is resistance, not a target.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
+          # 1 = no T1/T2/T3 at all means no entry (bot 3's rule). 17 Nov entered
+          # HINDUNILVR (T2/T3 N/A) and DABUR (all three N/A) for -1.4R.
+          SCAN5M_REQUIRE_TARGET: ${{ vars.SCAN5M_REQUIRE_TARGET || '1' }}
+          # 1 = look the incumbent pick up in a per-bar log, so the early pass
+          # cannot erase the candle before this one (pick cannot flip inside a
+          # candle). Off: 17 Nov it would have held REALTY and lost BANKINDIA.
+          PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
+          # 0 = a NEUTRAL follow scans only the sector it picked, not every
+          # leader after it (each extra sector brings its own 3-entry budget).
+          SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
           # EMA9 exit needs a close beyond the smaller of these (0 = old rule).
           EXIT_EMA9_BUFFER_PCT: ${{ vars.EXIT_EMA9_BUFFER_PCT || '0.10' }}
