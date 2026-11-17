@@ -809,7 +809,7 @@ def _entries_line(stats: dict) -> str:
 
 
 def format_summary(st: dict) -> str:
-    from .pipeline import _summary_rejects, _summary_sectors
+    from .pipeline import _summary_open, _summary_rejects, _summary_sectors
 
     stats = st.get("stats") or {}
     lines = [f"📊 <b>1m projected scan {st.get('session', '')}</b>",
@@ -832,7 +832,7 @@ def format_summary(st: dict) -> str:
         bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]
         bits += [f"{k} {v}" for k, v in skips.items() if k not in _SKIP_LABEL]
         lines.append("Checked, not projected: " + " · ".join(bits))
-    lines += [_entries_line(stats), _summary_rejects(st)]
+    lines += [_entries_line(stats), _summary_rejects(st), _summary_open(st)]
     if stats.get("feed_behind"):
         lines.append(f"⚠ the 1m feed lagged past the close on {stats['feed_behind']} candle(s)")
     lines.append(f"Projected alerts fire {first_minute()}–4 minutes before the 5m close.")
@@ -1198,6 +1198,9 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
             continue
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
+            # Bot 1 has always counted this in its summary; bot 3 only logged it,
+            # so an OI refusal was invisible in the 1m report.
+            _note_reject(st, "oi", raw, f"{raw} {best.time}", per_bar=best.time)
             _no_projection(raw, "oi")
             continue
         stamp = now                     # the caller's clock (live loop → now_ist())

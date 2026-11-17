@@ -422,6 +422,8 @@ _REJECT_TEXT = (
     ("opposite", "on the opposite side to the pick"),
     ("no_stop", "without a valid EMA9 stop"),
     ("oi", "not confirmed by open interest"),
+    ("no_data", "had no 5m candle to scan"),
+    ("scan_error", "could not be scanned"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
     ("no_target", "without a pivot target"),
@@ -484,8 +486,45 @@ def format_summary(st: dict) -> str | None:
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
              _summary_rejects(st),
+             _summary_pending(st),
+             _summary_open(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
     return "\n".join(lines)
+
+
+def _summary_pending(st: dict) -> str:
+    """Open trades whose candles never arrived — nothing was checked, and why."""
+    names = list((st.get("stats") or {}).get("pending") or ())
+    if not names:
+        return ""
+    shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
+    return (f"⚠ not checked this session (no 5m candle): {shown} — their stops, "
+            f"targets and EMA9 exit were never evaluated")
+
+
+def _summary_open(st: dict) -> str:
+    """The trades still open when the session ended — the ones with no exit alert.
+
+    Every other line of the summary counts what was *sent*. A position that was
+    opened at 15:20 has had no TARGET HIT, no SL HIT and no EMA9 EXIT, and bot 1
+    will drop it at the next session's reset (a trade is intraday). Nothing else
+    in the day's messages says which trades are still live.
+    """
+    positions = st.get("positions") or {}
+    if not positions:
+        return "Open at the close: none — every entry got its exit alert"
+    shown = []
+    for raw, pos in list(positions.items())[:5]:
+        stop = pos.get("sl")
+        text = f"{raw} {float(pos.get('entry') or 0):.2f}"
+        if stop is not None:
+            text += f" (stop {float(stop):.2f})"
+        shown.append(text)
+    if len(positions) > 5:
+        shown.append(f"+{len(positions) - 5} more")
+    return ("Open at the close — no exit alert yet: "
+            + " · ".join(shown)
+            + ". A trade is intraday: it is not trailed into the next session.")
 
 
 def _early_lead() -> int:
@@ -621,6 +660,8 @@ def run_early(bar: datetime) -> list[dict]:
             fires = scan_stock(raw, df5, sd1.get(ysym), keep_all=True)
         except Exception as e:
             log.exception("early scan failed %s: %s", raw, e)
+            _note_reject(st, "scan_error", raw, f"{raw} {bar.strftime('%H:%M')}",
+                         per_bar=bar.strftime("%H:%M"))
             continue
         fresh = [s for s in fires if s.time == hhmm and s.side == want]
         if not fresh:
@@ -860,6 +901,13 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             del positions[raw]
             log.warning("dropping %s: trade from %s is not today's (%s) — no hit alerts for it",
                         raw, came_from, session_key)
+            # It is still the user's position. The machine stopped following it,
+            # and that is a fact about the alert stream, not a log line.
+            send(f"⚠ <b>TRADE ABANDONED</b> — {pos.get('side')} {raw} "
+                 f"({float(pos.get('entry') or 0):.2f}, entered {came_from}) was dropped "
+                 f"before an exit alert: a trade is intraday, so it is not trailed "
+                 f"against {session_key}'s candles. Manage it yourself.",
+                 dry_run=_dry())
             save(st)
     if not positions:
         return []
@@ -987,7 +1035,14 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
 
             pos["last_bar"] = ts.isoformat()
             changed = True
-    if changed:
+    if changed or pending:
+        # A trade whose bars never arrive is replayed later, never dropped — but
+        # until this line the delay was invisible: no hit alert, no reason.
+        stats = st.setdefault("stats", {})
+        if pending:
+            stats["pending"] = sorted(set(pending))
+        else:
+            stats.pop("pending", None)
         save(st)
     return pending
 
@@ -1226,6 +1281,12 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
+            # No published candle for a name the pick named: the scan looked and
+            # found nothing to judge. Invisible before this line.
+            log.info("no 5m candle for %s @ %s; not scanned", raw, last)
+            if not allow_stale:
+                _note_reject(st, "no_data", raw, f"{raw} {last.strftime('%H:%M')}",
+                             per_bar=last.strftime("%H:%M"))
             continue
         # One entry per stock per IST session, regardless of rank upgrades or
         # later runs. A new session resets this in reset_if_new_day().

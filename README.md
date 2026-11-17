@@ -392,7 +392,19 @@ bot-3 twin, produced by the same code:
 | ⚠ feed delayed | one notice per session on bot 1 | the same notice on bot 3 |
 | ⏰ LATE LEADER | never | the sector's leader fired before its sector was picked: once, labelled, bounded (`SCAN1M_LEADER_CATCHUP`) |
 | ❌ early cancelled | only when `EARLY_…` reports it | only when `SCAN1M_CANCEL_MESSAGE=1` |
+| ⚠ TRADE ABANDONED | a position from an earlier session is dropped (`pipeline._track_positions`) | the same function |
 | 15:33 summary | `format_summary` | same counters, plus projected / confirmed / cancelled |
+
+**Nothing ends silently.** An alert stream that only reports what it *sent* leaves
+three holes, and the summary now closes all three: a trade still open at the
+close had no TARGET HIT, no SL HIT and no EMA9 EXIT, so it is named —
+`Open at the close — no exit alert yet: LODHA 1208.20 (stop 1208.20)`; a trade
+whose candles never arrived was never evaluated, so it is named —
+`⚠ not checked this session (no 5m candle): PNB`; and an trade dropped the next
+morning (a trade is intraday) is announced once instead of vanishing —
+`⚠ TRADE ABANDONED — BUY PNB (135.73, entered 2026-11-11)`. A name the pick named
+but had no published candle for, or whose scan raised, is counted under
+`Signals not alerted` (`had no 5m candle to scan`, `could not be scanned`).
 
 Positions are opened by the confirm pass through the same `new_position` call
 `run_once` uses (`side, entry, sl, sl0, risk, t_names, entry_ema9, t1–t3,
