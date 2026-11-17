@@ -209,6 +209,11 @@ The pick reads the sector list, never a single sector in isolation:
   it goes stale, drops below the floor or rolls over, it is dropped at once.
   The line carries the arithmetic:
   `PERSIST + PHA qualified (score 56) · held — FMCG 59 is +3.0, needs 5 to take the pick`.
+  When the incumbent cannot be read at all — the early pass has already written
+  *this* candle into the ledger slot that holds "the candle before it" — the
+  pick may flip inside one candle, and the line now says why:
+  `· REALTY not held — this candle's pick was already written, so the candle
+  before it is gone`.
 * **Whatever is passed over is named**, with the number that did it:
   `PERSIST + FMCG persistent (score 60) · passed over PHA (rs -0.01)`.
 * **A block that trades nothing does not announce a direction.** `MARKET BULL
