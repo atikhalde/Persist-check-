@@ -1396,7 +1396,11 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     from .pipeline import (entry_cap_room, new_position, pick_cap_key,
                            rank_by_sector_lead, rank_candidates, sector_lead,
                            take_entry_slot)
-    cap_key = pick_cap_key(pick["sector"], int(pick["side"]))
+    # The cap is keyed per candidate's own sector, exactly as bot 1 keys it: a
+    # SECTOR FOLLOW scan that also scans an extra leader must not charge that
+    # leader's names to the pick's budget. 17 Nov bot 3 refused BLUESTARCO (CDUR)
+    # as "CDUR long already has its entries" out of the FMCG budget while bot 1
+    # took it for +2.8R — the cap was not full where the name lived.
     out: list[dict] = []
     confirmed: set[str] = set()
     checked: set[str] = set()
@@ -1460,17 +1464,18 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     capped: dict[str, str] = {}
     for cand in candidates:
         raw, best, plan = cand["raw"], cand["best"], cand["plan"]
-        if not entry_cap_room(st, cap_key):
+        own_key = pick_cap_key(sector_of[raw], int(pick["side"]))
+        if not entry_cap_room(st, own_key):
             _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
-            capped[raw] = f"not taken — {cap_key} already has its entries"
-            log.info("1m cap: %s not taken — %s already has its entries", raw, cap_key)
+            capped[raw] = f"not taken — {own_key} already has its entries"
+            log.info("1m cap: %s not taken — %s already has its entries", raw, own_key)
             continue
         text = format_confirmed(best, pick, plan, early=cand["early"], sector=sector_of[raw],
                                 oi_line=_oi_line(cand["reading"]), lead=cand["lead"])
         if not telegram.send_bot3(text, dry_run=_dry()):
             log.warning("bot 3 delivery failed for %s; the next minute retries", raw)
             continue
-        take_entry_slot(st, cap_key)
+        take_entry_slot(st, own_key)      # charged to the name's own sector
         confirmed.add(raw)
         sent[raw] = {"code": best.code, "name": best.name, "time": best.time,
                      "price": plan.entry, "sl": plan.sl,
@@ -1554,7 +1559,10 @@ def _count_candle(stats: dict, pick: dict | None) -> None:
         tag = ", follow" if pick.get("follow") else ""
         book = stats.setdefault("sectors", {})
         key = f"{pick['sector']} {side}{tag}"
-        book[key] = book.get(key, 0) + 1
+        book[key] = book.get(key, 0) + 1          # same book as the 5m scan: pick once
+        followed = stats.setdefault("extra", {})
+        for name in (pick.get("extra") or []):
+            followed[name] = followed.get(name, 0) + 1
 
 
 def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) -> None:
