@@ -239,14 +239,18 @@ def _doctor() -> int:
              if follow_on_weak() else "weak-day follow off (conf < 55 stands aside)")
           + (f" · divergence short on (persist >= {diverge_min_persist():.0f})"
              if divergence_short() else " · divergence short off"))
-    from .scan1m import early_retries, leader_catchup, leader_max_minutes, leader_max_r
+    from .scan1m import (alert_cap, catchup_digest, early_retries, leader_catchup,
+                         leader_max_minutes, leader_max_r, require_target)
     catchup = (f"on (max {leader_max_minutes()} min old, <= {leader_max_r():.1f}R)"
                if leader_catchup() else "off")
     print(f"1m scan knobs: first minute {fm} (up to {5 - fm} min early) · "
           f"market source {source} {lead} · "
           f"re-projection after a cancel: up to {early_retries()} more per name · "
           f"cancel messages {'on' if cancel_message() else 'off'} · "
-          f"leader catch-up {catchup}")
+          f"leader catch-up {catchup} · "
+          f"alerts per candle {'no cap' if not alert_cap() else alert_cap()} · "
+          f"late leaders {'one digest' if catchup_digest() else 'one per name'} · "
+          f"entries without a target {'refused' if require_target() else 'taken'}")
     if token and chat:
         ok = telegram.send("NSE scanner doctor ping", dry_run=os.environ.get("DRY_RUN") == "1")
         print("Telegram send:", "ok" if ok else "FAILED")

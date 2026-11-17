@@ -194,6 +194,12 @@ def format_market(md, prev_conf: int | None = None) -> str:
         commit = getattr(md, "commit_side", getattr(md, "dir_state", 0))
         if commit in (1, -1) and md.pick_side != commit:
             head += ("  ·  short on divergence" if md.pick_side == -1 else "  ·  long on divergence")
+    # A qualified live flow on the other side is a real disagreement, and the
+    # block used to print it three lines below the pick as if it were decoration:
+    # 17 Nov 12:50 picked BANK long with `Live flow DEF▼ Q (72)` on the screen.
+    if md.pick_side and getattr(md, "live_flow_qualified", False) \
+            and getattr(md, "live_flow_side", 0) == -md.pick_side:
+        head += f"  ·  live flow against ({md.live_flow})"
     # The day's persistent movers on each side, even when nothing is traded:
     # that is the question the block was silent on — "which sectors are moving?"
     watch = ""
@@ -401,6 +407,8 @@ _REJECT_TEXT = (
     ("oi", "not confirmed by open interest"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
+    ("no_target", "without a pivot target"),
+    ("alert_cap", "held back — more than the per-candle alert cap"),
 )
 
 

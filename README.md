@@ -336,8 +336,10 @@ Confirmed entry follows at the 10:35 close if the candle holds
   `earlier` — correct (it is not a new signal on the candle being scanned) but
   it used to mean silence, while the followers that fired later got their
   alerts: the reported "missed the leader, late on the followers". Bot 3 now
-  sends one `⏰ LATE LEADER` message per name per session when the sector is
-  picked and the trade is still valid: the fire's own stop untouched since, no
+  sends `⏰ LATE LEADER` for them when the sector is picked and the trade is
+  still valid — **one message per pick window** by default, listing the names
+  best-first (17 of them in 35 minutes on 17 Nov was the false-alert problem,
+  not the rule; `SCAN1M_CATCHUP_DIGEST=0` sends one per name): the fire's own stop untouched since, no
   older than `SCAN1M_LEADER_MAX_MINUTES` (30), move within
   `SCAN1M_LEADER_MAX_R` (2.0R). It is **not** an entry — `sent`/`positions` are
   untouched, and the message says so. `SCAN1M_LEADER_CATCHUP=0` turns it off;
@@ -456,6 +458,9 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_MAX_STALE_SECONDS` | `100` | skip a stock whose newest 1m print is older than this |
 | `SCAN1M_GRACE_SECONDS` | `6` | seconds after a minute boundary before asking Yahoo |
 | `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 summary |
+| `SCAN1M_ALERT_CAP` | `3` | projections allowed per 5m candle, ranked by sector lead exactly as the entries are ranked (`0` = one message per firing name). 17 Nov put **11 of the 24 names it scanned** into one candle (six FMCG, five PSU banks) and no name could be taken that the cap would not have ranked first; the held-back names are counted in the summary (`· 8 held back by the per-candle cap`) |
+| `SCAN1M_CATCHUP_DIGEST` | `1` | one `LATE LEADER` message per pick window, best-first, instead of one per name (`0` = per name) |
+| `SCAN1M_REQUIRE_TARGET` | `1` | refuse an entry that has **no pivot target at all** — no exit level, no trade. `MIN_TARGET_R` refuses a target that is too close; this refuses the absence of one. DABUR on 17 Nov was entered with `T1 N/A · T2 N/A · T3 N/A` and lost −0.8R (`0` = old rule) |
 | `SCAN1M_1M_PERIOD` | `1d` | 1m history window fetched every minute (prior sessions come from one 7d fetch per day) |
 
 A few more decide what a 5m alert is allowed to say. The exit, target and
@@ -479,8 +484,8 @@ sector bot 1 would have refused — so they are shared, not forked.
 | `PICK_LOWCONF_MIN_PERSIST` | `65` | the floor at the confidence gate when the floor is scaled |
 | `DIVERGENCE_SHORT` | `0` | `1` lets the **persistent faller** be shorted while the index itself is up. `commit_side == BULL` only says the index is on the up side — it does not say the up-move is confirmed, so the short needs the index up **and** one of: `MTF < 3`, `conf < PICK_CONF_GOOD` (70), or breadth against it (`dec − adv ≥ 2`). 16 Nov was `MTF 2/3` and `conf 29–56` all morning (REALTY 66 → 76 → 69 on `PERSIST −`, nothing tradeable) and `5▲/10▼` by 11:55 (REALTY 91). Mirrored gates on the sector: `persist_bear ≥ DIVERGE_MIN_PERSIST` (65), not stale, `day ≤ −0.20%`, `range pos ≤ 40`, `rs < 0`, bearish flow, not bouncing. **One pick per bar, long side first** — the short only replaces a `WAIT`; the block marks it `· short on divergence`. `0` keeps the pick aligned with Nifty |
 | `DIVERGE_MIN_PERSIST` | `65` | `persist_bear` a sector needs for that short (see `DIVERGENCE_SHORT`) |
-| `SECTOR_FOLLOW_WEAK_MIN_PERSIST` | `65` | persistence the weak-day path needs (see below); the NEUTRAL path keeps `SECTOR_FOLLOW_MIN_PERSIST` (55) |
-| `SECTOR_FOLLOW_ON_WEAK` | `0` | `1` lets a **weak but directional** market follow a plainly leading sector. Two gates used to leave a gap between them on 16 Nov 11:55 — `MARKET BULL conf 41% WEAK`, `PERSIST + FMCG 93`, `PERSIST − REALTY 91`, `WAIT`: the picker stands aside below conf 55 and the sector-follow path only ran with *no* committed side, so a day with a direction it did not trust had no path to a sector at all. `1` falls back to the strict `SECTOR_FOLLOW` gates (up on the day, upper half of the range, positive RS, bullish flow, not rolling over) on a weak **BULL** only, with a higher persistence floor than the NEUTRAL case — `SECTOR_FOLLOW_WEAK_MIN_PERSIST` (65) against 55 — because on a weak day only the exception is worth following. `0` is the locked rule: conf < 55 stands aside. The pick stays one-sided: on a committed BULL bar the top of `PERSIST −` is a reading, never a pick |
+| `SECTOR_FOLLOW_WEAK_MIN_PERSIST` | `85` | persistence the weak-day path needs (see below); it must stay above the NEUTRAL floor (`SECTOR_FOLLOW_MIN_PERSIST` 75), because on a weak day only the exception is worth following |
+| `SECTOR_FOLLOW_ON_WEAK` | `0` | `1` lets a **weak but directional** market follow a plainly leading sector. Two gates used to leave a gap between them on 16 Nov 11:55 — `MARKET BULL conf 41% WEAK`, `PERSIST + FMCG 93`, `PERSIST − REALTY 91`, `WAIT`: the picker stands aside below conf 55 and the sector-follow path only ran with *no* committed side, so a day with a direction it did not trust had no path to a sector at all. `1` falls back to the strict `SECTOR_FOLLOW` gates (up on the day, upper half of the range, positive RS, bullish flow, not rolling over) on a weak **BULL** only, with a higher persistence floor than the NEUTRAL case — `SECTOR_FOLLOW_WEAK_MIN_PERSIST` (85) against 75 — because on a weak day only the exception is worth following. `0` is the locked rule: conf < 55 stands aside. The pick stays one-sided: on a committed BULL bar the top of `PERSIST −` is a reading, never a pick |
 
 `python -m nse_scanner doctor` prints the ones that change behaviour most
 (`first minute → up to N min early`, `market source`, `re-projections after a
@@ -574,7 +579,7 @@ instead of sending. It keeps its own throw-away ledger
 **Sector follow (Nifty NEUTRAL).** The normal pick needs a committed Nifty
 direction, so on a flat index it used to say WAIT all day even when a sector was
 clearly leading. Now, when Nifty is NEUTRAL, any `PERSIST +` top-3 sector that is a
-real leader (persist score at least `SECTOR_FOLLOW_MIN_PERSIST` = 55, up on the day,
+real leader (persist score at least `SECTOR_FOLLOW_MIN_PERSIST` = 75, up on the day,
 in the upper part of its range, positive RS, bullish flow, not rolling over) is
 scanned LONG — up to `SECTOR_FOLLOW_MAX` (2) sectors, so a quiet leader does not
 hide an entry in the next one. The market message reads
@@ -587,7 +592,7 @@ BULL/BEAR market is unaffected.
 | Setting | Default | Meaning |
 |---|---|---|
 | `SECTOR_FOLLOW` | `1` | `0` = old behaviour (NEUTRAL → WAIT) |
-| `SECTOR_FOLLOW_MIN_PERSIST` | `55` | persist score a sector needs |
+| `SECTOR_FOLLOW_MIN_PERSIST` | `75` | persist score a sector needs. **Raised from 55 on 17 Nov:** the follow path's picks at persist 63 (CDUR) and 73 (FMCG) lost −2.8R between them, while 80 (REALTY) and 97 (PSUBK) paid +6.2R — and the 09:21 burst of eleven projections came from exactly those two weak picks. `55` restores the old rule |
 | `SECTOR_FOLLOW_MAX` | `2` | how many leading sectors are scanned |
 | `SF_ALIGNED_SECTORS` | empty | e.g. `PHA,ENE` — sectors your chart shows as SMART$/MARKET/SECTOR/FLOW aligned; scanned first. The scanner cannot read the chart, so this is manual. |
 

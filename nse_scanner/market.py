@@ -868,7 +868,7 @@ def _follow_leaders(plus, need: float | None = None) -> list:
     Longs only — a flat index gives no reason to short a weak sector, and the
     pick is one-sided by rule: on a committed BULL bar only PERSIST + is usable,
     so the top of PERSIST − is a reading on the block, never a pick.
-    ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (55) is
+    ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (75) is
     the score needed (``need`` overrides it — the weak-day path demands more),
     ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
     """
@@ -876,9 +876,9 @@ def _follow_leaders(plus, need: float | None = None) -> list:
         return []
     if need is None:
         try:
-            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
+            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 75)
         except ValueError:
-            need = 55.0
+            need = 75.0
     try:
         most = max(1, int(os.environ.get("SECTOR_FOLLOW_MAX") or 2))
     except ValueError:
@@ -1120,12 +1120,12 @@ def weak_follow_min_persist() -> float:
 
     A weak day is followed only by the exception, not the marginal case: the
     index is offering no help, so the sector has to be plainly persistent
-    (``SECTOR_FOLLOW_MIN_PERSIST`` is 55, the NEUTRAL-market floor).
+    (``SECTOR_FOLLOW_MIN_PERSIST`` is 75, the NEUTRAL-market floor).
     """
     try:
-        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "65"))
+        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "85"))
     except ValueError:
-        return 65.0
+        return 85.0
 
 
 def divergence_short() -> bool:

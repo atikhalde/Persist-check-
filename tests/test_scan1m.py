@@ -54,6 +54,8 @@ class Scan1mFixture(TestCase):
 
         self.env = patch.dict("os.environ", {
             "DRY_RUN": "0", "SCAN1M_FIRST_MINUTE": "1", "SCAN1M_MAX_STALE_SECONDS": "100",
+            # this world is the old one: the per-candle alert cap has its own tests
+            "SCAN1M_ALERT_CAP": "0",
             "SCAN1M_EARLY_PER_DAY": "1", "SCAN1M_CANCEL_MESSAGE": "0",
             "SCAN1M_MARKET_SOURCE": "ledger", "TELEGRAM_BOT_TOKEN_3": "",
             "TELEGRAM_CHAT_ID_3": "",
@@ -456,6 +458,103 @@ class FiveMinuteParityTests(Scan1mFixture):
         self.assertIn("1 on the opposite side to the pick", text)
         self.assertIn("1 without a valid EMA9 stop", text)
         self.assertIn("feed lagged past the close on 1 candle", text)
+
+
+class AlertCapTests(Bot3EntryRuleTests):
+    """Four names can fire on one candle; the alert layer now ranks like the cap.
+
+    17 Nov 09:21: 24 names scanned (FMCG + the `also scanning` PSUBK), 11
+    projected, 3 ever taken. The entry cap existed; nothing capped the messages.
+    """
+
+    def test_the_default_keeps_the_three_best_of_a_four_name_candle(self):
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "3"}):
+            scan1m.run_minute(BAR, now=MIN1)
+        texts = [c.args[0] for c in self.bot3.call_args_list]
+        self.assertEqual(len(texts), 3)
+        self.assertEqual(len(self.ledger()["early"]), 3)
+        self.assertIn("DDD@10:00", self.ledger()["stats"]["rejected"]["alert_cap"])
+        self.assertEqual(self.ledger()["stats"]["alert_capped"], 1)
+
+    def test_the_ranking_is_the_one_the_entries_use(self):
+        # BBB is furthest ahead of its sector (+2pp); the rest are at +0pp, so
+        # the tie falls to the score the way `rank_candidates` always decides it.
+        from nse_scanner import pipeline
+        leads = {self.LAST["BBB"]: 2.0}
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "2"}), \
+                patch.object(pipeline, "sector_lead",
+                             side_effect=lambda f, b, close, intra, long_side:
+                             leads.get(close, 0.0)):
+            scan1m.run_minute(BAR, now=MIN1)
+        sent = [c.args[0] for c in self.bot3.call_args_list]
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(any("BBB" in t for t in sent))
+        self.assertFalse(any("DDD" in t for t in sent))
+
+    def test_zero_restores_one_message_per_name(self):
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "0"}):
+            scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual(len(self.ledger()["early"]), 4)
+
+    def test_the_summary_says_how_many_were_held_back(self):
+        st = {"session": "2026-11-17",
+              "stats": {"candles": 2, "picks": 1, "early": 3, "confirmed": 2,
+                        "cancelled": 1, "alert_capped": 8},
+              "sent": {}}
+        self.assertIn("8 held back by the per-candle cap", scan1m.format_summary(st))
+
+
+class EntryTargetTests(Bot3EntryRuleTests):
+    """A trade with no pivot target at all has no exit — DABUR, 17 Nov, -0.8R."""
+
+    def test_an_entry_without_any_target_is_refused(self):
+        self.plan_for = lambda raw: base.TradePlan(
+            self.LAST[raw], self.LAST[raw], self.LAST[raw] - 1.0, 1.0,
+            None, None, None, ())
+        out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual(out, [])
+        self.assertIn("AAA@10:00", self.ledger()["stats"]["rejected"]["no_target"])
+        self.bot3.assert_not_called()
+
+    def test_the_old_rule_can_be_restored(self):
+        self.plan_for = lambda raw: base.TradePlan(
+            self.LAST[raw], self.LAST[raw], self.LAST[raw] - 1.0, 1.0,
+            None, None, None, ())
+        with patch.dict("os.environ", {"SCAN1M_REQUIRE_TARGET": "0"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual(len(out), 3)                     # only the entry cap stops them
+
+
+class CatchupDigestTests(TestCase):
+    """A burst of late leaders is one message; a single one keeps its detail."""
+
+    def test_a_burst_becomes_one_message(self):
+        items = []
+        for i, (raw, r) in enumerate((("BANKINDIA", -0.1), ("CANBK", 0.1),
+                                      ("PSB", 0.0), ("BLUESTARCO", 0.4))):
+            plan = base.TradePlan(100.0, 100.0, 99.0, 1.0, 101.0, 102.0, None, ("R1", "R2"))
+            sig = base.StockSignal(raw, 1, "ENTRY", "BUY", f"09:2{i}", 100.0, 80,
+                                   "Strong", 20, 1, "test", 99.0)
+            items.append({"raw": raw, "sector": "PSUBK",
+                          "hit": {"sig": sig, "plan": plan, "price": 100.0, "r": r, "age": 3.0}})
+        text = scan1m.format_catchup_digest(items, {"sector": "PSUBK", "label": "BULL",
+                                                    "conf": 56}, BAR, MIN1)
+        self.assertIn("LATE LEADER BUY ×4", text)
+        self.assertIn("BLUESTARCO", text.split("\n")[2])      # best first
+        self.assertIn("Not entry alerts", text)
+        self.assertEqual(len([ln for ln in text.split("\n") if ln.startswith("•")]), 4)
+        self.assertNotIn("PSUBK", text.split("\n")[2])        # its own sector, no tag
+
+    def test_a_different_sector_is_tagged(self):
+        plan = base.TradePlan(100.0, 100.0, 99.0, 1.0, 101.0, None, None, ("R1",))
+        sig = base.StockSignal("SUNTV", 1, "ENTRY", "BUY", "09:30", 100.0, 80, "Strong",
+                               20, 1, "test", 99.0)
+        item = {"raw": "SUNTV", "sector": "MEDIA",
+                "hit": {"sig": sig, "plan": plan, "price": 100.0, "r": 0.2, "age": 4.0}}
+        text = scan1m.format_catchup_digest([item, {**item, "raw": "ZEEL"}],
+                                            {"sector": "REALTY", "label": "BULL", "conf": 61},
+                                            BAR, MIN1)
+        self.assertIn("SUNTV</b> · MEDIA", text)
 
 
 class SummaryCounterTests(TestCase):

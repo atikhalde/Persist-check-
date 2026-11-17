@@ -34,7 +34,7 @@ class SectorFollowTests(TestCase):
     @staticmethod
     def snap(name="PHA", **over):
         from types import SimpleNamespace
-        base = dict(name=name, side=1, persist_bull=72.0, day_ret=0.9, pos=85.0, rs=0.6,
+        base = dict(name=name, side=1, persist_bull=90.0, day_ret=0.9, pos=85.0, rs=0.6,
                     bull=70.0, recent=0.02, qualified=False, lag_bars=0, stale=False)
         return SimpleNamespace(**{**base, **over})
 
@@ -45,7 +45,7 @@ class SectorFollowTests(TestCase):
             return _follow_pick(plus)
 
     def test_persistent_leader_is_followed_even_between_fresh_pushes(self):
-        name, reason = self.pick([self.snap(), self.snap("ENE", persist_bull=60)])
+        name, reason = self.pick([self.snap(), self.snap("ENE", persist_bull=88)])
         self.assertEqual(name, "PHA")
         self.assertTrue(reason.startswith("SECTOR FOLLOW"))
 
@@ -56,7 +56,7 @@ class SectorFollowTests(TestCase):
             return [x.name for x in _follow_leaders(plus)]
 
     def test_next_leader_is_scanned_too_when_the_first_is_weak_or_quiet(self):
-        plus = [self.snap(), self.snap("ENE", persist_bull=60), self.snap("IT", persist_bull=58)]
+        plus = [self.snap(), self.snap("ENE", persist_bull=88), self.snap("IT", persist_bull=80)]
         self.assertEqual(self.leaders(plus), ["PHA", "ENE"])                 # two by default
         self.assertEqual(self.leaders(plus, SECTOR_FOLLOW_MAX="1"), ["PHA"])
         self.assertEqual(self.leaders(plus, SECTOR_FOLLOW_MAX="3"), ["PHA", "ENE", "IT"])
@@ -68,12 +68,12 @@ class SectorFollowTests(TestCase):
         self.assertEqual(self.leaders(plus), [])
 
     def test_chart_aligned_sectors_are_scanned_first(self):
-        plus = [self.snap(), self.snap("ENE", persist_bull=60)]
+        plus = [self.snap(), self.snap("ENE", persist_bull=88)]
         self.assertEqual(self.leaders(plus, SF_ALIGNED_SECTORS="ene"), ["ENE", "PHA"])
         name, reason = self.pick(plus, SF_ALIGNED_SECTORS="ENE")
         self.assertEqual(name, "ENE")
         self.assertIn("chart aligned", reason)
-        self.assertIn("also scanning PHA 72", reason)
+        self.assertIn("also scanning PHA 90", reason)
 
     def test_flow_agreement_is_reported_not_required(self):
         self.assertIn("flow aligned", self.pick([self.snap(qualified=True)])[1])
@@ -88,7 +88,13 @@ class SectorFollowTests(TestCase):
 
     def test_can_be_switched_off_and_tuned(self):
         self.assertIsNone(self.pick([self.snap()], SECTOR_FOLLOW="0")[0])
-        self.assertIsNone(self.pick([self.snap()], SECTOR_FOLLOW_MIN_PERSIST="80")[0])
+        self.assertIsNone(self.pick([self.snap()], SECTOR_FOLLOW_MIN_PERSIST="95")[0])
+
+    def test_the_floor_sits_where_17_nov_split_winners_from_losers(self):
+        # 17 Nov: follow picks at persist 63 (CDUR) and 73 (FMCG) lost -2.8R
+        # between them; 80 (REALTY) and 97 (PSUBK) paid +6.2R.
+        self.assertIsNone(self.pick([self.snap(persist_bull=73.0)])[0])
+        self.assertEqual(self.pick([self.snap(persist_bull=76.0)])[0], "PHA")
 
     def test_alert_says_it_is_a_sector_follow_trade(self):
         from types import SimpleNamespace
@@ -154,7 +160,7 @@ class PassedOverTests(TestCase):
         from nse_scanner.market import _follow_leaders
         from unittest.mock import patch
         plus = [self.snap("AUTO", stale=True, lag_bars=6),
-                self.snap("ENE", persist_bull=60)]
+                self.snap("ENE", persist_bull=80)]
         with patch.dict("os.environ", {}):
             self.assertEqual([x.name for x in _follow_leaders(plus)], ["ENE"])
 
@@ -327,8 +333,8 @@ class WeakFollowTests(TestCase):
         self.assertIsNone(self.fallback("PHA", 1, 41, self.leaders(), SECTOR_FOLLOW_ON_WEAK="1"))
 
     def test_a_weak_day_demands_more_persistence_than_a_flat_one(self):
-        # NEUTRAL follows at persist 55; a weak BULL only follows the exception (65).
-        mid = [self.snap("PHA", persist_bull=58.0, pos=70.0, rs=0.4)]
+        # NEUTRAL follows at persist 75; a weak BULL only follows the exception (85).
+        mid = [self.snap("PHA", persist_bull=78.0, pos=70.0, rs=0.4)]
         self.assertEqual(self.fallback(None, 0, 41, mid)["pick"], "PHA")
         self.assertIsNone(self.fallback(None, 1, 41, mid, SECTOR_FOLLOW_ON_WEAK="1"))
         strong = [self.snap("FMCG", persist_bull=93.0, pos=88.0, rs=0.6)]
@@ -402,6 +408,37 @@ class MtfLineTests(TestCase):
         self.assertIn("MTF 1▲/2▼", text)             # both conventions readable
         self.assertNotIn("MTF 1/3", text)            # never the bare, sign-blind form
         self.assertIn("Breadth 2▲/13▼  TRANSITION", text)
+
+
+class FlowAgainstTests(TestCase):
+    """A qualified live flow on the other side is named on the pick line.
+
+    17 Nov 12:50 picked BANK long with `Live flow DEF▼ Q (72)` three lines below
+    it, and nothing said the two disagreed.
+    """
+
+    def md(self, **over):
+        base = dict(pick_side=1, dir_label="STRONG BULL", dir_conf=100, dir_tier="TREND-LOCK",
+                    commit_side=1, nifty=25458.1, nifty_day_ret=0.66, nifty_intra=0.71,
+                    vix=15.49, vix_chg=1.16, adx=39, mtf_bull=3, regime="TREND UP",
+                    breadth_adv=10, breadth_dec=5, persist_plus=[("BANK", 71.0)],
+                    persist_minus=[("PSE", 66.0)], live_flow="DEF", live_flow_side=-1,
+                    live_flow_score=72, live_flow_qualified=True, stale_sectors=[],
+                    pick_sector="BANK", pick_reason="PERSIST + BANK qualified (score 71)",
+                    action="SCAN LONG", bar_time="12:50")
+        return SimpleNamespace(**{**base, **over})
+
+    def test_the_disagreement_is_named(self):
+        from nse_scanner.pipeline import format_market
+        self.assertIn("live flow against (DEF)", format_market(self.md()))
+
+    def test_an_unqualified_flow_is_only_reported(self):
+        from nse_scanner.pipeline import format_market
+        self.assertNotIn("live flow against", format_market(self.md(live_flow_qualified=False)))
+
+    def test_a_flow_with_the_pick_is_not_flagged(self):
+        from nse_scanner.pipeline import format_market
+        self.assertNotIn("live flow against", format_market(self.md(live_flow_side=1)))
 
 
 class DivergenceShortTests(TestCase):

@@ -166,7 +166,7 @@ jobs:
           SF_ALIGNED_SECTORS: ${{ vars.SF_ALIGNED_SECTORS }}    # e.g. PHA,ENE - scanned first
           OI_FILTER: ${{ vars.OI_FILTER || 'annotate' }}        # off | annotate | require
           # The NEUTRAL-market follow fallback's two limits (README: 55 / 2).
-          SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '55' }}
+          SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '75' }}
           SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           # An early print older than this is never shown as live (README: 100).
           EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
@@ -198,7 +198,7 @@ jobs:
           # 1 = a weak-but-directional BULL may still follow a plainly leading
           # sector (conf < 55). 0 = the locked rule: conf < 55 stands aside.
           SECTOR_FOLLOW_ON_WEAK: ${{ vars.SECTOR_FOLLOW_ON_WEAK || '0' }}
-          SECTOR_FOLLOW_WEAK_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_WEAK_MIN_PERSIST || '65' }}
+          SECTOR_FOLLOW_WEAK_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_WEAK_MIN_PERSIST || '85' }}
           # 1 = index up but breadth against it: the persistent faller may be
           # shorted (mirrored gates). 0 = the pick must agree with Nifty.
           DIVERGENCE_SHORT: ${{ vars.DIVERGENCE_SHORT || '0' }}
