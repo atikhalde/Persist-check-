@@ -530,8 +530,9 @@ def _summary_open(st: dict) -> str:
         return "Open at the close: none — every entry got its exit alert"
     shown = []
     for raw, pos in list(positions.items())[:5]:
-        stop = pos.get("sl")
-        text = f"{raw} {float(pos.get('entry') or 0):.2f}"
+        entry, stop = pos.get("entry"), pos.get("sl")
+        # A record without a price is still a trade to name — never "0.00".
+        text = f"{raw} {float(entry):.2f}" if entry is not None else f"{raw}"
         if stop is not None:
             text += f" (stop {float(stop):.2f})"
         shown.append(text)
@@ -902,6 +903,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
     save = save or _save
     positions = st.setdefault("positions", {})
     if not positions:
+        _store_pending(st, [])
         return []
     ledger = st.setdefault("alerts", {})
     session = session_date(bar)
@@ -925,6 +927,8 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                  dry_run=_dry())
             save(st)
     if not positions:
+        _store_pending(st, [])          # nothing open: nothing can be unchecked
+        save(st)
         return []
     symbols = {raw: data.yahoo_stock(raw) for raw in positions}
     frames = data.fetch_many(symbols.values(), period_5m, "5m")
@@ -1051,15 +1055,25 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             pos["last_bar"] = ts.isoformat()
             changed = True
     if changed or pending:
-        # A trade whose bars never arrive is replayed later, never dropped — but
-        # until this line the delay was invisible: no hit alert, no reason.
-        stats = st.setdefault("stats", {})
-        if pending:
-            stats["pending"] = sorted(set(pending))
-        else:
-            stats.pop("pending", None)
+        _store_pending(st, pending)
         save(st)
     return pending
+
+
+def _store_pending(st: dict, pending) -> None:
+    """Record which open trades could not be checked — and forget the ones that can.
+
+    A trade whose bars never arrive is replayed later, never dropped, but until
+    this line the delay was invisible: no hit alert, no reason. The list has to be
+    cleared as well as set: it used to survive the trades it described, so a
+    session whose last position had closed still printed "not checked: PNB".
+    """
+    names = sorted(set(pending or ()))
+    stats = st.setdefault("stats", {})
+    if names:
+        stats["pending"] = names
+    else:
+        stats.pop("pending", None)
 
 
 def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, backfill: bool = False) -> dict:
