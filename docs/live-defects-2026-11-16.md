@@ -743,3 +743,105 @@ projected line under a residue and with none, the carried / close-only split, a
 zero catch-up line that explains itself, skips printing the LATE LEADER line
 even when `catchup` is 0, and each refusal code. The old ledgers stay readable:
 with no `entries` key the entry line falls back to `confirmed`.
+
+---
+
+## Seventh pass — "I set the variables" was not observable
+
+Three of the recommended knobs are repository **variables** that only reach a run
+through `env: X: ${{ vars.X || 'default' }}`. That chain has two silent breaks:
+
+1. a variable created as a **secret** (or in an environment the job does not
+   attach) resolves to an empty `vars.X`, and the workflow supplies its default —
+   the session then looks *identical* to one where the knob had no effect;
+2. `${{ vars.X }}` with no `|| default` injects the empty string instead of
+   leaving the variable unset, so `""` and "unset" become two configurations.
+
+Freezing the settings does not reveal either one, so the run now reports what it
+received. Both loops and `doctor` print:
+
+```
+pick knobs in force: PICK_CONF_SCALED_FLOOR=1 · PICK_MIN_PERSIST=50 · … · DIVERGENCE_SHORT=0
+pick knobs differing from default: PICK_CONF_SCALED_FLOOR=1
+```
+
+and both workflows print the repository's own variables before the loop starts
+(`repository variables: {"PICK_CONF_SCALED_FLOOR":"1"}`, `{}` when none are set).
+`knobs.effective()` treats `""` as absent, matching the workflow's `||`, so the
+log cannot disagree with the code reading the same variable.
+
+### Two knobs nothing forwarded
+
+`SECTOR_FOLLOW_MIN_PERSIST` (55) and `SECTOR_FOLLOW_MAX` (2) — the NEUTRAL-market
+follow fallback's limits, both documented in the README — were read by
+`market._follow_leaders` and forwarded by **neither** workflow. Setting either as
+a repository variable did nothing at all. Both are forwarded now, as is
+`EARLY_MAX_STALE_SECONDS` (100), and every default is spelled out in the
+workflows rather than left to `vars.X` being empty.
+
+### Proof
+
+`pytest -q` → **382 passed** (48 subtests), `pyflakes` clean, workflows still
+parse as YAML. New: every audited knob is forwarded by both workflows with the
+same default as `knobs.AUDITED`; every variable the code reads reaches some
+workflow (or is runtime-only); both loops log `describe()`; the recommended set
+is named on the line; an empty variable is a default; and the shipped defaults
+still reproduce the old behaviour (`conf_scaled_floor`, `follow_on_weak` and
+`divergence_short` all false, flat floor 50).
+
+---
+
+## Eighth pass — the chart at 14:41, read against the block
+
+The indicator's own panel at 14:41 (`Wait conflict`, `DIR BEAR 44% Weak`, `MTF 2/3`,
+`Breadth 2/13`, `PERSIST + FMCG 93 · CDUR 37 · OIL 31`, `PERSIST − PHA 95 · MET 94 ·
+AUTO 90`) is the first **bear-side** panel of the day, and it matches this engine
+row for row — same side, same confidence, same tier, same breadth, same two persist
+lists to the digit — with one exception, and one difference that is a decision
+rather than a defect:
+
+| panel | block |
+|---|---|
+| `DIR BEAR 44% Weak` | `commit_side −1, dir_conf 44, tier WEAK` |
+| `Breadth 2/13` | `2▲/13▼` (15 sector snaps) |
+| `MTF 2/3` | `MTF 1/3` — **fixed**, see below |
+| `Wait conflict` | `WAIT — market TRANSITION conf 44 < 55` |
+| `PLAY BearIdx: Long FMCG / Short PHA` | `No pick · persistent movers FMCG long 93 · PHA short 95` |
+
+The play stays one-sided: the pair is a decision for a hedged book, not a rule bug.
+
+### Fixed — `MTF` printed one side's count
+
+`format_market` printed `MTF {mtf_bull}/3`, the **bullish** count, whatever the
+block was describing. On a BEAR row that is the complement of the number on the
+chart, so the same tape described itself two ways (`MTF 2/3` there, `MTF 1/3`
+here). The line now prints both counts — `MTF 1▲/2▼`, `MTF 3▲` — which is
+unambiguous under either convention, and matches the quantity `_dir_conf` already
+uses (`abs(bull − bear)`). Same fix in the divergence-short reason line.
+
+### Proposals (unshipped, no code)
+
+1. **The weak-aligned pick.** The one coherent trade of the afternoon was not a
+   divergence at all: `PHA 95` on `PERSIST −`, aligned with `commit_side −1`, and
+   the signal tracker shows the index falling with it (`FLOW PHA ▼ 12:45–14:45,
+   Nifty −0.22%`). It was refused by `PICK_MIN_CONF` (44 < 55), and
+   `DIVERGENCE_SHORT` can never reach it — that lane requires `commit_side == +1`.
+   A symmetric knob (`PICK_WEAK_ALIGNED_MIN_PERSIST`, default `0` = off: allow the
+   aligned pick below conf 55 only when persist ≥ 85 and the sector is the pool's
+   top with flow agreeing) would have taken it. **Not shipped**: one afternoon is
+   not a measurement, and the same class of rule is what turned 16 Nov's morning
+   into −2.4R.
+2. **`DIVERGE_SPREAD = 2` is a 13% tilt, not "breadth against it".** Breadth is
+   15 sector snaps; 16 Nov read `2▲/13▼` (11 apart) and a 9▲/6▼ day clears 2. The
+   constant is inert while `DIVERGENCE_SHORT=0`, so it is left alone until the
+   study says the lane is worth having at all.
+
+### What the tracker says about the day
+
+26 episodes 09:20→14:45, median hold 25 min (FLOW 7, SECTOR 6, SMART$ 11, MARKET 2).
+Measured on the index leg only: bearish episodes 5 with / 8 against / 1 flat
+(median `+0.08%`), bullish 6 with / 3 against / 1 flat (median `−0.03%`), and the
+two `MARKET INDEX LONG` calls were followed by the index falling both times
+(−0.10%, −0.34%). That is chop, and it is the strongest yet support for
+`SECTOR_FOLLOW_ON_WEAK=0`. Caveat: `NIFTY%` prices the index leg, never the sector
+being traded.

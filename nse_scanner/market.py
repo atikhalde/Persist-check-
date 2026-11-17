@@ -549,6 +549,30 @@ def run_market(
     )
 
 
+def mtf_text(mtf_bull: int) -> str:
+    """``MTF 2▲/1▼`` — both counts, because ``MTF 2/3`` is ambiguous.
+
+    The chart indicator prints ``MTF 2/3`` next to its direction row, and those
+    three characters mean two different things depending on the convention: two
+    of three timeframes *agreeing with DIR*, or two of three *bullish*. This
+    engine only ever stored the bullish count, so on a BEAR block the alert
+    printed the complement of the number on the chart — 16 Nov 14:41 read
+    ``DIR BEAR 44% Weak · MTF 2/3`` on the indicator and would have read
+    ``MTF 1/3`` here: the same tape describing itself two ways.
+
+    Showing both counts cannot be misread under either convention, and it is the
+    number the engine's own ``_dir_conf`` uses (``abs(bull - bear)``, which is
+    blind to the sign).
+    """
+    bull = max(0, min(3, int(mtf_bull)))
+    bear = 3 - bull
+    if bear == 0:
+        return f"MTF {bull}▲"
+    if bull == 0:
+        return f"MTF {bear}▼"
+    return f"MTF {bull}▲/{bear}▼"
+
+
 def _direction_label(side: int, strong_bull: bool = False, strong_bear: bool = False) -> str:
     """Label for the side the engine actually trades.
 
@@ -844,7 +868,7 @@ def _follow_leaders(plus, need: float | None = None) -> list:
     Longs only — a flat index gives no reason to short a weak sector, and the
     pick is one-sided by rule: on a committed BULL bar only PERSIST + is usable,
     so the top of PERSIST − is a reading on the block, never a pick.
-    ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (55) is
+    ``SECTOR_FOLLOW=0`` switches it off, ``SECTOR_FOLLOW_MIN_PERSIST`` (75) is
     the score needed (``need`` overrides it — the weak-day path demands more),
     ``SECTOR_FOLLOW_MAX`` (2) the number of sectors scanned.
     """
@@ -852,9 +876,9 @@ def _follow_leaders(plus, need: float | None = None) -> list:
         return []
     if need is None:
         try:
-            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 55)
+            need = float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 75)
         except ValueError:
-            need = 55.0
+            need = 75.0
     try:
         most = max(1, int(os.environ.get("SECTOR_FOLLOW_MAX") or 2))
     except ValueError:
@@ -1096,12 +1120,12 @@ def weak_follow_min_persist() -> float:
 
     A weak day is followed only by the exception, not the marginal case: the
     index is offering no help, so the sector has to be plainly persistent
-    (``SECTOR_FOLLOW_MIN_PERSIST`` is 55, the NEUTRAL-market floor).
+    (``SECTOR_FOLLOW_MIN_PERSIST`` is 75, the NEUTRAL-market floor).
     """
     try:
-        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "65"))
+        return float(os.environ.get("SECTOR_FOLLOW_WEAK_MIN_PERSIST", "85"))
     except ValueError:
-        return 65.0
+        return 85.0
 
 
 def divergence_short() -> bool:
@@ -1187,7 +1211,7 @@ def _divergence_short(commit_side, n_day_ret, breadth_adv, breadth_dec, minus,
                 keep.persist_bear + pick_sticky_margin() > best.persist_bear:
             best, held = keep, True
     why = " · ".join(x for x in (
-        f"MTF {mtf_bull}/3" if mtf_bull < 3 else "",
+        mtf_text(mtf_bull) if mtf_bull < 3 else "",
         f"conf {dir_conf}%" if dir_conf < PICK_CONF_GOOD else "",
         f"breadth {breadth_adv}▲/{breadth_dec}▼" if narrow else "") if x)
     reason = (f"DIVERGENCE SHORT — index up (Nifty {n_day_ret:+.2f}%) but {why}; "

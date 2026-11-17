@@ -164,6 +164,7 @@ def _intra_of(snap: dict | None) -> float | None:
 
 
 def format_market(md, prev_conf: int | None = None) -> str:
+    from .market import mtf_text
     side = "BULL" if md.pick_side == 1 else "BEAR" if md.pick_side == -1 else "FLAT"
     plus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_plus)
     minus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_minus)
@@ -193,6 +194,12 @@ def format_market(md, prev_conf: int | None = None) -> str:
         commit = getattr(md, "commit_side", getattr(md, "dir_state", 0))
         if commit in (1, -1) and md.pick_side != commit:
             head += ("  ·  short on divergence" if md.pick_side == -1 else "  ·  long on divergence")
+    # A qualified live flow on the other side is a real disagreement, and the
+    # block used to print it three lines below the pick as if it were decoration:
+    # 17 Nov 12:50 picked BANK long with `Live flow DEF▼ Q (72)` on the screen.
+    if md.pick_side and getattr(md, "live_flow_qualified", False) \
+            and getattr(md, "live_flow_side", 0) == -md.pick_side:
+        head += f"  ·  live flow against ({md.live_flow})"
     # The day's persistent movers on each side, even when nothing is traded:
     # that is the question the block was silent on — "which sectors are moving?"
     watch = ""
@@ -205,7 +212,8 @@ def format_market(md, prev_conf: int | None = None) -> str:
     return (
         f"{head}\n"
         f"Nifty {md.nifty:,.1f}  day {md.nifty_day_ret:+.2f}%  intra {md.nifty_intra:+.2f}%\n"
-        f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   MTF {md.mtf_bull}/3\n"
+        f"VIX {md.vix:.2f} {vix_arrow} {md.vix_chg:+.2f}%   ADX {md.adx:.0f}   "
+        f"{mtf_text(md.mtf_bull)}\n"
         f"Breadth {md.breadth_adv}▲/{md.breadth_dec}▼  {md.regime}\n"
         f"PERSIST +  {plus}\n"
         f"PERSIST −  {minus}\n"
@@ -399,6 +407,8 @@ _REJECT_TEXT = (
     ("oi", "not confirmed by open interest"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
+    ("no_target", "without a pivot target"),
+    ("alert_cap", "held back — more than the per-candle alert cap"),
 )
 
 
@@ -1450,6 +1460,9 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
         state.use_scratch()   # full behaviour, real ledger untouched
     log.info("live loop IST: early pass %ss before each 5m close%s, confirm %ss after",
              lead, "" if lead else " (disabled)", grace)
+    from .knobs import describe
+    for line in describe():        # what this process is actually running with
+        log.info("%s", line)
     # Announce once per session: a planned handover between jobs is not news.
     # The flag is stored, so restarts (handover, watchdog, holiday re-checks)
     # stay silent for the rest of the session.

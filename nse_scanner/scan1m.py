@@ -711,13 +711,30 @@ def _pick_source(scan: dict) -> str:
         else "pick: last close (no projection this minute)"
 
 
-def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int) -> str:
+def _sector_text(own: str | None, picked: str | None) -> str:
+    """The stock's *own* sector, and the picked one when they differ.
+
+    17 Nov announced ten MEDIA names as "Sector REALTY", and PSUBK banks the same
+    way: the text printed the **pick's** sector for every name in the scan list,
+    and that list also holds the ``also scanning …`` sectors. A name that is not
+    in the sector printed above it makes the alert unreadable, and it hides the
+    one thing the reader needs — that the scan is wider than the pick.
+    """
+    own = own or picked or ""
+    if own and picked and own != picked:
+        return f"Sector <b>{own}</b>  (scanned with {picked})"
+    return f"Sector <b>{own}</b>"
+
+
+def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int,
+                     sector: str | None = None) -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close = bar + timedelta(minutes=BAR_MINUTES)
     left = max(0, int((close - now).total_seconds()))
     return (
         f"⚡ {arrow} <b>EARLY {sig.side}</b> (1m projection) | <b>{sig.name}</b>  {sig.symbol}\n"
-        f"Sector <b>{scan.get('sector')}</b>  |  Market {scan.get('label')} ({scan.get('conf')}%)"
+        f"{_sector_text(sector, scan.get('sector'))}"
+        f"  |  Market {scan.get('label')} ({scan.get('conf')}%)"
         f"  ·  {_pick_source(scan)}\n"
         f"Price now <b>{plan.entry:.2f}</b>  ·  5m bar {bar:%H:%M}–{close:%H:%M} still forming\n"
         f"<b>{left // 60}m {left % 60:02d}s left</b> — projected from 1m prints up to {now:%H:%M}\n"
@@ -769,8 +786,10 @@ def _projected_line(stats: dict) -> str:
     ok = int(stats.get("confirmed") or 0)
     gone = int(stats.get("cancelled") or 0)
     open_n = max(0, sent - ok - gone)
+    capped = int(stats.get("alert_capped") or 0)
     return (f"Projected alerts {sent} · of which confirmed at the close {ok}"
-            f" · did not hold {gone}" + (f" · still open {open_n}" if open_n else ""))
+            f" · did not hold {gone}" + (f" · still open {open_n}" if open_n else "")
+            + (f" · {capped} held back by the per-candle cap" if capped else ""))
 
 
 def _entries_line(stats: dict) -> str:
@@ -931,7 +950,8 @@ def _fire_bar(bar: datetime, hhmm: str) -> datetime | None:
     return bar.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
-def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime) -> str:
+def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime, *,
+                   sector: str | None = None) -> str:
     """One labelled message; unmistakably not an entry alert."""
     sig, plan = hit["sig"], hit["plan"]
     arrow = "🟢" if sig.side == "BUY" else "🔴"
@@ -942,7 +962,7 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
     target = _targets(plan)
     return (
         f"⏰ {arrow} <b>LATE LEADER {sig.side}</b> — fired before its sector was picked\n"
-        f"<b>{raw}</b> · sector <b>{pick.get('sector')}</b>  |  "
+        f"<b>{raw}</b> · {_sector_text(sector, pick.get('sector'))}  |  "
         f"Market {pick.get('label')} ({pick.get('conf')}%)\n"
         f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
         f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
@@ -957,7 +977,75 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
     )
 
 
+def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: datetime) -> str:
+    """All of a pick window's late leaders in one message (best first).
+
+    17 Nov sent 17 of these in 35 minutes, one per name, each closing with "not
+    an entry alert": the volume was the false-alert problem, not the rule.
+    """
+    close = bar + timedelta(minutes=BAR_MINUTES)
+    side = items[0]["hit"]["sig"].side
+    arrow = "🟢" if side == "BUY" else "🔴"
+    shown = sorted(items, key=lambda i: -i["hit"]["r"])[:8]
+    lines = [f"⏰ {arrow} <b>LATE LEADER {side} ×{len(items)}</b> — fired before their "
+             f"sector was picked",
+             f"Market {pick.get('label')} ({pick.get('conf')}%)  ·  sector picked "
+             f"{bar:%H:%M}  ·  {close:%H:%M} bar forming"]
+    for item in shown:
+        raw, hit = item["raw"], item["hit"]
+        sig, plan = hit["sig"], hit["plan"]
+        own = item.get("sector")
+        tag = f" · {own}" if own and own != pick.get("sector") else ""
+        lines.append(f"• <b>{raw}</b>{tag} · fired {sig.time} @ {plan.entry:.2f} · "
+                     f"now {hit['price']:.2f} ({hit['r']:+.1f}R) · SL {plan.sl:.2f}")
+    if len(items) > len(shown):
+        lines.append(f"… and {len(items) - len(shown)} more")
+    lines.append("<b>Not entry alerts</b> — no 5m signal fired on this candle; bot 1 has "
+                 "none for these either. Check the stop yourself before acting.")
+    return "\n".join(lines)
+
+
 # ── one minute of the projection ─────────────────────────────────────────────
+def alert_cap() -> int:
+    """Projection alerts allowed per 5m candle, ranked like the entries (3).
+
+    ``MAX_ENTRIES_PER_PICK`` caps what is *taken*; nothing capped what is
+    *announced*, so on 17 Nov 09:21 the scan projected 11 of the 24 names it
+    looked at — six FMCG and five PSU banks — in one candle, and 24 projections
+    produced 3 entries that day. The same ranking the entry cap uses decides
+    which ones are worth a message, so the two layers agree on what is best.
+    ``0`` restores one message per firing name.
+    """
+    try:
+        return max(0, int(os.environ.get("SCAN1M_ALERT_CAP", "3")))
+    except ValueError:
+        return 3
+
+
+def catchup_digest() -> bool:
+    """One `LATE LEADER` message per pick window instead of one per name (1).
+
+    17 Nov sent 17 of them in 35 minutes, each saying it was not an entry alert;
+    the move they described had already happened (median +0.2R from the fire).
+    ``0`` restores one message per name.
+    """
+    return os.environ.get("SCAN1M_CATCHUP_DIGEST", "1") != "0"
+
+
+def require_target() -> bool:
+    """Refuse a trade with no pivot target at all (1).
+
+    DABUR on 17 Nov was entered with ``T1 N/A · T2 N/A · T3 N/A`` — no exit
+    level existed — and lost −0.8R. ``MIN_TARGET_R`` refuses a target that is
+    too close; this refuses the absence of one. ``0`` restores the old rule.
+    """
+    return os.environ.get("SCAN1M_REQUIRE_TARGET", "1") != "0"
+
+
+def _has_target(plan) -> bool:
+    return any(getattr(plan, key, None) is not None for key in ("t1", "t2", "t3"))
+
+
 def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
     """One projection per candle; the session budget is per *name*.
 
@@ -1050,6 +1138,8 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     stats = st.setdefault("stats", {})
     skips = stats.setdefault("proj_skip", {})
     out: list[dict] = []
+    ready: list[dict] = []          # projections that cleared every gate
+    from .pipeline import rank_by_sector_lead, rank_candidates, sector_lead
 
     def _no_projection(raw: str, reason: str) -> None:
         """Count *why* a name was not projected — reported in the 1m summary.
@@ -1101,6 +1191,11 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
             log.info("1m %s %s: no valid EMA9 stop yet — not projected", raw, best.name)
             _no_projection(raw, "no_stop")
             continue
+        if require_target() and not _has_target(plan):
+            log.info("1m %s %s: no pivot target — projected trades need an exit", raw, best.name)
+            _note_reject(st, "no_target", raw, f"{raw} {best.time}", per_bar=best.time)
+            _no_projection(raw, "no_target")
+            continue
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
             _no_projection(raw, "oi")
@@ -1111,7 +1206,26 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
             _no_projection(raw, "at_close")
             continue
         best.price, best.sl = plan.entry, plan.sl
-        text = format_projected(best, pick, plan, bar, stamp, minute=minute)
+        lead = (sector_lead(frame, bar, plan.entry, pick.get("intra"), pick["side"] == 1)
+                if rank_by_sector_lead() else None)
+        ready.append({"raw": raw, "best": best, "plan": plan, "lead": lead, "stamp": stamp})
+    # The alert layer is capped and ranked exactly like the entry layer: on one
+    # candle, ten names can fire and only three can ever be taken.
+    cap = alert_cap()
+    if cap and len(ready) > cap:
+        rank_candidates(ready)
+        for held in ready[cap:]:
+            _note_reject(st, "alert_cap", held["raw"], f"{held['raw']} {hhmm}", per_bar=hhmm)
+            _no_projection(held["raw"], "alert_cap")
+        stats["alert_capped"] = stats.get("alert_capped", 0) + len(ready) - cap
+        log.info("1m %s: %d projections held back by the per-candle cap (%d sent)",
+                 hhmm, len(ready) - cap, cap)
+        ready = ready[:cap]
+
+    for item in ready:
+        raw, best, plan, stamp = item["raw"], item["best"], item["plan"], item["stamp"]
+        text = format_projected(best, pick, plan, bar, stamp, minute=minute,
+                                sector=sector_of.get(raw))
         if not telegram.send_bot3(text, dry_run=_dry()):
             continue
         prev = book.get(raw) or {}
@@ -1132,14 +1246,16 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         out.append({**best.__dict__, "early": True, "minute": minute})
         projected_now.add(raw)
 
-    out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now))
+    out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now,
+                         sector_of=sector_of))
     if skips or catching:
         save_ledger(st)              # the summary reports these counts
     return out
 
 
 def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: dict,
-              daily: dict, bar: datetime, now: datetime) -> list[dict]:
+              daily: dict, bar: datetime, now: datetime, *,
+              sector_of: dict | None = None) -> list[dict]:
     """Send the labelled LATE LEADER messages for this minute (bot 3 only)."""
     if not catching:
         return []
@@ -1147,6 +1263,7 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
     sent = st.setdefault("sent", {})
     hhmm = bar.strftime("%H:%M")
     out: list[dict] = []
+    found: list[dict] = []
     for raw in catching:
         if raw in sent or raw in caught:
             continue
@@ -1161,15 +1278,28 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
                 skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
                 skips[why["why"]] = skips.get(why["why"], 0) + 1
             continue
-        if not telegram.send_bot3(format_catchup(raw, hit, pick, bar, now), dry_run=_dry()):
+        found.append({"raw": raw, "hit": hit, "sector": (sector_of or {}).get(raw)})
+    if not found:
+        return out
+
+    # A burst becomes one message; a single late leader keeps its detail. One
+    # message per name is `SCAN1M_CATCHUP_DIGEST=0`.
+    digest = catchup_digest() and len(found) > 1
+    sent_all = (telegram.send_bot3(format_catchup_digest(found, pick, bar, now), dry_run=_dry())
+                if digest else True)
+    for item in found:
+        raw, hit = item["raw"], item["hit"]
+        if not digest and not telegram.send_bot3(
+                format_catchup(raw, hit, pick, bar, now, sector=item["sector"]), dry_run=_dry()):
             continue
+        if not sent_all:
+            break
         caught[raw] = {"bar": bar.isoformat(), "session": str(bar.date()),
                        "fired": hit["sig"].time, "side": hit["sig"].side,
                        "code": hit["sig"].code, "price": hit["price"],
                        "at": now.strftime("%H:%M:%S")}
         stats = st.setdefault("stats", {})
         stats["catchup"] = stats.get("catchup", 0) + 1
-        save_ledger(st)              # before the next send: never twice
         log.info("1m LATE LEADER %s %s fired %s as %s, sector %s picked %s "
                  "(%.1fR, %.0f min late, sent %s IST)", raw, hit["sig"].side, hit["sig"].time,
                  hit["sig"].name, pick.get("sector"), hhmm, hit["r"], hit["age"],
@@ -1177,6 +1307,7 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
         out.append({"symbol": raw, "side": hit["sig"].side, "fired": hit["sig"].time,
                     "code": hit["sig"].code, "price": hit["price"], "r": hit["r"],
                     "catchup": True})
+    save_ledger(st)                  # before the next tick: never twice
     return out
 
 
@@ -1285,6 +1416,10 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
             log.warning("1m SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close",
                         raw, best.time)
             _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
+            continue
+        if require_target() and not _has_target(plan):
+            log.info("1m SKIP %s @ %s: no pivot target — the trade has no exit", raw, best.time)
+            _note_reject(st, "no_target", raw, f"{raw} {best.time}", per_bar=best.time)
             continue
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
@@ -1586,6 +1721,9 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
         return "closed"
     log.info("1m projected scan: alerts from minute %d of each 5m candle (up to %d min early); "
              "confirmed at the close; bot 3 only", first_minute(), BAR_MINUTES - first_minute())
+    from .knobs import describe
+    for line in describe():        # the same knobs, printed by this loop too
+        log.info("%s", line)
     _announce()
 
     holiday = None
