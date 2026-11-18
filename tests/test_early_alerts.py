@@ -554,6 +554,27 @@ class LiveLoopTests(TestCase):
             self.assertEqual(pipeline.live_loop(exit_at_close=True), "holiday")
         self.assertEqual(ready.call_count, 3)
 
+    def test_the_summary_says_out_loud_whether_it_went_out(self):
+        """18 Nov: the 1m summary was sent (or not) with no trace in the run's log."""
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {},
+                    "stats": {"candles": 3}})
+        self.now = BAR.replace(hour=15, minute=32)     # the loop walks on to 15:35
+        with self.assertLogs("nse_scanner", level="INFO") as logs:
+            self.assertEqual(pipeline.live_loop(exit_at_close=True), "closed")
+        self.assertTrue(any("summary sent" in line for line in logs.output), logs.output)
+        self.assertTrue(state.load()["stats"]["reported"])
+
+    def test_a_summary_telegram_refused_is_reported_as_not_delivered(self):
+        state.save({"session": str(BAR.date()), "sent": {}, "positions": {},
+                    "stats": {"candles": 3}})
+        self.now = BAR.replace(hour=15, minute=32)     # the loop walks on to 15:35
+        self.send.return_value = False
+        with self.assertLogs("nse_scanner", level="ERROR") as logs:
+            pipeline.live_loop(exit_at_close=True)
+        self.assertTrue(any("summary was NOT delivered" in line for line in logs.output),
+                        logs.output)
+        self.assertFalse(state.load()["stats"].get("reported"))
+
     def test_a_late_index_bar_is_polled_for_instead_of_dropping_the_candle(self):
         """18 Nov 09:40: the 09:35 Nifty bar was 10s late, and the candle was dropped.
 
