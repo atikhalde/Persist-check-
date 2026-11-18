@@ -565,7 +565,8 @@ def market_alert(st: dict, pick: dict | None) -> bool:
                     "conf": md.dir_conf, "regime": md.regime}
     st["sector"] = {"name": md.pick_sector, "side": md.pick_side, "reason": md.pick_reason}
     save_ledger(st)
-    log.info("1m market alert: %s / %s %s", md.dir_label, md.pick_sector, md.pick_side)
+    log.info("1m market alert: %s / %s %s", md.dir_label, md.pick_sector,
+             "long" if md.pick_side == 1 else "short")
     return True
 
 
@@ -819,15 +820,22 @@ def _projected_line(stats: dict) -> str:
     sent = int(stats.get("early") or 0)
     ok = int(stats.get("confirmed") or 0)
     gone = int(stats.get("cancelled") or 0)
-    open_n = max(0, sent - ok - gone)
+    lost = int(stats.get("undelivered") or 0)
+    open_n = max(0, sent - ok - gone - lost)
     capped = int(stats.get("alert_capped") or 0)
     why = stats.get("cancel_why") or {}
     refused = " · ".join(f"{_CANCEL_WHY.get(k, k)} {why[k]}"
                          for k in _CANCEL_WHY_ORDER if why.get(k))
     return (f"Projected alerts {sent} · of which confirmed at the close {ok}"
             f" · did not hold {gone}" + (f" · still open {open_n}" if open_n else "")
+            + (f" · not delivered {lost}" if lost else "")
             + (f" · {capped} held back by the per-candle cap" if capped else "")
             + (f"\nNot held: {refused}" if refused else ""))
+
+
+def _tries(entry: dict) -> str:
+    n = int(entry.get("tries") or 1)
+    return "1 try" if n == 1 else f"{n} tries"
 
 
 def _entries_line(stats: dict) -> str:
@@ -849,7 +857,9 @@ def _entries_line(stats: dict) -> str:
 def format_summary(st: dict) -> str:
     from .pipeline import _summary_open, _summary_rejects, _summary_sectors
 
-    stats = st.get("stats") or {}
+    stats = dict(st.get("stats") or {})
+    lost = st.get("undelivered") or {}
+    stats["undelivered"] = len(lost)          # read by _projected_line
     lines = [f"📊 <b>1m projected scan {st.get('session', '')}</b>",
              f"Candles confirmed {stats.get('candles', 0)} of 75"
              f" · with a sector pick {stats.get('picks', 0)}",
@@ -879,6 +889,11 @@ def format_summary(st: dict) -> str:
         bits += [f"{k} {v}" for k, v in skips.items() if k not in _SKIP_LABEL]
         lines.append("Checked, not projected: " + " · ".join(bits))
     lines += [_entries_line(stats), _summary_rejects(st), _summary_open(st)]
+    if lost:
+        shown = " · ".join(f"{e.get('raw')} {e.get('time')} ({_tries(e)})"
+                           for e in list(lost.values())[:6])
+        lines.append(f"⚠ entry alert(s) not delivered: {len(lost)} — {shown} — Telegram "
+                     f"refused them, so no entry was recorded and no trade is being tracked")
     if stats.get("feed_behind"):
         lines.append(f"⚠ the 1m feed lagged past the close on {stats['feed_behind']} candle(s)")
     lines.append(f"Projected alerts fire {first_minute()}–4 minutes before the 5m close.")
@@ -1188,6 +1203,9 @@ def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
     return tries < budget
 
 
+_no_pick_bar: str | None = None      # the last candle that logged "no sector pick"
+
+
 def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                force_sector: str | None = None) -> list[dict]:
     """Evaluate the forming candle ``bar`` from the 1m prints and alert bot 3.
@@ -1207,9 +1225,12 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     _track_once(bar - timedelta(minutes=BAR_MINUTES))   # last closed candle's hits
     pick = pick_for(bar, projection=True, force_sector=force_sector, now=now)
     if not pick or pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
-        log.info("1m %s: no sector pick to project on — nothing projected%s",
-                 bar.strftime("%H:%M"),
-                 " (projected from the forming candle)" if (pick or {}).get("projected") else "")
+        global _no_pick_bar
+        if _no_pick_bar != bar.isoformat():      # once per candle, not once per minute
+            _no_pick_bar = bar.isoformat()
+            log.info("1m %s: no sector pick to project on — nothing projected%s",
+                     bar.strftime("%H:%M"),
+                     " (projected from the forming candle)" if (pick or {}).get("projected") else "")
         return []
     session = str(bar.date())
     want = "BUY" if pick["side"] == 1 else "SELL"
@@ -1269,6 +1290,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     frames: dict[str, pd.DataFrame] = {}
     fires_book: dict[str, list] = {}
     projected_now: set[str] = set()
+    earlier: list[tuple[str, str]] = []   # names whose fire was on an older candle
     for raw, ysym in tickers.items():
         m1 = sm1.get(ysym)
         frame = projected_frame(sm5.get(ysym), m1, bar, now)
@@ -1293,8 +1315,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                 before = [s.time for s in fires if s.side == want and s.time < hhmm]
                 if before:
                     _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
-                    log.info("1m %s: last %s fire was %s, not this candle — not projected",
-                             raw, want, min(before))
+                    earlier.append((raw, min(before)))
             _no_projection(raw, "no_signal")
             continue
         best = fresh[-1]
@@ -1329,6 +1350,11 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         lead = (sector_lead(frame, bar, plan.entry, pick.get("intra"), pick["side"] == 1)
                 if rank_by_sector_lead() else None)
         ready.append({"raw": raw, "best": best, "plan": plan, "lead": lead, "stamp": stamp})
+    if earlier:
+        # One line, not eight: this printed a line per name per minute — 479 of
+        # them on 18 Nov, half the 1m log — to say the same thing each time.
+        log.info("1m %s: %d names fired on an earlier candle, not this one — not projected: %s",
+                 hhmm, len(earlier), ", ".join(f"{r} {t}" for r, t in earlier))
     # The alert layer is capped and ranked exactly like the entry layer: on one
     # candle, ten names can fire and only three can ever be taken.
     cap = alert_cap()
@@ -1448,6 +1474,29 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
 
 
 # ── the close: confirm (silent on failure by request) ────────────────────────
+def _note_undelivered(st: dict, raw: str, bar: datetime, now: datetime) -> None:
+    """An entry alert Telegram refused: the trade is not recorded — and not forgotten.
+
+    ``tick`` only retried a candle while a *feed* had not published, so an entry
+    whose send bounced on a candle with complete feeds was never re-sent, although
+    the log promised "the next minute retries". 18 Nov, LGEINDIA 10:15: two
+    refusals, no entry, no position, and the day's summary said nothing about it.
+    """
+    book = st.setdefault("undelivered", {})
+    key = f"{raw} {bar:%H:%M}"
+    entry = book.setdefault(key, {"raw": raw, "bar": bar.isoformat(),
+                                  "time": bar.strftime("%H:%M"),
+                                  "first": now.strftime("%H:%M:%S")})
+    entry["tries"] = int(entry.get("tries") or 0) + 1
+    entry["at"] = now.strftime("%H:%M:%S")
+    early = (st.get("early") or {}).get(raw)
+    if early and early.get("bar") == bar.isoformat() and not early.get("result"):
+        # Not a verdict: the retry may still confirm it, so it is kept out of
+        # ``_settle``'s write-off and out of the cancelled count.
+        early["result"] = "undelivered"
+    log.warning("bot 3 delivery failed for %s; the next minute retries", raw)
+
+
 def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
                  force_sector: str | None = None) -> list[dict]:
     """Judge the closed candle ``bar`` exactly as the 5m scan judges it.
@@ -1595,10 +1644,11 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         text = format_confirmed(best, pick, plan, early=cand["early"], sector=sector_of[raw],
                                 oi_line=_oi_line(cand["reading"]), lead=cand["lead"])
         if not telegram.send_bot3(text, dry_run=_dry()):
-            log.warning("bot 3 delivery failed for %s; the next minute retries", raw)
+            _note_undelivered(st, raw, bar, now_ist())
             continue
         take_entry_slot(st, own_key)      # charged to the name's own sector
         confirmed.add(raw)
+        (st.get("undelivered") or {}).pop(f"{raw} {bar:%H:%M}", None)   # delivered now
         sent[raw] = {"code": best.code, "name": best.name, "time": best.time,
                      "price": plan.entry, "sl": plan.sl,
                      "at": now_ist().strftime("%H:%M:%S")}
@@ -1623,10 +1673,18 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
             scanned=set(names), reasons=reasons)
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
+    stuck = [e["raw"] for e in (st.get("undelivered") or {}).values()
+             if e.get("bar") == bar.isoformat()]
     if checked != set(names):
         st["retry_bar"] = bar.isoformat()
         log.info("1m %s: %d of %d feeds had not published — will retry",
                  bar.strftime("%H:%M"), len(set(names) - checked), len(names))
+    elif stuck:
+        # Complete feeds, a refused alert: the candle stays owed so the promised
+        # retry really happens instead of the entry dying with a warning line.
+        st["retry_bar"] = bar.isoformat()
+        log.info("1m %s: close pass retried — %s not delivered yet (%s)",
+                 bar.strftime("%H:%M"), ", ".join(stuck), now_ist().strftime("%H:%M:%S"))
     else:
         _mark_judged(st, bar)
     save_ledger(st)

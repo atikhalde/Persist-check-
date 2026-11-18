@@ -1731,3 +1731,96 @@ class CatchupWindowTests(TestCase):
     def test_the_switch_can_turn_it_off(self):
         with patch.dict("os.environ", {"SCAN1M_LEADER_CATCHUP": "0"}):
             self.assertFalse(scan1m.catchup_due({}, self.pick, self.bar(0)))
+
+
+class UndeliveredAlertTests(Scan1mFixture):
+    """An entry alert Telegram refused must not vanish with a warning line.
+
+    18 Nov, LGEINDIA 10:15: the close pass built the entry, bot 3 refused the
+    message twice (a bare ``<`` in the 5m block) and the log said "the next minute
+    retries" — but ``tick`` only retried while a *feed* had not published, and that
+    candle's feeds were complete. The candle was marked judged, the entry was never
+    sent, nothing was recorded, and the summary did not mention it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.now = CLOSE
+        self.minutes = one_minute(0, 1, 2, 3, 4, 5)     # the whole 10:00 candle
+        self.bot3.return_value = False
+
+    def test_a_refused_entry_keeps_the_candle_owed_and_is_booked(self):
+        self.assertEqual(scan1m.confirm_pass(BAR, now=CLOSE), [])
+        st = self.ledger()
+        self.assertEqual(st["retry_bar"], BAR.isoformat())
+        self.assertEqual(st["undelivered"]["ABC 10:00"]["tries"], 1)
+        self.assertNotIn("ABC", st["sent"])            # nothing was recorded
+        self.assertNotIn("ABC", st["positions"])
+        self.assertNotEqual((st["stats"] or {}).get("judged_bar"), BAR.isoformat())
+
+    def test_the_next_minute_really_retries_the_closed_candle(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        self.now = CLOSE + timedelta(minutes=1)
+        self.assertEqual(scan1m.tick(self.now), "retry")
+
+    def test_the_retry_that_delivers_records_the_entry_and_forgets_the_refusal(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        self.bot3.return_value = True
+        self.now = CLOSE + timedelta(minutes=1)
+        out = scan1m.confirm_pass(BAR, now=self.now)
+        st = self.ledger()
+        self.assertEqual([s["symbol"] for s in out], ["ABC"])
+        self.assertIn("ABC", st["sent"])
+        self.assertEqual(st.get("undelivered"), {})
+        self.assertNotEqual(st.get("retry_bar"), BAR.isoformat())   # judged now
+
+    def test_a_refused_projection_is_not_filed_as_cancelled(self):
+        self.bot3.return_value = True                  # the projection itself lands
+        scan1m.run_minute(BAR, now=MIN1)
+        self.bot3.return_value = False                 # …and its confirmation bounces
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        st = self.ledger()
+        self.assertEqual(st["early"]["ABC"]["result"], "undelivered")
+        self.assertFalse((st["stats"] or {}).get("cancelled"))
+        self.assertIn("not delivered 1",
+                      scan1m._projected_line({**st["stats"], "undelivered": 1}))
+
+    def test_the_summary_names_the_entry_that_was_never_delivered(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        st = self.ledger()
+        st["stats"]["candles"] = 1                     # it scanned a candle
+        text = scan1m.format_summary(st)
+        self.assertIn("⚠ entry alert(s) not delivered: 1", text)
+        self.assertIn("ABC 10:00 (1 try)", text)
+        self.assertIn("no entry was recorded", text)
+
+
+class ProjectionLogTests(Scan1mFixture):
+    """Half of the 18 Nov 1m log was the same sentence printed per name, per minute."""
+
+    def setUp(self):
+        super().setUp()
+        self.universe["sectors"]["IT"]["stocks"] = ["ABC", "XYZ"]
+        scan1m._no_pick_bar = None
+
+    def test_names_that_fired_on_an_earlier_candle_are_one_line_a_minute(self):
+        self.engine.side_effect = lambda raw, frame, daily, keep_all=False: [
+            base.signal(time="09:55")]
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            scan1m.run_minute(BAR, now=MIN1)
+        lines = [line for line in logs.output if "earlier candle" in line]
+        self.assertEqual(len(lines), 1, logs.output)      # 2 names, 2 lines before
+        self.assertIn("2 names", lines[0])
+        self.assertIn("ABC 09:55", lines[0])
+        self.assertIn("XYZ 09:55", lines[0])
+
+    def test_no_sector_pick_is_said_once_per_candle(self):
+        self.pick = {**self.pick, "sector": "WAIT", "side": 0}
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            for minute in (1, 2, 3):
+                scan1m.run_minute(BAR, now=BAR + timedelta(minutes=minute, seconds=5))
+        lines = [line for line in logs.output if "no sector pick" in line]
+        self.assertEqual(len(lines), 1, logs.output)      # four times before
+
+    def test_the_market_alert_log_names_the_side(self):
+        self.assertEqual(self.ledger().get("sector"), None)
