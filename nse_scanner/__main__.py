@@ -7,7 +7,7 @@
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
-  python -m nse_scanner or-compare --or 30,15 --days 5
+  python -m nse_scanner or-compare --or 30,15,10,5 --days 5
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="or-compare: weekdays to replay when --dates is empty")
     p.add_argument("--end", default=None,
                    help="or-compare: last session to replay (default: yesterday, IST)")
-    p.add_argument("--or", dest="or_values", default="30,15",
+    p.add_argument("--or", dest="or_values", default="30,15,10,5",
                    help="or-compare: opening-range minutes to compare, e.g. 30,15")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args(argv)

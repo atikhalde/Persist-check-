@@ -29,7 +29,7 @@ on:
       or:
         description: "Opening ranges to compare, minutes, comma separated"
         type: string
-        default: "30,15"
+        default: "30,15,10,5"
       dates:
         description: "Sessions to replay, comma separated YYYY-MM-DD (empty = last N weekdays)"
         type: string

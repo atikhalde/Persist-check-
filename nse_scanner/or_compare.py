@@ -229,7 +229,13 @@ def compare_day(target: date, ors=DEFAULT_ORS) -> dict:
         })
         log.info("%s OR %dm: first pick %s, %d entries, net %.1fR",
                  target, value, results[-1]["first_pick"], len(entries), results[-1]["net_r"])
-    return {"date": str(target), "results": results}
+    # A day where the ranges agree is the common case, and it means something the
+    # table cannot show on its own: on that tape the opening range was not the
+    # binding constraint. Said out loud, identical columns read as a result
+    # instead of as a bug (18 Nov's first report had four of five days identical).
+    same = len({(r["first_pick"], r["dominant"], r["wait_bars"],
+                 tuple((e["raw"], e["time"]) for e in r["entries"])) for r in results}) == 1
+    return {"date": str(target), "results": results, "identical": same}
 
 
 def _names(entries: list[dict]) -> str:
@@ -262,6 +268,9 @@ def render(day: dict) -> str:
             else:
                 cells.append(str(r[key]))
         rows.append(f"| {label} | " + " | ".join(cells) + " |")
+    if day.get("identical"):
+        rows += ["", "_Every opening range produced the same pick path and the same entries on_"
+                     " _this session: the range was not what decided it._"]
     return "\n".join(rows)
 
 
