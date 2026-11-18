@@ -2,8 +2,22 @@
 
 The 18 Nov question, in one line: **KALYANKJIL fired at 09:20, DIXON and TITAN at 09:25, and the
 sector that made them relevant was only picked at 09:45.** Seven of the twelve names of that
-sector were inside the opening range. A 15-minute range would have had the same pick at 09:30,
-while those fires were still live. Would that have been better, and what would it have cost?
+sector were inside the opening range. Would a shorter range have caught them, and what would it
+have cost?
+
+The arithmetic, before any measuring — the gate is `mom = bar time − 09:15 >= OR_MINUTES`, and a
+fire is eligible only if its own candle is one where the pick was live:
+
+| opening range | first bar a pick is possible on | judged at | fires it can rescue (18 Nov) |
+|---|---|---|---|
+| **30 min** (live) | 09:45 | 09:50 | LGEINDIA 10:15, BATAINDIA 10:50 |
+| **15 min** | 09:30 | 09:35 | WHIRLPOOL 09:40 — **not** the 09:20/09:25 cluster |
+| **10 min** | 09:25 | 09:30 | CROMPTON, DIXON, HAVELLS, TITAN, VOLTAS @09:25 |
+| **5 min** | 09:20 | 09:25 | KALYANKJIL @09:20 |
+
+So "15 minutes would have caught DIXON and TITAN" is **false** — it needs 10, and KALYANKJIL needs
+5. Run `--or 30,15,10,5` to see the whole ladder; each step down is more whipsaw, and that is what
+the table is for.
 
 This is the measuring tool for that question. It is **not** a knob and not a rule change: nothing in
 the live loops imports it, it sends no Telegram message, it never touches the live ledger, and
