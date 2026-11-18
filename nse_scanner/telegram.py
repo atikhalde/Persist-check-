@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 import requests
@@ -11,6 +12,27 @@ import requests
 log = logging.getLogger("nse_scanner.telegram")
 
 API = "https://api.telegram.org/bot{token}/sendMessage"
+
+_PARSE_ERR = "can't parse entities"
+_TAGS = re.compile(r"</?(?:b|strong|i|em|u|s|code|pre)>", re.IGNORECASE)
+
+
+def esc(text) -> str:
+    """Escape text that goes *inside* an HTML message.
+
+    18 Nov: every WAIT block of the morning was dropped by Telegram —
+    ``Bad Request: can't parse entities: Unsupported start tag ""`` — because the
+    pick reason says ``conf 30 < 55`` and ``persist 43 < 50``: one bare ``<`` and
+    the whole message is refused, four retries and then silence. Nine messages
+    that morning, including the four the audit was waiting for.
+    """
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _plain(text: str) -> str:
+    """The same message with the scanner's own markup stripped, for the fallback."""
+    out = _TAGS.sub("", text)
+    return out.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
 def config_from_env() -> tuple[str, str]:
@@ -36,12 +58,25 @@ def _send_to(token: str, chat: str, text: str, *, parse_mode: str, label: str) -
     }
     url = API.format(token=token)
     last = None
+    fell_back = False
     for i in range(3):
         try:
             response = requests.post(url, json=payload, timeout=12)
             if response.ok:
                 return True
             last = f"{response.status_code} {response.text[:200]}"
+            # A markup mistake must not cost the alert. Send the same words as
+            # plain text — the reader loses the bold, not the warning.
+            if parse_mode and not fell_back and _PARSE_ERR in response.text:
+                fell_back = True
+                plain = {k: v for k, v in payload.items() if k != "parse_mode"}
+                plain["text"] = _plain(text)
+                log.warning("telegram %s rejected the markup (%s); retrying as plain text",
+                            label, last)
+                again = requests.post(url, json=plain, timeout=12)
+                if again.ok:
+                    return True
+                last = f"{again.status_code} {again.text[:200]}"
             log.warning("telegram %s send failed: %s", label, last)
         except Exception as exc:
             # Request exceptions can contain the request URL (including the bot
@@ -79,7 +114,8 @@ def send(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> bool:
         if not token_2 or not chat_2:
             log.error("TELEGRAM_BOT_TOKEN_2 and TELEGRAM_CHAT_ID_2 must both be set; secondary bot skipped")
         elif not _send_to(token_2, chat_2, text, parse_mode=parse_mode, label="secondary"):
-            log.error("secondary Telegram alert was not delivered; primary alert was delivered")
+            log.error("secondary Telegram alert was not delivered (check TELEGRAM_CHAT_ID_2: "
+                      "bot 2 must be a member of that chat); primary alert was delivered")
 
     return True
 

@@ -922,6 +922,19 @@ class Bot1SummaryTests(TestCase):
                          "⏱ close scan late: 12 of 72 candles judged more than 180s"
                          " after their close (slowest 340s)")
 
+    def test_a_candle_abandoned_for_a_late_index_bar_says_so(self):
+        """18 Nov 09:40: the 09:35 Nifty bar was 10s late, so the candle was dropped.
+
+        The deadline was 09:43: ``_run_until_ready`` gave up at 09:40:10 because a
+        "CLOSED" market after 09:30 is read as a holiday. One of the three candles
+        missing from ``72 of 75``.
+        """
+        self.assertEqual(pipeline._summary_no_index({"candle_no_index": 1}),
+                         "Candles skipped: 1 — Nifty had not published its bar when"
+                         " the run reached the candle")
+        self.assertEqual(pipeline._summary_no_index({"candle_no_index": 0}), "")
+        self.assertEqual(pipeline._summary_no_index({}), "")
+
     def test_a_scan_on_time_prints_no_lag_line(self):
         self.assertEqual(pipeline._summary_scan_lag({"candles": 72, "scan_lag_max": 40.0}), "")
 

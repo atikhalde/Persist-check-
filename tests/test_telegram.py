@@ -79,6 +79,32 @@ class TelegramDeliveryTests(TestCase):
                 self.assertTrue(telegram.send("alert"))
         post.assert_called_once()
 
+    def test_a_markup_mistake_does_not_lose_the_alert(self):
+        """18 Nov: nine alerts were dropped, four retries each, in silence.
+
+        The pick reason says ``conf 30 < 55``; one bare ``<`` made Telegram refuse
+        the whole message — including the four WAIT blocks the audit was waiting
+        for. The words now go out as plain text instead of not at all.
+        """
+        bad = ('{"ok":false,"error_code":400,"description":"Bad Request: can\'t parse '
+               'entities: Unsupported start tag \"\" at byte offset 400"}')
+        env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(telegram.requests, "post",
+                             side_effect=[Response(False, 400, bad), Response(True)]) as post, \
+                patch.object(telegram.time, "sleep"):
+            self.assertTrue(telegram.send("<b>MARKET STAND ASIDE</b>\nconf 30 < 55"))
+
+        self.assertEqual(post.call_count, 2)
+        plain = post.call_args_list[1].kwargs["json"]
+        self.assertNotIn("parse_mode", plain)                 # markup off
+        self.assertEqual(plain["text"], "MARKET STAND ASIDE\nconf 30 < 55")
+
+    def test_the_escape_keeps_a_less_than_sign_readable(self):
+        self.assertEqual(telegram.esc("conf 30 < 55"), "conf 30 &lt; 55")
+        self.assertEqual(telegram.esc("A & B"), "A &amp; B")
+        self.assertEqual(telegram.esc(None), "None")
+
     def test_primary_failure_keeps_existing_retry_and_failure_behavior(self):
         env = {
             "TELEGRAM_BOT_TOKEN": "primary-token",
