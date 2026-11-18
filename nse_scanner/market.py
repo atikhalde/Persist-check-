@@ -203,6 +203,11 @@ class MarketDecision:
     # Sectors left out of the pick because their index stopped updating:
     # [(name, lag_bars)]. Shown on the market block, never silently dropped.
     stale_sectors: list = field(default_factory=list)
+    # Every sector's index lag, ``{name: bars}``. Lag *inside* the limit is legal
+    # and used, so it was invisible — and two runs of the same candle could then
+    # print different PERSIST scores with nothing on screen to explain it
+    # (18 Nov: MET 78 vs MET 85 on two blocks both stamped 09:45).
+    sector_lag: dict = field(default_factory=dict)
 
 
 def _day_ohlc_so_far(df: pd.DataFrame, sid) -> tuple[float, float, float, float]:
@@ -551,6 +556,7 @@ def run_market(
         extra_sectors=extra_sectors,
         flow_aligned=flow_aligned,
         stale_sectors=stale_sectors,
+        sector_lag={name: int(snap.lag_bars) for name, snap in snaps.items()},
     )
 
 
