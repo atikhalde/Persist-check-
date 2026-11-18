@@ -943,13 +943,19 @@ _CATCHUP_WHY_ORDER = ("stop", "chased", "old", "bar", "plan", "none")
 
 
 def _note_old_age(stats: dict, why: dict) -> None:
-    """Remember how old the youngest refused fire was (any refusal reason).
+    """Remember the age of the youngest fire the window refused as *too old*.
 
     ``old`` is the one refusal that says nothing about the name and everything
     about the clock, so the number belongs next to the count: a replay whose
     clock sits past the close refuses everything as ``old`` with an age in hours,
     a live window refuses only the morning's fires at 31–40 minutes.
+
+    Only ``old`` refusals count. A ``chased`` fire is refused for having run —
+    usually minutes after its candle — and mixing those in would answer "why
+    weren't the stale ones sent?" with a fresh fire's age.
     """
+    if why.get("why") != "old":
+        return
     age = why.get("age")
     if age is None:
         return
@@ -969,11 +975,12 @@ _CANCEL_WHY = {
     "late": "the close scan ran past the alert deadline",
     "pick_wait": "not checked — the pick dropped to WAIT",
     "sector_moved": "not checked — the close picked another sector",
+    "no_free": "not checked — no free name in the scanned sector",
     "unchecked": "could not be checked in time",
 }
 
 _CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap",
-                     "late", "sector_moved", "pick_wait", "unchecked")
+                     "late", "pick_wait", "no_free", "sector_moved", "unchecked")
 
 
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
@@ -1472,7 +1479,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     market_alert(st, pick)
     if pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         _count_candle(stats, pick)
-        _settle(st, bar, set(), None, "not checked — the pick dropped to WAIT")
+        _settle(st, bar, set(), None, code="pick_wait")
         _mark_judged(st, bar)          # nothing to scan on this candle, as on bot 1
         save_ledger(st)
         return []
@@ -1488,7 +1495,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     names = [raw for raw in sector_of if raw not in sent and raw not in positions]
     if not names:
         _mark_judged(st, bar)          # every name is already in a trade today
-        _settle(st, bar, set(), None, "not checked — no free name in the scanned sector", scanned=set())
+        _settle(st, bar, set(), None, code="no_free", scanned=set())
         save_ledger(st)
         return []
 
@@ -1612,7 +1619,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         log.info("1m CONFIRMED %s %s %s @ %.2f (sent %s IST)", raw, best.side, best.name,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
-    _settle(st, bar, confirmed, checked, "did not hold", closes=closes,
+    _settle(st, bar, confirmed, checked, closes=closes,
             scanned=set(names), reasons=reasons)
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
@@ -1702,9 +1709,10 @@ def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) ->
 
 
 def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | None = None,
-            reason: str = "", closes: dict[str, float] | None = None,
+            closes: dict[str, float] | None = None,
             scanned: set[str] | None = None,
-            reasons: dict[str, str] | None = None) -> None:
+            reasons: dict[str, str] | None = None,
+            code: str = "") -> None:
     """Resolve projected alerts of ``bar`` that the close did not confirm.
 
     ``checked`` limits this to the stocks the close scan could actually judge: a
@@ -1721,21 +1729,24 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
     for raw, early in list((st.get("early") or {}).items()):
         if early.get("result") or early.get("bar") != bar.isoformat() or raw in confirmed:
             continue
-        code = (reasons or {}).get(raw) or ""
-        why = _CANCEL_WHY.get(code) or (reasons or {}).get(raw) or reason
+        # Every write-off names a gate. It used to fall back to the sentence
+        # "did not hold" while the summary filed the same projection under
+        # "could not be checked in time" — a message and a report disagreeing
+        # about why one projection died.
+        gate = (reasons or {}).get(raw) or code or ""
         if checked is not None and raw not in checked:
             if scanned is None or raw in scanned:
                 continue                 # the feed had not published: retried
-            code = code or "sector_moved"
-            why = _CANCEL_WHY["sector_moved"]
+            gate = gate or "sector_moved"
+        why = _CANCEL_WHY.get(gate) or _CANCEL_WHY["unchecked"]
+        gate = gate or "unchecked"
         early["result"] = "cancelled"
         stats = st.setdefault("stats", {})
         stats["cancelled"] = stats.get("cancelled", 0) + 1
         # The book the summary reads: a cancellation is a refusal, and every
         # refusal has to be countable by the gate that made it.
         book = stats.setdefault("cancel_why", {})
-        key = code or "unchecked"
-        book[key] = book.get(key, 0) + 1
+        book[gate] = book.get(gate, 0) + 1
         log.info("1m projection for %s did not hold (%s) — no message", raw, why)
         if cancel_message():
             price = early.get("price")
@@ -1748,10 +1759,10 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
                     pct = -pct                    # "beyond" always means "in our favour"
                 favour = pct > 0
                 move = f" · close {px:.2f} ({pct:+.2f}%)"
-                if favour and key == "no_signal":
+                if favour and gate == "no_signal":
                     move += " — price moved in our favour, the signal did not repeat"
-            code = early.get("name")
-            who = f"{early.get('side')} {raw}" + (f" ({code})" if code else "")
+            label = early.get("name")
+            who = f"{early.get('side')} {raw}" + (f" ({label})" if label else "")
             telegram.send_bot3(
                 f"❌ <b>EARLY CANCELLED</b> — {who}\n"
                 f"projected {early.get('at')} @ {price:.2f}{move}\n"
