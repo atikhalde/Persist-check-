@@ -694,7 +694,7 @@ python -m nse_scanner live
 | `python -m nse_scanner live` | always-on loop: early pass before each close, confirmed scan after it |
 | `python -m nse_scanner live --exit-at-close --max-minutes 170` | same, for hosts with a job time limit (GitHub Actions) |
 | `python -m nse_scanner early-check --date D --sector S` | measure early alerts against their closes |
-| `python -m nse_scanner or-compare --or 30,15 --days 5` | measure two opening-range lengths on the same sessions |
+| `python -m nse_scanner or-compare --or 30,15,10,5 --days 5` | measure several opening-range lengths on the same sessions |
 
 State (dedupe) is `state/scan_state.json`.
 

@@ -29,7 +29,7 @@ GitHub → **Actions → OR comparison (measurement) → Run workflow**
 
 | input | meaning |
 |---|---|
-| `or` | opening ranges to compare, minutes: `30,15` (or `30,20,15`) |
+| `or` | opening ranges to compare, minutes. Defaults to the whole useful ladder, `30,15,10,5`; any comma-separated list works (`30,20,15`) |
 | `dates` | sessions to replay, `2026-11-18,2026-11-17` — empty means "the last N weekdays" |
 | `days` | how many weekdays to replay when `dates` is empty (default 5) |
 
@@ -37,8 +37,8 @@ The report appears in the run's **Summary** page and as a downloadable artifact.
 locally, wherever Yahoo is reachable:
 
 ```
-python -m nse_scanner or-compare --or 30,15 --dates 2026-11-18
-python -m nse_scanner or-compare --or 30,15 --days 5 --end 2026-11-18
+python -m nse_scanner or-compare --or 30,15,10,5 --dates 2026-11-18
+python -m nse_scanner or-compare --or 30,15,10,5 --days 10 --end 2026-11-18
 ```
 
 ## What it reports
@@ -75,6 +75,19 @@ P&L statement for either bot.
 
 It also cannot answer "would the trade have been taken at the fire price in real life": the fire is
 only knowable when its candle closes, and the alert goes out seconds later.
+
+## When the columns are identical
+
+Most sessions come back byte-identical across every opening range, and that is a finding, not a bug:
+the report says so in a line under the table. It means no fire on that tape needed a shorter range —
+every entry was already eligible at 30 minutes, either because the pick happened before the fire's
+own candle (the `early` rotation needs `mom <= EARLY_ROT_UNTIL` and the close already through the
+range) or because the first pick came late enough that 30 was already open. Four of the five
+sessions in the first 30-vs-15 run were like this; only 17 Nov actually differed.
+
+So the ladder is worth running over **ten** sessions, and the sessions worth looking at are the ones
+where the columns differ — those are the days when the length of the opening range was the thing
+that decided the entry.
 
 ## Reading the result honestly
 

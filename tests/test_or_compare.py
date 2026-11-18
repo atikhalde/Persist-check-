@@ -132,6 +132,14 @@ class ReportTests(TestCase):
         self.assertIn("| OR 30 min (sessions 2) | 2 | +0.8R | +0.40R | 2/2 | 0 |", text)
         self.assertIn("| OR 15 min (sessions 2) | 4 | -1.2R | -0.30R | 2/4 | 2 |", text)
 
+    def test_a_session_where_the_ranges_agree_says_so(self):
+        day = self.day()
+        day["identical"] = True
+        text = or_compare.render(day)
+        self.assertIn("the range was not what decided it", text)
+        day["identical"] = False
+        self.assertNotIn("the range was not what decided it", or_compare.render(day))
+
     def test_the_report_says_what_it_does_not_replay(self):
         text = or_compare.render_report([self.day()], (30, 15))
         self.assertIn("The entry cap", text)
