@@ -118,3 +118,44 @@ class TelegramDeliveryTests(TestCase):
                 self.assertFalse(telegram.send("alert"))
         self.assertEqual(post.call_count, 3)
         self.assertTrue(all("primary-token" in call.args[0] for call in post.call_args_list))
+
+    def test_a_secondary_chat_that_refuses_every_alert_is_counted(self):
+        """18 Nov: ``chat not found`` on every mirror, and the run still looked clean.
+
+        The primary alert is delivered and must stay delivered; what changes is that
+        the refusal is now remembered, so the day's summary can name it.
+        """
+        telegram.reset_secondary_failures()
+        self.addCleanup(telegram.reset_secondary_failures)
+        env = {
+            "TELEGRAM_BOT_TOKEN": "primary-token",
+            "TELEGRAM_CHAT_ID": "primary-chat",
+            "TELEGRAM_BOT_TOKEN_2": "secondary-token",
+            "TELEGRAM_CHAT_ID_2": "secondary-chat",
+        }
+        not_found = Response(False, 400, '{"description":"Bad Request: chat not found"}')
+        posts = []
+
+        def post(url, **kwargs):
+            posts.append(url)
+            return Response(True) if "primary-token" in url else not_found
+
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(telegram.requests, "post", side_effect=post), \
+                patch.object(telegram.time, "sleep"):
+            for _ in range(3):
+                self.assertTrue(telegram.send("alert"))       # primary still wins
+
+        self.assertEqual(sum("primary-token" in u for u in posts), 3)
+        self.assertEqual(sum("secondary-token" in u for u in posts), 9)   # 3 retries each
+        self.assertEqual(telegram.secondary_failures(), 3)               # 3 alerts lost
+
+    def test_a_half_configured_secondary_bot_counts_as_undelivered(self):
+        telegram.reset_secondary_failures()
+        self.addCleanup(telegram.reset_secondary_failures)
+        env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c",
+               "TELEGRAM_BOT_TOKEN_2": "secondary-token"}
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(telegram.requests, "post", return_value=Response(True)):
+            self.assertTrue(telegram.send("alert"))
+        self.assertEqual(telegram.secondary_failures(), 1)

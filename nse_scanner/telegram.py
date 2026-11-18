@@ -17,6 +17,26 @@ _PARSE_ERR = "can't parse entities"
 _TAGS = re.compile(r"</?(?:b|strong|i|em|u|s|code|pre)>", re.IGNORECASE)
 
 
+#: Alerts bot 2 refused since this process started (usually ``chat not found``).
+#:
+#: A secondary failure is logged and then forgotten — the run stays green, the
+#: primary alert is delivered, and nobody learns that the mirror chat got nothing.
+#: 18 Nov: every single message of the morning was refused for this reason and the
+#: only trace was one log line per alert. The count reaches the day's summary.
+_secondary_failures = 0
+
+
+def secondary_failures() -> int:
+    """How many alerts the secondary bot failed to deliver (0 = it is fine)."""
+    return _secondary_failures
+
+
+def reset_secondary_failures() -> None:
+    """Forget the running count (a new session or a fresh process)."""
+    global _secondary_failures
+    _secondary_failures = 0
+
+
 def esc(text) -> str:
     """Escape text that goes *inside* an HTML message.
 
@@ -109,11 +129,14 @@ def send(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> bool:
     if not _send_to(token, chat, text, parse_mode=parse_mode, label="primary"):
         return False
 
+    global _secondary_failures
     token_2, chat_2 = secondary_config_from_env()
     if token_2 or chat_2:
         if not token_2 or not chat_2:
+            _secondary_failures += 1
             log.error("TELEGRAM_BOT_TOKEN_2 and TELEGRAM_CHAT_ID_2 must both be set; secondary bot skipped")
         elif not _send_to(token_2, chat_2, text, parse_mode=parse_mode, label="secondary"):
+            _secondary_failures += 1
             log.error("secondary Telegram alert was not delivered (check TELEGRAM_CHAT_ID_2: "
                       "bot 2 must be a member of that chat); primary alert was delivered")
 

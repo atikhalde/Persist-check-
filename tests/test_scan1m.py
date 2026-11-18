@@ -864,6 +864,16 @@ class Bot1SummaryTests(TestCase):
         x.update(over)
         return {"session": "2026-11-18", "stats": x, "sent": {}}
 
+    def test_a_silent_mirror_bot_is_named_in_the_summary(self):
+        """Every mirrored alert of 18 Nov was refused and no line of the summary said so."""
+        telegram.reset_secondary_failures()
+        self.addCleanup(telegram.reset_secondary_failures)
+        self.assertNotIn("mirror", pipeline.format_summary(self.stats()))
+        with patch.object(telegram, "secondary_failures", return_value=12):
+            text = pipeline.format_summary(self.stats())
+        self.assertIn("⚠ mirror alerts not delivered: 12", text)
+        self.assertIn("TELEGRAM_CHAT_ID_2", text)
+
     def test_a_cancellation_names_the_gate_that_refused_it(self):
         st = self.stats()
         pipeline._note_cancel(st, "had no pivot target — nothing to exit at")
@@ -929,7 +939,7 @@ class Bot1SummaryTests(TestCase):
         "CLOSED" market after 09:30 is read as a holiday. One of the three candles
         missing from ``72 of 75``.
         """
-        self.assertEqual(pipeline._summary_no_index({"candle_no_index": 1}),
+        self.assertEqual(pipeline._summary_no_index({"no_index": {"2026-11-18 09:35": 1}}),
                          "Candles skipped: 1 — Nifty had not published its bar when"
                          " the run reached the candle")
         self.assertEqual(pipeline._summary_no_index({"candle_no_index": 0}), "")
