@@ -910,9 +910,112 @@ class Bot1SummaryTests(TestCase):
                       " (BATAINDIA 09:45, VOLTAS 09:45, WHIRLPOOL 09:45,"
                       " TITAN 09:45, WHIRLPOOL 09:50, BATAINDIA 10:15)", text)
 
+    def test_a_late_scan_says_so_and_says_by_how_much(self):
+        """The one number 18 Nov needed and did not have.
+
+        A scan judging its candle minutes after the close refuses every older
+        fire as ``old`` and drops every fresh one as ``late``; the summary's only
+        lateness figure was for *entry alerts that were sent*, and none were.
+        """
+        x = {"candles": 72, "scan_late": 12, "scan_lag_max": 340.0}
+        self.assertEqual(pipeline._summary_scan_lag(x),
+                         "⏱ close scan late: 12 of 72 candles judged more than 180s"
+                         " after their close (slowest 340s)")
+
+    def test_a_scan_on_time_prints_no_lag_line(self):
+        self.assertEqual(pipeline._summary_scan_lag({"candles": 72, "scan_lag_max": 40.0}), "")
+
+    def test_the_lag_is_measured_once_per_candle_and_never_on_a_replay(self):
+        st = {}
+        with patch.object(pipeline, "now_ist", return_value=BAR + timedelta(minutes=10)):
+            pipeline._note_scan_lag(st, BAR)
+            pipeline._note_scan_lag(st, BAR)                  # a retry, not a second candle
+            self.assertEqual(st["stats"]["scan_late"], 1)
+            self.assertEqual(st["stats"]["scan_lag_max"], 300.0)
+        with patch.object(pipeline, "now_ist", return_value=BAR + timedelta(minutes=20)):
+            pipeline._note_scan_lag(st, BAR + timedelta(minutes=5))   # closed at +10
+            self.assertEqual(st["stats"]["scan_late"], 2)
+        before = dict(st["stats"])
+        with patch.object(pipeline, "now_ist", return_value=BAR + timedelta(hours=2)):
+            pipeline._note_scan_lag(st, BAR + timedelta(minutes=10), stale=True)
+        self.assertEqual(st["stats"], before)                 # a replay measures the replay
+
     def test_a_quiet_section_leaves_no_blank_line(self):
         text = pipeline.format_summary(self.stats())
         self.assertNotIn("\n\n", text)
+
+
+class CancelGateTests(TestCase):
+    """Bot 1's cancellations: one glossary, two bots.
+
+    18 Nov, bot 1: ``Early alerts 1: confirmed 0 · cancelled 1 · unverified 0``
+    and the message ``… · did not hold at this close …`` — the same vague phrase
+    #40 removed from bot 3. Bot 1 also filed two write-offs (a pick that moved,
+    a scan that never ran) under labels its own message never used.
+    """
+
+    EARLY = {"bar": BAR.isoformat(), "side": "SELL", "price": 1714.80,
+             "name": "NORMAL SELL", "session": str(BAR.date()), "at": "10:16:06"}
+
+    def cancel(self, code, close=1712.10):
+        from nse_scanner.scan1m import _CANCEL_WHY
+        st = {}
+        with patch.object(pipeline.telegram, "send", return_value=True) as send, \
+                patch.object(pipeline, "_save"), \
+                patch.dict("os.environ", {"DRY_RUN": "0"}):
+            pipeline._cancel_early(st, "LGEINDIA", dict(self.EARLY), _CANCEL_WHY[code],
+                                   close=close, code=code)
+        return send.call_args.args[0], st
+
+    def test_a_cancel_in_our_favour_says_the_price_held(self):
+        text, _ = self.cancel("no_signal")                    # SELL: 1712.10 is better
+        self.assertIn("close 1712.10 vs early 1714.80 (+0.16%)", text)
+        self.assertIn("price moved in our favour, the signal did not repeat", text)
+        self.assertNotIn("did not hold", text)
+
+    def test_a_cancel_against_us_does_not_claim_otherwise(self):
+        text, _ = self.cancel("no_signal", close=1717.00)
+        self.assertIn("(-0.13%)", text)
+        self.assertNotIn("in our favour", text)
+
+    def test_the_summary_and_the_message_use_bot_3_s_glossary(self):
+        _, st = self.cancel("opposite")
+        self.assertEqual(st["stats"]["cancel_why"], {"opposite": 1})
+        self.assertEqual(pipeline._summary_not_held(st["stats"]),
+                         f"Not held: {scan1m._CANCEL_WHY['opposite']} 1")
+
+    def test_every_gate_bot_1_can_hit_is_named_and_ordered_worst_first(self):
+        x = {"cancel_why": {"cap": 1, "no_signal": 3, "no_stop": 1, "oi": 2}}
+        self.assertEqual(pipeline._summary_not_held(x),
+                         "Not held: no signal on the closed candle 3"
+                         " · no EMA9 stop beyond the entry on the closed candle 1"
+                         " · open interest veto at the close 2"
+                         " · the sector already had its entries 1")
+
+    def test_a_write_off_with_no_gate_is_not_reported_as_did_not_hold(self):
+        """``_settle``'s fallback said "did not hold" while filing "unchecked"."""
+        st = {"early": {"LGEINDIA": dict(self.EARLY)}, "stats": {}}
+        with patch.object(scan1m.telegram, "send_bot3", return_value=True) as send, \
+                patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_CANCEL_MESSAGE": "1"}):
+            scan1m._settle(st, BAR, set(), checked={"LGEINDIA"})
+        self.assertEqual(st["stats"]["cancel_why"], {"unchecked": 1})
+        self.assertIn("could not be checked in time", send.call_args.args[0])
+        self.assertNotIn("did not hold", send.call_args.args[0])
+
+    def test_the_two_write_offs_have_their_own_names(self):
+        for code in ("pick_wait", "no_free"):
+            st = {"early": {"LGEINDIA": dict(self.EARLY)}, "stats": {}}
+            with patch.object(scan1m.telegram, "send_bot3", return_value=True), \
+                    patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_CANCEL_MESSAGE": "0"}):
+                scan1m._settle(st, BAR, set(), checked=set(), code=code, scanned=set())
+            self.assertEqual(st["stats"]["cancel_why"], {code: 1})
+            self.assertIn(code, scan1m._CANCEL_WHY_ORDER)
+
+    def test_the_summary_says_how_a_pass_was_paid_for(self):
+        self.assertEqual(pipeline._live_text({"early_passes": 57, "early_live": 57}),
+                         "all with live 1m data")
+        self.assertEqual(pipeline._live_text({"early_passes": 57, "early_live": 38}),
+                         "38 of them with live 1m data")
 
 
 class CancelReasonTests(TestCase):

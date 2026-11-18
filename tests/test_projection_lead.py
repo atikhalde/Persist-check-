@@ -388,7 +388,7 @@ class RepeatProjectionTests(LeaderFixture):
     def _cancel_on_close(self, bar=BAR):
         st = scan1m.load_ledger()
         scan1m._settle(st, bar, set(), checked={"ITC", "DABUR"},
-                       reason="did not hold at the close", scanned={"ITC", "DABUR"})
+                       scanned={"ITC", "DABUR"})
         scan1m.save_ledger(st)
         return st
 
@@ -568,15 +568,14 @@ class RetryAndSettleTests(TestCase):
 
     def test_a_name_the_close_no_longer_scans_is_written_off(self):
         st = self._st()
-        scan1m._settle(st, BAR, set(), checked={"ITC"}, reason="did not hold",
-                       scanned={"ITC"})
+        scan1m._settle(st, BAR, set(), checked={"ITC"}, scanned={"ITC"})
         self.assertEqual(st["early"]["DIVISLAB"]["result"], "cancelled")
         self.assertEqual(st["early"]["SUNPHARMA"]["result"], "cancelled")
         self.assertEqual(st["stats"]["cancelled"], 2)
 
     def test_a_name_whose_feed_had_not_published_is_still_retried(self):
         st = self._st()
-        scan1m._settle(st, BAR, set(), checked=set(), reason="did not hold",
+        scan1m._settle(st, BAR, set(), checked=set(),
                        scanned={"DIVISLAB", "SUNPHARMA"})
         self.assertIsNone(st["early"]["DIVISLAB"]["result"])
         self.assertNotIn("cancelled", st["stats"])

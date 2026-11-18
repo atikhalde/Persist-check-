@@ -502,6 +502,20 @@ _REJECT_TEXT = (
 )
 
 
+def _live_text(x: dict) -> str:
+    """``with live 1m data N`` read as N *names*; it counts passes.
+
+    One live name was enough for a pass to count, so on a day when every pass had
+    one the line said "57" beside "Early passes 57" and looked like a restatement
+    of the names rather than a different unit.
+    """
+    passes = int(x.get("early_passes") or 0)
+    live = int(x.get("early_live") or 0)
+    if passes and live == passes:
+        return "all with live 1m data"
+    return f"{live} of them with live 1m data"
+
+
 def _summary_sectors(x: dict) -> str:
     """Candles per picked sector — the pick only, once per candle.
 
@@ -541,6 +555,8 @@ def _summary_rejects(st: dict) -> str:
         if not items:
             continue
         shown = ", ".join(list(items.values())[:6]) + (" …" if len(items) > 6 else "")
+        if len(items) == 1 and text.startswith("name-checks"):
+            text = "name-check had" + text[len("name-checks had"):]
         parts.append(f"{len(items)} {text} ({shown})")
     if parts:
         return "Signals not alerted: " + " · ".join(parts)
@@ -569,17 +585,18 @@ def format_summary(st: dict) -> str | None:
     lines = [f"📊 <b>Scanner summary {st.get('session', '')}</b>",
              f"Candles scanned {x['candles']} of 75 · with a sector pick {x.get('picks', 0)}",
              _summary_sectors(x),
-             f"Early passes {x.get('early_passes', 0)} · with live 1m data {x.get('early_live', 0)}"
+             f"Early passes {x.get('early_passes', 0)} · {_live_text(x)}"
              f" · {age(avg('early_age'))}",
+             _summary_early_skip(x),
              f"Early alerts {x.get('early_sent', 0)}: confirmed {x.get('confirmed', 0)}"
              f" · cancelled {x.get('cancelled', 0)} · unverified {x.get('unverified', 0)}",
              _summary_not_held(x),
-             _summary_early_skip(x),
              f"Entries {x.get('entries', 0)}"
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
              _summary_rejects(st),
              _summary_catchup(st),
+             _summary_scan_lag(x),
              _summary_pending(st),
              _summary_open(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
@@ -688,17 +705,17 @@ def _confirm_header(early: dict, entry: float) -> str:
             f"(close is {pct:+.2f}% {'beyond' if diff >= 0 else 'back from'} it)\n")
 
 
-def _note_cancel(st: dict, reason: str) -> None:
+def _note_cancel(st: dict, key: str) -> None:
     """Count cancellations by the gate that refused them.
 
     18 Nov: ``Early alerts 1: confirmed 0 · cancelled 1 · unverified 0`` — one
     projection died and the summary never said which gate did it, while bot 3
-    printed ``Not held: …`` for the same two projections. ``reason`` is the
-    clause the cancellation message already carried, so the summary and the
-    message cannot disagree; anything parenthesised is window-specific detail
-    (``was not confirmed by open interest (… +4%)``) and is not a separate gate.
+    printed ``Not held: …`` for the same two projections. Both bots now use one
+    glossary for the gates (``scan1m._CANCEL_WHY``), so the two reports describe
+    the same event with the same words; a caller that passes a clause instead of
+    a code still gets bucketed on it rather than dropped.
     """
-    key = reason.split(" (")[0].strip() or "unstated"
+    key = key.split(" (")[0].strip() or "unstated"
     why = st.setdefault("stats", {}).setdefault("cancel_why", {})
     why[key] = why.get(key, 0) + 1
 
@@ -713,6 +730,36 @@ def _note_early_skip(st: dict, why: str) -> None:
     skips[why] = skips.get(why, 0) + 1
 
 
+def _note_scan_lag(st: dict, last: datetime, *, stale: bool = False) -> None:
+    """How late the close scan is judging this candle, once per candle.
+
+    18 Nov asked the catch-up line to explain ``catch-ups 0`` and could not: the
+    only lateness figure the summary had was for *entry alerts that were sent*,
+    and none were. A scan that runs ten minutes behind its candle refuses every
+    older fire as ``old`` and drops every fresh one as ``late``, and the day's
+    report showed neither number.
+    """
+    if stale:
+        return                       # a replayed candle measures the replay, not the day
+    stats = st.setdefault("stats", {})
+    stamp = last.strftime("%Y-%m-%d %H:%M")
+    if stats.get("scan_lag_bar") == stamp:
+        return                       # the retries of one candle are one measurement
+    stats["scan_lag_bar"] = stamp
+    lag = (now_ist() - (last + timedelta(minutes=5))).total_seconds()
+    stats["scan_lag_max"] = max(float(stats.get("scan_lag_max", 0.0)), lag)
+    if lag > _max_lag():
+        stats["scan_late"] = stats.get("scan_late", 0) + 1
+
+
+def _summary_scan_lag(x: dict) -> str:
+    late = x.get("scan_late") or 0
+    if not late:
+        return ""
+    return (f"⏱ close scan late: {late} of {x.get('candles', 0)} candles judged more than "
+            f"{_max_lag()}s after their close (slowest {x.get('scan_lag_max', 0):.0f}s)")
+
+
 def _summary_early_skip(x: dict) -> str:
     skips = x.get("early_skip") or {}
     if not skips:
@@ -722,15 +769,42 @@ def _summary_early_skip(x: dict) -> str:
 
 
 def _summary_not_held(x: dict) -> str:
+    """``Not held: <gate> N`` — bot 3's vocabulary, in bot 3's order.
+
+    One glossary (``scan1m._CANCEL_WHY``) and one ordering, so the same two
+    projections read the same way on both bots.
+    """
     why = x.get("cancel_why") or {}
     if not why:
         return ""
-    return "Not held: " + " · ".join(f"{k} {n}" for k, n in
-                                    sorted(why.items(), key=lambda kv: (-kv[1], kv[0])))
+    from .scan1m import _CANCEL_WHY, _CANCEL_WHY_ORDER
+
+    order = {k: i for i, k in enumerate(_CANCEL_WHY_ORDER)}
+    keys = sorted(why, key=lambda k: (order.get(k, len(order)), -why[k], k))
+    return "Not held: " + " · ".join(f"{_CANCEL_WHY.get(k, k)} {why[k]}" for k in keys)
+
+
+def _move_clause(early: dict, close: float | None, code: str | None) -> str:
+    """The close's move in the trade's favour, and what it means for a dead signal.
+
+    Bot 3 prints this; bot 1 showed ``close 1712.10 vs early 1714.80`` and left the
+    reader to work out that the projection died *while the price helped* — the
+    case that looks most like a bug (LGEINDIA, 18 Nov, +0.16%).
+    """
+    price = early.get("price") or 0.0
+    if close is None or not price:
+        return ""
+    pct = (close - price) / price * 100.0
+    if str(early.get("side") or "").upper() == "SELL":
+        pct = -pct                       # "in our favour" always means "beyond"
+    text = f" ({pct:+.2f}%)"
+    if pct > 0 and code == "no_signal":
+        text += " — price moved in our favour, the signal did not repeat"
+    return text
 
 
 def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "cancelled",
-                  close: float | None = None) -> bool:
+                  close: float | None = None, code: str | None = None) -> bool:
     """Tell the user an early heads-up did not survive; once, then never again.
 
     ``reason`` is a clause about the *alert*, not the stock, and ``who`` puts the
@@ -740,7 +814,8 @@ def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "c
     bar = pd.Timestamp(early["bar"])
     hhmm = (bar + timedelta(minutes=5)).strftime("%H:%M")
     head = "❌ <b>EARLY CANCELLED</b>" if result == "cancelled" else "⚠ <b>EARLY UNVERIFIED</b>"
-    px = f" · close {close:.2f} vs early {early['price']:.2f}" if close is not None else ""
+    px = (f" · close {close:.2f} vs early {early['price']:.2f}"
+          f"{_move_clause(early, close, code)}" if close is not None else "")
     tail = ("no confirmed entry — manage/exit if you already entered" if result == "cancelled"
             else "treat as unconfirmed")
     who = f"{early['side']} {raw}" + (f" ({early['name']})" if early.get("name") else "")
@@ -750,21 +825,22 @@ def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "c
     early["result"] = result
     _bump(st, result)
     if result == "cancelled":
-        _note_cancel(st, reason)
+        _note_cancel(st, code or reason)
     _save(st)
     log.info("EARLY %s %s %s: %s", result.upper(), raw, early["side"], reason)
     return True
 
 
 def _settle_early(st: dict, bar: datetime, skip: set[str], reason: str,
-                  result: str = "cancelled", older: bool = False) -> None:
+                  result: str = "cancelled", older: bool = False,
+                  code: str | None = None) -> None:
     """Resolve early alerts for ``bar`` that the close scan did not look at."""
     for raw, early in list((st.get("early") or {}).items()):
         if early.get("result") or raw in skip:
             continue
         ebar = pd.Timestamp(early["bar"])
         if ebar == bar or (older and ebar < bar):
-            _cancel_early(st, raw, early, reason, result)
+            _cancel_early(st, raw, early, reason, result, code=code)
 
 
 def run_early(bar: datetime) -> list[dict]:
@@ -804,13 +880,20 @@ def run_early(bar: datetime) -> list[dict]:
     uni = data.load_universe()
     sector_of = _scan_list(uni, scan["sector"], scan.get("extra"))
     if not sector_of:
+        _note_early_skip(st, "no names in the picked sector")
+        _save(st)
         return []
     sent, positions = st.setdefault("sent", {}), st.setdefault("positions", {})
     book = st.setdefault("early", {})
     names = [raw for raw in sector_of
              if raw not in sent and raw not in positions and raw not in book]
     if not names:
+        _note_early_skip(st, "every name already alerted or held")
+        _save(st)
         return []
+    # Counted here, not at the end: "Early passes N" claims the scan *looked* at
+    # these names, and the two returns above are passes that never looked.
+    _bump(st, "early_passes")
     tickers = {raw: data.yahoo_stock(raw) for raw in names}
     period_5m = os.environ.get("YF_PERIOD_5M", "7d")
     sm5 = data.fetch_many(tickers.values(), period_5m, "5m")
@@ -862,7 +945,6 @@ def run_early(bar: datetime) -> list[dict]:
     log.info("early %s %s %s: %d names, %d with live 1m data, %d alert(s), done %.0fs before close",
              hhmm, scan["sector"], want, len(names), live, len(out),
              (close - now_ist()).total_seconds())
-    _bump(st, "early_passes")
     _bump(st, "early_live", 1 if live else 0)
     _bump(st, "early_sent", len(out))
     _save(st)
@@ -1462,6 +1544,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     sd1 = data.fetch_daily(current, period_1d)
 
     want_buy = md.pick_side == 1
+    _note_scan_lag(st, last, stale=allow_stale)
     new_signals: list[dict] = []
     handled: set[str] = set(missing)
     candidates: list[dict] = []
@@ -1495,6 +1578,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         fresh = [s for s in fires if s.time == last.strftime("%H:%M")
                  and s.side == ("BUY" if want_buy else "SELL")]
         if not fresh:
+            same_side_before: list[str] = []
             if fires:
                 log.info("SKIP historical/wrong-side %s fires=%s; decision bar=%s",
                          raw, ",".join(f"{s.name}@{s.time}" for s in fires),
@@ -1504,19 +1588,33 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                     if any(s.time == hhmm for s in fires):
                         _note_reject(st, "opposite", raw, f"{raw} {hhmm}", per_bar=hhmm)
                     before = [s.time for s in fires if s.side == want and s.time < hhmm]
+                    same_side_before = before
                     if before:
                         _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
                         if late_open:
                             _consider_late(st, late, raw, df5, fires, want, last,
                                            sd1.get(ysym), sector_of[raw])
             if early:
-                _cancel_early(st, raw, early, "did not hold at this close",
+                # Two different deaths, one line before: the candle closed on the
+                # other side (the signal flipped) or no crossover was left at all.
+                hhmm_now = last.strftime("%H:%M")
+                flipped = any(s.time == hhmm_now and s.side != want for s in fires)
+                code = "opposite" if flipped and not same_side_before else "no_signal"
+                reason = ("the closed candle fired the opposite side" if code == "opposite"
+                          else "no signal on the closed candle")
+                _cancel_early(st, raw, early, reason, code=code,
                               close=float(df5["Close"].iloc[-1]))
             continue
         best = fresh[-1]
         if not allow_stale and not _recent_bar(last, now_ist()):
             log.warning("scan finished too late for %s @ %s; dropping entry", raw, best.time)
             _note_reject(st, "late", raw, f"{raw} {best.time}", per_bar=best.time)
+            if early:
+                # The projection was never judged — say so instead of leaving it to
+                # the end-of-run "could not be checked" sweep, which cannot tell a
+                # late scan from a scan error.
+                _cancel_early(st, raw, early, "the close scan ran past the alert deadline",
+                              code="late", close=float(df5["Close"].iloc[-1]))
             continue
         plan = build_plan(best, df5, last, sd1.get(ysym))
         if plan is None:
@@ -1524,15 +1622,15 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             if not allow_stale:
                 _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
-                _cancel_early(st, raw, early, "had no valid EMA9 stop",
-                              close=float(df5["Close"].iloc[-1]))
+                _cancel_early(st, raw, early, "no EMA9 stop beyond the entry on the closed candle",
+                              code="no_stop", close=float(df5["Close"].iloc[-1]))
             continue
         if not allow_stale and scan_require_target() and not _plan_has_target(plan):
             log.warning("SKIP %s @ %s: no pivot target (T1/T2/T3 N/A)", raw, best.time)
             _note_reject(st, "no_target", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
-                _cancel_early(st, raw, early, "had no pivot target — nothing to exit at",
-                              close=float(df5["Close"].iloc[-1]))
+                _cancel_early(st, raw, early, "no pivot target — the trade would have had no exit",
+                              code="no_target", close=float(df5["Close"].iloc[-1]))
             continue
         best.price = plan.entry
         best.sl = plan.sl
@@ -1542,8 +1640,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             log.info("OI filter rejected %s %s @ %s: %s", raw, best.side, best.time, why)
             _note_reject(st, "oi", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
-                _cancel_early(st, raw, early, f"was not confirmed by open interest ({why})",
-                              close=float(df5["Close"].iloc[-1]))
+                _cancel_early(st, raw, early, f"open interest veto at the close ({why})",
+                              code="oi", close=float(df5["Close"].iloc[-1]))
             continue
         # No send here: candidates are ranked and capped below, so one pick
         # cannot alert six names in universe order.
@@ -1572,8 +1670,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
             if early:
                 _cancel_early(st, raw, early,
-                              f"not taken — {pick_key} already has {cap} entries this session",
-                              close=cand["close"])
+                              f"{pick_key} already has {cap} entries this session",
+                              code="cap", close=cand["close"])
             continue
         reading = cand["reading"]
         text = format_stock(best, md, plan, sector=sector_of[raw], oi_line=_oi_line(reading),
@@ -1620,7 +1718,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         was = prev_pick if prev_pick not in (None, "", "WAIT") else (prev_s or {}).get("name")
         moved = (f"{was} → {md.pick_sector}" if was and was != md.pick_sector
                  else f"to {md.pick_sector}")
-        _settle_early(st, last, handled, f"not checked — the pick moved {moved}")
+        _settle_early(st, last, handled, f"not checked — the pick moved {moved}",
+                      code="sector_moved")
     st["sent"] = sent
     st["session"] = session
     _save(st)
@@ -1647,7 +1746,7 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
                 st = state.load()
                 if any(not e.get("result") for e in (st.get("early") or {}).values()):
                     _settle_early(st, expected_bar, set(), "could not be checked in time",
-                                  result="unverified", older=True)
+                                  result="unverified", older=True, code="unchecked")
         except Exception:  # never mask the scan's own outcome
             log.exception("early-alert settlement failed")
 

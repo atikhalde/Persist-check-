@@ -152,6 +152,38 @@ class EarlyAlertTests(TestCase):
         self.assertEqual(pipeline.run_early(BAR), [])
         self.assertNotIn("early_skip", state.load().get("stats") or {})
 
+    def test_a_pass_with_nothing_left_to_look_at_says_so(self):
+        st = state.load()
+        st["sent"] = {"ABC": {"code": "BUY-EX", "name": "BUY-EX", "time": "09:55", "price": 100.0}}
+        state.save(st)
+        self.assertEqual(pipeline.run_early(BAR), [])
+        self.assertEqual(state.load()["stats"]["early_skip"],
+                         {"every name already alerted or held": 1})
+        self.assertNotIn("early_passes", state.load()["stats"])   # it never looked
+
+    def test_a_pass_for_an_empty_sector_says_so(self):
+        self.uni["sectors"]["IT"]["stocks"] = []
+        self.assertEqual(pipeline.run_early(BAR), [])
+        self.assertEqual(state.load()["stats"]["early_skip"],
+                         {"no names in the picked sector": 1})
+
+    def test_a_close_scan_that_ran_past_the_deadline_says_so(self):
+        """The projection is never judged; the cancel names the deadline, not the name.
+
+        The scan passes the candle's freshness guard and then spends longer than
+        the alert deadline on its downloads, so the *entries* are dropped. The
+        projection used to be left for the end-of-run "could not be checked in
+        time" sweep, which cannot tell a slow scan from a broken one.
+        """
+        pipeline.run_early(BAR)
+        with patch.object(pipeline, "_recent_bar",
+                          side_effect=[True, True] + [False] * 50):
+            self.close()
+        cancel = next(t for t in self.texts() if "EARLY CANCELLED" in t)
+        self.assertIn("the close scan ran past the alert deadline", cancel)
+        st = state.load()
+        self.assertEqual(st["stats"]["cancel_why"], {"late": 1})
+
     def test_early_pass_covers_the_extra_follow_sector_and_names_it(self):
         self.uni["sectors"]["ENE"] = {"index": "E", "stocks": ["XYZ"]}
         st = state.load()
@@ -225,7 +257,8 @@ class EarlyAlertTests(TestCase):
         cancel = self.texts()[-1]
         self.assertIn("EARLY CANCELLED", cancel)
         self.assertIn("BUY ABC (BUY-EX)", cancel)          # name first, code in brackets
-        self.assertIn("did not hold at this close", cancel)
+        # the gate, not "did not hold": the close carried no crossover at all
+        self.assertIn("no signal on the closed candle", cancel)
         self.assertIn("10:05 close", cancel)
         self.assertNotIn("\n", cancel)
         st = state.load()
@@ -504,7 +537,8 @@ class LiveLoopTests(TestCase):
         texts = [c.args[0] for c in self.send.call_args_list]
         self.assertEqual(len(texts), 1)
         self.assertIn("Candles scanned 75 of 75 · with a sector pick 40", texts[0])
-        self.assertIn("Early passes 40 · with live 1m data 38 · newest 1m bar 40s old on average", texts[0])
+        self.assertIn("Early passes 40 · 38 of them with live 1m data"
+                       " · newest 1m bar 40s old on average", texts[0])
         self.assertIn("Early alerts 3: confirmed 2 · cancelled 1 · unverified 0", texts[0])
         self.assertIn("Entries 4 · sent 15s after the close on average, slowest 47s", texts[0])
         self.assertIn("At the confirm scan: newest 1m bar 9s old on average", texts[0])
