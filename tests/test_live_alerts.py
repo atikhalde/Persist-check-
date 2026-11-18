@@ -1075,7 +1075,9 @@ class AlertInventoryTests(TestCase):
         text = self.summary(rejected={
             "no_data": {"X@09:20": "X 09:20"},
             "scan_error": {"Y@09:25": "Y 09:25"}})
-        self.assertIn("1 had no 5m candle to scan (X 09:20)", text)
+        # 18 Nov counted these as names: "147 had no 5m candle to scan" was 147
+        # name-checks across 5 candles, and nothing said the bar was the feed's.
+        self.assertIn("1 name-checks had no 5m bar from the feed (X 09:20)", text)
         self.assertIn("1 could not be scanned (Y 09:25)", text)
 
     def test_the_1m_summary_carries_the_same_open_line(self):

@@ -85,6 +85,35 @@ def late_max_r() -> float:
         return 2.0
 
 
+_LATE_WINDOW_MINUTES = 10
+
+
+def _late_due(st: dict, md, bar) -> bool:
+    """Evaluate catch-ups around a pick change, not on every candle.
+
+    Bot 3 has always windowed this (``catchup_due``); bot 1 checked a pre-pick
+    fire on **every** candle of a pick. On 18 Nov, CDUR was the pick for 51
+    candles: 20 names × 48 candles = 963 name-checks reported as "older than the
+    window" against bot 3's 62, a number that means nothing to a reader and hides
+    the one thing it should say. Same rule, same ten minutes, its own ledger key.
+    """
+    if not scan5m_leader_catchup():
+        return False
+    key = f"{getattr(md, 'pick_sector', None)}|{getattr(md, 'pick_side', None)}"
+    prev = st.get("late_pick") or {}
+    if prev.get("key") != key:
+        st["late_pick"] = {"key": key, "since": bar.isoformat()}
+        return True
+    try:
+        since = pd.Timestamp(prev.get("since") or bar.isoformat())
+    except (TypeError, ValueError):
+        st["late_pick"] = {"key": key, "since": bar.isoformat()}
+        return True
+    if since.tzinfo is None and bar.tzinfo is not None:
+        since = since.tz_localize(bar.tzinfo)
+    return (bar - since) <= timedelta(minutes=_LATE_WINDOW_MINUTES)
+
+
 def scan_require_target() -> bool:
     """Refuse a 5m entry with no pivot target at all (1).
 
@@ -464,7 +493,7 @@ _REJECT_TEXT = (
     ("opposite", "on the opposite side to the pick"),
     ("no_stop", "without a valid EMA9 stop"),
     ("oi", "not confirmed by open interest"),
-    ("no_data", "had no 5m candle to scan"),
+    ("no_data", "name-checks had no 5m bar from the feed"),
     ("scan_error", "could not be scanned"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
@@ -544,6 +573,8 @@ def format_summary(st: dict) -> str | None:
              f" · {age(avg('early_age'))}",
              f"Early alerts {x.get('early_sent', 0)}: confirmed {x.get('confirmed', 0)}"
              f" · cancelled {x.get('cancelled', 0)} · unverified {x.get('unverified', 0)}",
+             _summary_not_held(x),
+             _summary_early_skip(x),
              f"Entries {x.get('entries', 0)}"
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
@@ -552,7 +583,7 @@ def format_summary(st: dict) -> str | None:
              _summary_pending(st),
              _summary_open(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line)
 
 
 def _summary_catchup(st: dict) -> str:
@@ -566,8 +597,11 @@ def _summary_catchup(st: dict) -> str:
         return ""
     refused = " · ".join(f"{_CATCHUP_WHY.get(k, k)} {skips[k]}"
                          for k in _CATCHUP_WHY_ORDER if skips.get(k))
+    youngest = x.get("catchup_age_min")
     return (f"LATE LEADER catch-ups {sent} (signal fired before its sector was picked)"
-            + (f" · not sent (per name-check): {refused}" if refused else ""))
+            + (f" · not sent (per name-check): {refused}" if refused else "")
+            + (f" · youngest refused fire {float(youngest):.0f} min old"
+               if youngest is not None and refused else ""))
 
 
 def _summary_pending(st: dict) -> str:
@@ -654,6 +688,47 @@ def _confirm_header(early: dict, entry: float) -> str:
             f"(close is {pct:+.2f}% {'beyond' if diff >= 0 else 'back from'} it)\n")
 
 
+def _note_cancel(st: dict, reason: str) -> None:
+    """Count cancellations by the gate that refused them.
+
+    18 Nov: ``Early alerts 1: confirmed 0 · cancelled 1 · unverified 0`` — one
+    projection died and the summary never said which gate did it, while bot 3
+    printed ``Not held: …`` for the same two projections. ``reason`` is the
+    clause the cancellation message already carried, so the summary and the
+    message cannot disagree; anything parenthesised is window-specific detail
+    (``was not confirmed by open interest (… +4%)``) and is not a separate gate.
+    """
+    key = reason.split(" (")[0].strip() or "unstated"
+    why = st.setdefault("stats", {}).setdefault("cancel_why", {})
+    why[key] = why.get(key, 0) + 1
+
+
+def _note_early_skip(st: dict, why: str) -> None:
+    """Count an early pass that never looked at a stock, and why.
+
+    Both of these were silent: the pass returned an empty list, so the summary's
+    ``Early passes N`` read as though the scan had looked and found nothing.
+    """
+    skips = st.setdefault("stats", {}).setdefault("early_skip", {})
+    skips[why] = skips.get(why, 0) + 1
+
+
+def _summary_early_skip(x: dict) -> str:
+    skips = x.get("early_skip") or {}
+    if not skips:
+        return ""
+    return "Early pass skipped: " + " · ".join(
+        f"{k} {n}" for k, n in sorted(skips.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _summary_not_held(x: dict) -> str:
+    why = x.get("cancel_why") or {}
+    if not why:
+        return ""
+    return "Not held: " + " · ".join(f"{k} {n}" for k, n in
+                                    sorted(why.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "cancelled",
                   close: float | None = None) -> bool:
     """Tell the user an early heads-up did not survive; once, then never again.
@@ -674,6 +749,8 @@ def _cancel_early(st: dict, raw: str, early: dict, reason: str, result: str = "c
         return False
     early["result"] = result
     _bump(st, result)
+    if result == "cancelled":
+        _note_cancel(st, reason)
     _save(st)
     log.info("EARLY %s %s %s: %s", result.upper(), raw, early["side"], reason)
     return True
@@ -704,14 +781,25 @@ def run_early(bar: datetime) -> list[dict]:
     """
     now = now_ist()
     close = bar + timedelta(minutes=5)
-    if _early_lead() <= 0 or not bar < now < close or bar.weekday() >= 5:
+    if _early_lead() <= 0 or bar.weekday() >= 5:
         return []
     st = state.reset_if_new_day(state.load(), str(now.date()))
     scan = st.get("scan") or {}
     prev = (bar - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
     side = scan.get("side")
+    if not bar < now < close:
+        # A pass the loop reached after the candle closed cannot project: there is
+        # no forming candle left to judge. 18 Nov bot 1 projected one name to bot
+        # 3's two and the summary had no way to say whether a pass had been
+        # skipped, been too late, or simply found nothing — the count alone.
+        if now >= close:
+            _note_early_skip(st, "after the candle closed")
+            _save(st)
+        return []
     if scan.get("bar") != prev or side not in (1, -1) or scan.get("sector") in (None, "WAIT"):
         log.info("early %s: no current sector pick from %s — skipped", bar.strftime("%H:%M"), prev)
+        _note_early_skip(st, "no pick on the previous candle")
+        _save(st)
         return []
     uni = data.load_universe()
     sector_of = _scan_list(uni, scan["sector"], scan.get("extra"))
@@ -1378,6 +1466,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     handled: set[str] = set(missing)
     candidates: list[dict] = []
     late: list[dict] = []
+    # Once per candle, not once per name: the window is a property of the pick.
+    late_open = _late_due(st, md, last)
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
@@ -1416,8 +1506,9 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                     before = [s.time for s in fires if s.side == want and s.time < hhmm]
                     if before:
                         _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
-                        _consider_late(st, late, raw, df5, fires, want, last,
-                                       sd1.get(ysym), sector_of[raw])
+                        if late_open:
+                            _consider_late(st, late, raw, df5, fires, want, last,
+                                           sd1.get(ysym), sector_of[raw])
             if early:
                 _cancel_early(st, raw, early, "did not hold at this close",
                               close=float(df5["Close"].iloc[-1]))
@@ -1589,8 +1680,11 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
         return
     if hit is None:
         if why.get("why"):
-            skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
+            from .scan1m import _note_old_age
+            stats = st.setdefault("stats", {})
+            skips = stats.setdefault("catchup_skip", {})
             skips[why["why"]] = skips.get(why["why"], 0) + 1
+            _note_old_age(stats, why)
         return
     late.append({"raw": raw, "hit": hit, "sector": sector})
 

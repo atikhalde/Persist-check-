@@ -867,9 +867,12 @@ def format_summary(st: dict) -> str:
         # window's next minute and skipped again — while the reject list below is
         # per name. Unlabelled, "older than the window 48" next to "20 fired
         # before their sector was picked" reads as a contradiction.
+        youngest = stats.get("catchup_age_min")
         lines.append(f"LATE LEADER catch-ups {stats.get('catchup', 0)} "
                      f"(signal fired before its sector was picked)"
-                     + (f" · not sent (per name-check): {refused}" if refused else ""))
+                     + (f" · not sent (per name-check): {refused}" if refused else "")
+                     + (f" · youngest refused fire {float(youngest):.0f} min old"
+                        if youngest is not None and refused else ""))
     skips = stats.get("proj_skip") or {}
     if skips:
         bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]
@@ -938,6 +941,20 @@ _CATCHUP_WHY = {
 
 _CATCHUP_WHY_ORDER = ("stop", "chased", "old", "bar", "plan", "none")
 
+
+def _note_old_age(stats: dict, why: dict) -> None:
+    """Remember how old the youngest refused fire was (any refusal reason).
+
+    ``old`` is the one refusal that says nothing about the name and everything
+    about the clock, so the number belongs next to the count: a replay whose
+    clock sits past the close refuses everything as ``old`` with an age in hours,
+    a live window refuses only the morning's fires at 31–40 minutes.
+    """
+    age = why.get("age")
+    if age is None:
+        return
+    stats["catchup_age_min"] = min(float(stats.get("catchup_age_min", 1e9)), float(age))
+
 # Why a projection did not survive its close. Every refusal names one of these in
 # the cancellation message and is counted in the summary: before this, all but the
 # per-candle cap printed the same "did not hold", so a name cancelled *in favour*
@@ -988,6 +1005,11 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
     if fire is None:
         return _no("bar")
     age = (now - (fire + timedelta(minutes=BAR_MINUTES))).total_seconds() / 60.0
+    if report is not None:
+        # The age at refusal. 18 Nov's 5m report read "older than the window 963"
+        # with nothing to say *how* old — a replay whose clock is past the close
+        # and a genuinely stale window look identical without it.
+        report["age"] = age
     if age < 0 or age > (leader_max_minutes() if max_minutes is None else max_minutes):
         return _no("old")
     upto = frame.loc[frame.index <= pd.Timestamp(fire)]
@@ -1373,8 +1395,10 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
                                 bar, now, daily.get(data.yahoo_stock(raw)), report=why)
         if hit is None:
             if why.get("why"):
-                skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
+                stats = st.setdefault("stats", {})
+                skips = stats.setdefault("catchup_skip", {})
                 skips[why["why"]] = skips.get(why["why"], 0) + 1
+                _note_old_age(stats, why)
             continue
         found.append({"raw": raw, "hit": hit, "sector": (sector_of or {}).get(raw)})
     if not found:

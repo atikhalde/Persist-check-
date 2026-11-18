@@ -125,6 +125,33 @@ class EarlyAlertTests(TestCase):
         self.assertEqual(st["positions"], {})
         self.assertEqual(st["early"]["ABC"]["at"], "10:04:02")
 
+    def test_a_pass_that_arrived_after_the_close_says_so(self):
+        """18 Nov: bot 1 projected one name where bot 3 projected two.
+
+        ``run_early`` returned [] for three different reasons — the candle had
+        already closed, there was no pick from the previous candle, or the scan
+        ran and found nothing — and the summary's ``Early passes 57`` could not
+        tell them apart.
+        """
+        self.now = BAR + timedelta(minutes=6)                 # the candle has closed
+        self.assertEqual(pipeline.run_early(BAR), [])
+        self.assertEqual(state.load()["stats"]["early_skip"], {"after the candle closed": 1})
+        self.assertEqual(pipeline._summary_early_skip(state.load()["stats"]),
+                         "Early pass skipped: after the candle closed 1")
+
+    def test_a_pass_with_no_previous_pick_says_so(self):
+        st = state.load()
+        st["scan"].update({"bar": "2026-11-16 09:15"})        # not the previous candle
+        state.save(st)
+        self.assertEqual(pipeline.run_early(BAR), [])
+        self.assertEqual(state.load()["stats"]["early_skip"],
+                         {"no pick on the previous candle": 1})
+
+    def test_a_pass_that_looked_and_found_nothing_is_not_a_skip(self):
+        self.scan.side_effect = lambda *a, **k: []
+        self.assertEqual(pipeline.run_early(BAR), [])
+        self.assertNotIn("early_skip", state.load().get("stats") or {})
+
     def test_early_pass_covers_the_extra_follow_sector_and_names_it(self):
         self.uni["sectors"]["ENE"] = {"index": "E", "stocks": ["XYZ"]}
         st = state.load()

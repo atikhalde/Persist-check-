@@ -800,6 +800,121 @@ class SummaryReconciliationTests(TestCase):
                       pipeline._summary_rejects(self.st()))
 
 
+class LateWindowTests(TestCase):
+    """Bot 1's "older than the window 963" against bot 3's 62 checks the same morning.
+
+        5m:  LATE LEADER catch-ups 0 (signal fired before its sector was picked) · not sent: older than the window 963
+        1m:  LATE LEADER catch-ups 7 … not sent (per name-check): already ran (chase) 2 · older than the window 48 · no earlier fire 12
+
+    963 ≈ 20 names × 48 candles: bot 1 re-checked a pre-pick fire on every candle
+    of a pick that its 1m sibling evaluates for ten minutes, and neither report
+    said how old the refused fires were.
+    """
+
+    def test_the_window_opens_with_the_pick_and_closes_after_ten_minutes(self):
+        st, md = {}, market_md()
+        self.assertTrue(pipeline._late_due(st, md, BAR))
+        self.assertTrue(pipeline._late_due(st, md, BAR + timedelta(minutes=9)))
+        self.assertFalse(pipeline._late_due(st, md, BAR + timedelta(minutes=11)))
+        # …and a new pick opens a fresh window
+        self.assertTrue(pipeline._late_due(st, market_md(pick_sector="MET", pick_side=-1), BAR))
+
+    def test_a_refusal_records_the_age_that_refused_it(self):
+        report = {}
+        hit = scan1m.catchup_candidate(five_minute_history(), [base.signal(time="09:30")],
+                                       "BUY", BAR, BAR + timedelta(minutes=40), None,
+                                       report=report, max_minutes=10)
+        self.assertIsNone(hit)
+        self.assertEqual(report["why"], "old")
+        # the 09:30 fire's candle closed at 09:35; the clock reads 10:40
+        self.assertAlmostEqual(report["age"], 65.0, places=6)
+
+    def test_the_summary_says_how_old_the_youngest_refusal_was(self):
+        for line in (pipeline._summary_catchup({"stats": {"catchup": 0, "catchup_age_min": 34.4,
+                                                          "catchup_skip": {"old": 963}}}),
+                     scan1m.format_summary({"session": "2026-11-18", "sent": {},
+                                            "stats": {"candles": 72, "picks": 57,
+                                                      "catchup": 0, "catchup_age_min": 34.4,
+                                                      "catchup_skip": {"old": 48}}})):
+            self.assertIn("older than the window", line)
+            self.assertIn("youngest refused fire 34 min old", line)
+
+
+class Bot1SummaryTests(TestCase):
+    """The 18 Nov 5m summary, line by line.
+
+    ```
+    Candles scanned 72 of 75 · with a sector pick 57
+    Sectors picked (candles): CDUR short 51 · MET short 6
+    Early alerts 1: confirmed 0 · cancelled 1 · unverified 0
+    Signals not alerted: … · 147 had no 5m candle to scan (BATAINDIA 09:45, VOLTAS 09:45, …)
+    At the confirm scan: newest 1m bar 45s old  on average
+    ```
+
+    One cancellellation with no gate named, a count of 147 that reads as 147
+    companies when it is 147 name-checks, and a double space.
+    """
+
+    def stats(self, **over):
+        x = {"candles": 72, "picks": 57, "sectors": {"CDUR short": 51, "MET short": 6},
+             "early_passes": 57, "early_live": 57, "early_sent": 1,
+             "confirmed": 0, "cancelled": 1, "unverified": 0, "entries": 0,
+             "early_age_sum": 73 * 57, "early_age_n": 57,
+             "close_age_sum": 45 * 57, "close_age_n": 57}
+        x.update(over)
+        return {"session": "2026-11-18", "stats": x, "sent": {}}
+
+    def test_a_cancellation_names_the_gate_that_refused_it(self):
+        st = self.stats()
+        pipeline._note_cancel(st, "had no pivot target — nothing to exit at")
+        pipeline._note_cancel(st, "was not confirmed by open interest (+4% OI)")
+        pipeline._note_cancel(st, "was not confirmed by open interest (−2% OI)")
+        text = pipeline.format_summary(st)
+        self.assertIn("Early alerts 1: confirmed 0 · cancelled 1 · unverified 0", text)
+        self.assertIn("Not held: was not confirmed by open interest 2"
+                      " · had no pivot target — nothing to exit at 1", text)
+
+    def test_the_gate_comes_from_the_message_it_sent(self):
+        """One clause, two readers — the summary cannot drift from the alert."""
+        st = self.stats()
+        with patch.object(pipeline.telegram, "send", return_value=True), \
+                patch.object(pipeline, "_save"), patch.dict("os.environ", {"DRY_RUN": "0"}):
+            pipeline._cancel_early(st, "LGEINDIA",
+                                   {"bar": BAR.isoformat(), "side": "SELL", "price": 1714.80,
+                                    "session": str(BAR.date())},
+                                   "did not hold at this close")
+        self.assertIn("Not held: did not hold at this close 1", pipeline.format_summary(st))
+
+    def test_an_unverified_heads_up_is_not_a_cancellation(self):
+        st = self.stats(early_sent=2, cancelled=0, unverified=0)   # _cancel_early bumps
+        with patch.object(pipeline.telegram, "send", return_value=True), \
+                patch.object(pipeline, "_save"), patch.dict("os.environ", {"DRY_RUN": "0"}):
+            pipeline._cancel_early(st, "PNB",
+                                   {"bar": BAR.isoformat(), "side": "BUY", "price": 100.0,
+                                    "session": str(BAR.date())},
+                                   "never got a close to judge", result="unverified")
+        self.assertNotIn("Not held:", pipeline.format_summary(st))
+        self.assertIn("unverified 1", pipeline.format_summary(st))
+
+    def test_the_confirm_scan_line_has_one_space(self):
+        text = pipeline.format_summary(self.stats())
+        self.assertIn("At the confirm scan: newest 1m bar 45s old on average", text)
+        self.assertNotIn("old  on average", text)
+
+    def test_the_no_data_count_says_per_name_check_and_names_the_feed(self):
+        text = pipeline.format_summary(self.stats(rejected={"no_data": {
+            f"{n}@{t}": f"{n} {t}" for n, t in
+            [("BATAINDIA", "09:45"), ("VOLTAS", "09:45"), ("WHIRLPOOL", "09:45"),
+             ("TITAN", "09:45"), ("WHIRLPOOL", "09:50"), ("BATAINDIA", "10:15")]}}))
+        self.assertIn("6 name-checks had no 5m bar from the feed"
+                      " (BATAINDIA 09:45, VOLTAS 09:45, WHIRLPOOL 09:45,"
+                      " TITAN 09:45, WHIRLPOOL 09:50, BATAINDIA 10:15)", text)
+
+    def test_a_quiet_section_leaves_no_blank_line(self):
+        text = pipeline.format_summary(self.stats())
+        self.assertNotIn("\n\n", text)
+
+
 class CancelReasonTests(TestCase):
     """A projection that dies at the close has to say which gate killed it.
 
