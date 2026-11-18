@@ -1824,3 +1824,59 @@ class ProjectionLogTests(Scan1mFixture):
 
     def test_the_market_alert_log_names_the_side(self):
         self.assertEqual(self.ledger().get("sector"), None)
+
+
+class EndOfSessionTests(Scan1mFixture):
+    """The last minutes of 18 Nov: an unjudged candle and an unwitnessed summary.
+
+    Run #121 (14:12–15:33): the index feed stopped at the 15:15 bar, so
+    ``confirm_pass`` answered "pick not available yet — will retry" for the 15:20
+    and 15:25 closes until the loop exited at 15:33. The last candle of the day was
+    never judged, and neither the log nor the summary said so. The summary itself
+    was sent silently — eleven messages were refused by Telegram that day, and a
+    refused summary would have left no trace at all.
+    """
+
+    END = base.BAR.replace(hour=15, minute=33)
+
+    def ledger_with(self, **stats):
+        # The whole session judged except the last two candles, as on 18 Nov.
+        judged = {f"{h:02d}:{m:02d}": 1 for h in (9, 10, 11, 12, 13, 14)
+                  for m in range(0, 60, 5)} | {"15:00": 1, "15:05": 1, "15:10": 1, "15:15": 1}
+        st = {"session": str(base.BAR.date()), "sent": {}, "positions": {},
+              "stats": {"candles": 71, "judged": judged, **stats}}
+        state.save(st, self.dir / "scan1m.json")
+        return st
+
+    def test_the_candles_the_index_feed_stole_are_named(self):
+        self.ledger_with()
+        with self.assertLogs("nse_scanner.scan1m", level="WARNING") as logs:
+            scan1m._end_of_session(self.END)
+        self.assertIn("candle(s) never judged: 15:20, 15:25", logs.output[0])
+        self.assertIn("entries were not considered", logs.output[0])
+        self.assertEqual(self.ledger()["stats"]["unjudged"], ["15:20", "15:25"])
+
+    def test_the_summary_says_which_candles_were_never_judged(self):
+        st = self.ledger_with(unjudged=["15:20", "15:25"])
+        text = scan1m.format_summary(st)
+        self.assertIn("⚠ candle(s) never judged: 2 — 15:20, 15:25", text)
+
+    def test_a_judged_candle_and_a_sent_summary_are_both_logged(self):
+        judged = base.BAR.replace(hour=15, minute=25).isoformat()
+        self.ledger_with(judged_bar=judged, judged={f"{h:02d}:{m:02d}": 1
+                                                    for h in (9, 10, 11, 12, 13, 14, 15)
+                                                    for m in range(0, 60, 5)} | {"15:25": 1})
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            scan1m._end_of_session(self.END)
+        self.assertFalse(any("never judged" in line for line in logs.output))
+        self.assertTrue(any("1m summary sent" in line for line in logs.output), logs.output)
+        self.assertTrue(self.ledger()["stats"]["reported"])
+
+    def test_a_summary_telegram_refuses_says_so_instead_of_vanishing(self):
+        self.ledger_with()
+        self.bot3.return_value = False
+        with self.assertLogs("nse_scanner.scan1m", level="ERROR") as logs:
+            scan1m._end_of_session(self.END)
+        self.assertTrue(any("summary was NOT delivered" in line for line in logs.output),
+                        logs.output)
+        self.assertFalse(self.ledger()["stats"].get("reported"))   # not marked as sent

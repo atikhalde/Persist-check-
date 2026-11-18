@@ -2017,9 +2017,18 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
             try:  # one summary of the session, never repeated
                 st1 = state.reset_if_new_day(state.load(), str(now.date()))
                 text = None if (st1.get("stats") or {}).get("reported") else format_summary(st1)
-                if text and telegram.send(text, dry_run=_dry()):
-                    st1["stats"]["reported"] = True
-                    _save(st1)
+                if text:
+                    # Said out loud either way: 18 Nov's 1m summary went out (or did
+                    # not) without a trace, and the log could not answer the question.
+                    if telegram.send(text, dry_run=_dry()):
+                        st1["stats"]["reported"] = True
+                        _save(st1)
+                        log.info("summary sent: %d candles, %d lines",
+                                 int((st1.get("stats") or {}).get("candles") or 0),
+                                 text.count("\n") + 1)
+                    else:
+                        log.error("summary was NOT delivered — Telegram refused it; the session "
+                                  "is over, so no later run will send it")
             except Exception:
                 log.exception("session summary failed")
             if exit_at_close:

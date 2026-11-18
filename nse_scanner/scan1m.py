@@ -889,6 +889,11 @@ def format_summary(st: dict) -> str:
         bits += [f"{k} {v}" for k, v in skips.items() if k not in _SKIP_LABEL]
         lines.append("Checked, not projected: " + " · ".join(bits))
     lines += [_entries_line(stats), _summary_rejects(st), _summary_open(st)]
+    if stats.get("unjudged"):
+        names = list(stats["unjudged"])
+        shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
+        lines.append(f"⚠ candle(s) never judged: {len(names)} — {shown} — no market bar for them"
+                     f" inside the alert deadline, so their entries were not considered")
     if lost:
         shown = " · ".join(f"{e.get('raw')} {e.get('time')} ({_tries(e)})"
                            for e in list(lost.values())[:6])
@@ -1848,7 +1853,13 @@ def _judged_bar() -> str:
 
 def _mark_judged(st: dict, bar: datetime) -> None:
     """This candle has had its close pass — never judge it again."""
-    st.setdefault("stats", {})["judged_bar"] = bar.isoformat()
+    stats = st.setdefault("stats", {})
+    stats["judged_bar"] = bar.isoformat()
+    # The day's book of judged candles, so the session's end can name the ones
+    # that never were. 18 Nov: the 15:20 close fell out of its three-minute
+    # deadline and the 15:25 close was still owed when the loop exited at 15:33 —
+    # two candles unjudged, and the summary's "of 75" never explained them.
+    stats.setdefault("judged", {})[bar.strftime("%H:%M")] = 1
     if st.get("retry_bar") == bar.isoformat():
         st.pop("retry_bar", None)
 
@@ -1931,6 +1942,61 @@ def _sleep_until(target: datetime) -> None:
         time.sleep(min(left, 30))
 
 
+def missing_candles(stats: dict, now: datetime) -> list[str]:
+    """The session's candles whose close has passed and that were never judged.
+
+    Bot 3 cannot judge a candle without the market bar for it, and the loop gives
+    each one three minutes (``MAX_ALERT_LAG_SECONDS``). When the index feed stops —
+    18 Nov it stopped at the 15:15 bar — the last closes simply expire, and
+    nothing else in the day says which ones did.
+    """
+    judged = set(stats.get("judged") or ())
+    out: list[str] = []
+    t = clock_time(9, 15)
+    while t <= clock_time(15, 25):
+        close = datetime.combine(now.date(), t, tzinfo=now.tzinfo) + timedelta(minutes=BAR_MINUTES)
+        if now >= close and t.strftime("%H:%M") not in judged:
+            out.append(t.strftime("%H:%M"))
+        t = (datetime.combine(now.date(), t, tzinfo=now.tzinfo)
+             + timedelta(minutes=BAR_MINUTES)).time()
+    return out
+
+
+def _end_of_session(now: datetime) -> None:
+    """The day's last two duties: name an unjudged candle, send the summary.
+
+    18 Nov (run #121, 14:12–15:33): the Nifty 5m feed stopped at the 15:15 bar, so
+    ``confirm_pass`` kept answering "pick not available yet — will retry" for the
+    15:20 and 15:25 closes and the loop then exited at 15:33 — leaving the last
+    candle of the day unjudged with nothing in the log or the summary saying which
+    one. The summary itself was sent without a word either way, so a refused
+    summary (eleven messages were refused that day) left no trace at all: the
+    session was over, no later run reaches this branch, and nobody could tell.
+    """
+    try:
+        st = load_ledger()
+        stats = st.setdefault("stats", {})
+        late = (missing_candles(stats, now) if stats.get("judged") else [])
+        if late:
+            stats["unjudged"] = late
+            save_ledger(st)
+            log.warning("1m candle(s) never judged: %s — no market bar for them inside the "
+                        "alert deadline, so their entries were not considered",
+                        ", ".join(late))
+        if want_summary() and not stats.get("reported") and stats.get("candles"):
+            text = format_summary(st)
+            if telegram.send_bot3(text, dry_run=_dry()):
+                stats["reported"] = True
+                save_ledger(st)
+                log.info("1m summary sent: %d candles, %d lines",
+                         int(stats.get("candles") or 0), text.count("\n") + 1)
+            else:
+                log.error("1m summary was NOT delivered — Telegram refused it; the session "
+                          "is over, so no later run will send it")
+    except Exception:
+        log.exception("1m session summary failed")
+
+
 def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = False,
                  force_sector: str | None = None) -> str:
     """Minute-aligned loop: project inside the candle, confirm at its close."""
@@ -1965,16 +2031,7 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
             time.sleep(max(5, min((target - now).total_seconds(), 300)))
             continue
         if t.hour > 15 or (t.hour == 15 and t.minute >= 33):
-            if want_summary():
-                try:
-                    st = load_ledger()
-                    stats = st.setdefault("stats", {})
-                    if not stats.get("reported") and stats.get("candles"):   # same gate as bot 1
-                        if telegram.send_bot3(format_summary(st), dry_run=_dry()):
-                            stats["reported"] = True
-                            save_ledger(st)
-                except Exception:
-                    log.exception("1m session summary failed")
+            _end_of_session(now)
             if exit_at_close:
                 return "closed"
             time.sleep(1800)
