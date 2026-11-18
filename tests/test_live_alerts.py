@@ -1171,6 +1171,76 @@ class SummaryInvariantTests(TestCase):
         self.assertNotEqual(pipeline.pick_cap_key("CDUR", 1), pipeline.pick_cap_key("FMCG", 1))
 
 
+class LateLeaderTests(LiveAlertTests):
+    """A crossover that fired before its sector was picked is not lost (18 Nov).
+
+    CDUR was the pick from 09:45 with PERSIST − 93→99 and a qualified live flow,
+    and no CDUR stock was alerted all morning: the names had fired at 09:20–09:40,
+    while the 5m entry loop only accepts a fire on the decision candle. Bot 3 has
+    had this alert since the 1m round; bot 1 filed the names as "earlier" and said
+    nothing until the 15:33 summary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The fire candle needs 9 in-session 5m slots before it for its EMA9 (the
+        # stop of the catch-up plan) to exist at all: 09:15..09:55.
+        self.times = ([BAR - timedelta(minutes=5 * i) for i in range(9, 0, -1)]
+                      + [BAR, BAR + timedelta(minutes=5)])
+
+    def test_a_stock_that_fired_before_the_pick_is_reported(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        pipeline.run_once()                       # BAR is 10:00, 11 minutes later
+        texts = [c.args[0] for c in self.send.call_args_list]
+        late = [t for t in texts if "LATE LEADER" in t]
+        self.assertEqual(len(late), 1, texts)
+        self.assertIn("fired before its sector was picked", late[0])
+        self.assertIn("Fired <b>09:55</b>", late[0])
+        self.assertIn("Not an entry alert", late[0])
+        self.assertIn("no position", late[0].replace("no position was opened for it", "no position"))
+        self.assertEqual(state.load()["stats"]["catchup"], 1)
+        self.assertNotIn("ABC", state.load()["positions"])       # never a trade
+        self.assertIn("ABC", state.load()["catchup"])
+
+    def test_it_is_not_sent_twice_on_the_next_candle(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        pipeline.run_once()
+        self.now = BAR + timedelta(minutes=11)
+        self.times = self.times + [BAR + timedelta(minutes=5)]
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:50")]
+        pipeline.run_once()
+        self.assertEqual(sum("LATE LEADER" in c.args[0] for c in self.send.call_args_list), 1)
+
+    def test_a_burst_of_late_leaders_is_one_digest(self):
+        self.uni["sectors"]["IT"]["stocks"] = ["ABC", "XYZ"]
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        pipeline.run_once()
+        late = [c.args[0] for c in self.send.call_args_list if "LATE LEADER" in c.args[0]]
+        self.assertEqual(len(late), 1, late)      # one message, not one per name
+        self.assertIn("×2", late[0])
+        self.assertIn("ABC", late[0])
+        self.assertIn("XYZ", late[0])
+        self.assertIn("Not entry alerts", late[0])
+        self.assertEqual(state.load()["stats"]["catchup"], 2)
+
+    def test_a_stop_taken_since_the_fire_is_refused_and_counted(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        taken = quiet_bars(*self.times, low=98.0)          # traded through the SL since
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: (taken if t == "ABC.NS" else bars(*self.times)) for t in tickers}
+        pipeline.run_once()
+        self.assertEqual([c for c in self.send.call_args_list if "LATE LEADER" in c.args[0]], [])
+        self.assertEqual(state.load()["stats"]["catchup_skip"]["stop"], 1)
+        self.assertIn("stop taken since the fire 1", pipeline.format_summary(state.load()))
+
+    def test_the_knob_switches_the_alert_off_but_not_the_reject_book(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        with patch.dict("os.environ", {"SCAN5M_LEADER_CATCHUP": "0"}):
+            pipeline.run_once()
+        self.assertEqual([c for c in self.send.call_args_list if "LATE LEADER" in c.args[0]], [])
+        self.assertIn("ABC 09:55", state.load()["stats"]["rejected"]["earlier"]["ABC"])
+
+
 class TradeRecordTests(TestCase):
     """Both bots write one trade record, so both name the pivots they hit."""
 

@@ -212,6 +212,12 @@ jobs:
           # 1 = no T1/T2/T3 at all means no entry (bot 3's rule). 17 Nov entered
           # HINDUNILVR (T2/T3 N/A) and DABUR (all three N/A) for -1.4R.
           SCAN5M_REQUIRE_TARGET: ${{ vars.SCAN5M_REQUIRE_TARGET || '1' }}
+          # 1 = report a stock whose signal fired before its sector was picked,
+          # while the trade is still valid. 18 Nov: CDUR was the pick from 09:45
+          # with PERSIST - 93->99 and no CDUR stock was alerted all morning.
+          SCAN5M_LEADER_CATCHUP: ${{ vars.SCAN5M_LEADER_CATCHUP || '1' }}
+          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '30' }}
+          SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           # 1 = look the incumbent pick up in a per-bar log, so the early pass
           # cannot erase the candle before this one (pick cannot flip inside a
           # candle). Off: 17 Nov it would have held REALTY and lost BANKINDIA.

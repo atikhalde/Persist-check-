@@ -55,6 +55,36 @@ def max_entries_per_pick() -> int:
     return value if value >= 0 else 3
 
 
+def scan5m_leader_catchup() -> bool:
+    """Report a stock whose signal fired before its sector was picked (1).
+
+    18 Nov: CDUR was the pick from 09:45 with PERSIST − 93→99 and a qualified
+    live flow, and no CDUR name was alerted all morning — because the names had
+    fired their crossovers at 09:20–09:40, while CDUR was not yet the pick. The
+    5m entry loop only accepts a fire on the decision candle, so every one was
+    filed as ``fired before their sector was picked`` and the only trace was a
+    line in the 15:33 summary. Bot 3 has had this alert since the 1m round; bot 1
+    did not. ``0`` restores the silence.
+    """
+    return os.environ.get("SCAN5M_LEADER_CATCHUP", "1").strip() != "0"
+
+
+def late_max_minutes() -> float:
+    """How old a pre-pick fire may be and still be worth a catch-up (30 min)."""
+    try:
+        return max(5.0, min(120.0, float(os.environ.get("SCAN5M_LEADER_MAX_MINUTES", "30"))))
+    except ValueError:
+        return 30.0
+
+
+def late_max_r() -> float:
+    """Skip a catch-up once the move from the fire already exceeds this (2.0R)."""
+    try:
+        return max(0.5, float(os.environ.get("SCAN5M_LEADER_MAX_R", "2.0")))
+    except ValueError:
+        return 2.0
+
+
 def scan_require_target() -> bool:
     """Refuse a 5m entry with no pivot target at all (1).
 
@@ -501,10 +531,26 @@ def format_summary(st: dict) -> str | None:
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
              _summary_rejects(st),
+             _summary_catchup(st),
              _summary_pending(st),
              _summary_open(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
     return "\n".join(lines)
+
+
+def _summary_catchup(st: dict) -> str:
+    """The LATE LEADER line: what was sent, and what was not worth sending."""
+    from .scan1m import _CATCHUP_WHY, _CATCHUP_WHY_ORDER
+
+    x = st.get("stats") or {}
+    skips = x.get("catchup_skip") or {}
+    sent = x.get("catchup") or 0
+    if not sent and not skips:
+        return ""
+    refused = " · ".join(f"{_CATCHUP_WHY.get(k, k)} {skips[k]}"
+                         for k in _CATCHUP_WHY_ORDER if skips.get(k))
+    return (f"LATE LEADER catch-ups {sent} (signal fired before its sector was picked)"
+            + (f" · not sent: {refused}" if refused else ""))
 
 
 def _summary_pending(st: dict) -> str:
@@ -1309,6 +1355,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     new_signals: list[dict] = []
     handled: set[str] = set(missing)
     candidates: list[dict] = []
+    late: list[dict] = []
 
     for raw, ysym in zip(stocks, tickers):
         if ysym not in current:
@@ -1347,6 +1394,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                     before = [s.time for s in fires if s.side == want and s.time < hhmm]
                     if before:
                         _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
+                        _consider_late(st, late, raw, df5, fires, want, last,
+                                       sd1.get(ysym), sector_of[raw])
             if early:
                 _cancel_early(st, raw, early, "did not hold at this close",
                               close=float(df5["Close"].iloc[-1]))
@@ -1447,6 +1496,12 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                  best.name, raw, plan.entry, plan.sl, plan.ema9, best.time,
                  now_ist().strftime("%H:%M:%S"))
 
+    # A name whose crossover fired before its sector was picked used to be refused
+    # here and forgotten — 18 Nov: the whole CDUR book. The fresh entries of this
+    # candle go out first; then the labelled heads-up for what the pick missed.
+    if late:
+        _send_late_leaders(st, md, last, late)
+
     if not allow_stale:
         # Early alerts on names the close scan never looked at (sector switched).
         was = prev_pick if prev_pick not in (None, "", "WAIT") else (prev_s or {}).get("name")
@@ -1482,6 +1537,74 @@ def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str |
                                   result="unverified", older=True)
         except Exception:  # never mask the scan's own outcome
             log.exception("early-alert settlement failed")
+
+
+_LATE_NOTE = ("the crossover candle is over — this is the fire's own entry and stop; "
+              "no position was opened for it")
+
+
+def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
+                   bar: datetime, daily, sector: str) -> None:
+    """Queue a labelled LATE LEADER, or count why it is not worth one.
+
+    The 5m entry loop only takes a fire on the decision candle: a name whose
+    crossover happened before its sector was picked is refused as ``earlier`` and
+    never revisited, so on 18 Nov CDUR could be the pick from 09:45 with a 93→99
+    persistence and alert no CDUR stock at all. This is the same rule bot 3 has
+    had since the 1m round, with the same gates: same session, inside
+    ``SCAN5M_LEADER_MAX_MINUTES``, the fire candle's EMA9 stop untouched since,
+    and the move from that fire no larger than ``SCAN5M_LEADER_MAX_R``.
+    """
+    if not scan5m_leader_catchup():
+        return
+    from .scan1m import catchup_candidate
+    why: dict = {}
+    try:
+        hit = catchup_candidate(df5, fires, want, bar, now_ist(), daily, report=why,
+                                max_minutes=late_max_minutes(), max_r=late_max_r())
+    except Exception:
+        log.exception("late-leader check failed for %s", raw)
+        return
+    if hit is None:
+        if why.get("why"):
+            skips = st.setdefault("stats", {}).setdefault("catchup_skip", {})
+            skips[why["why"]] = skips.get(why["why"], 0) + 1
+        return
+    late.append({"raw": raw, "hit": hit, "sector": sector})
+
+
+def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict]) -> None:
+    """Send the labelled heads-up — one per name, or one digest for a burst."""
+    from .scan1m import catchup_digest, format_catchup, format_catchup_digest
+
+    pick = {"sector": md.pick_sector, "label": md.dir_label, "conf": md.dir_conf}
+    now = now_ist()
+    sent = st.setdefault("sent", {})
+    book = st.setdefault("catchup", {})
+    todo = [item for item in late if item["raw"] not in sent and item["raw"] not in book]
+    if not todo:
+        return
+    todo.sort(key=lambda item: -item["hit"]["r"])
+    digest = len(todo) > 1 and catchup_digest()
+    all_sent = (telegram.send(format_catchup_digest(todo, pick, bar, now, bot="5m", closed=True),
+                              dry_run=_dry()) if digest else True)
+    if digest and not all_sent:
+        return
+    for item in todo:
+        raw, hit = item["raw"], item["hit"]
+        if not digest and not telegram.send(
+                format_catchup(raw, hit, pick, bar, now, sector=item["sector"],
+                               bot="5m", closed=True), dry_run=_dry()):
+            continue
+        book[raw] = {"bar": bar.strftime("%Y-%m-%d %H:%M"), "session": str(session_date(bar)),
+                     "fired": hit["sig"].time, "side": hit["sig"].side,
+                     "code": hit["sig"].code, "price": hit["price"],
+                     "at": now.strftime("%H:%M:%S")}
+        _bump(st, "catchup")
+        _save(st)
+        log.info("LATE LEADER %s %s fired %s as %s, sector %s picked %s (%.1fR, %.0f min late)",
+                 raw, hit["sig"].side, hit["sig"].time, hit["sig"].name,
+                 md.pick_sector, bar.strftime("%H:%M"), hit["r"], hit["age"])
 
 
 def _retry_delay(close_time: datetime, remaining: float) -> float:
