@@ -26,6 +26,7 @@ from .data import sanitize_index_5m
 from .session import (
     IST,
     OR_MINUTES,
+    OR_MINUTES_SHORT,
     market_open_minutes,
     session_date,
     to_ist,
@@ -100,6 +101,51 @@ def _bull_map(x, lo, hi) -> float:
 
 def _bear_map(x, lo, hi) -> float:
     return float(np.clip(100.0 * (hi - x) / max(hi - lo, 1e-4), 0.0, 100.0))
+
+
+class OpeningRange:
+    """The opening range is not one number: 30 minutes for the buy side, 15 for
+    the sell side (``OR_MINUTES`` / ``OR_MINUTES_SHORT``).
+
+    ``extend(mom, high, low)`` is called once per bar: a bar inside a range
+    widens it, a bar after it leaves it alone, and the two ranges each stop on
+    their own clock — 09:45 for the buy high/low, 09:30 for the sell low. So on
+    a falling open the sell side has a range to test a break of from 09:30,
+    while the buy side still has nothing until 09:45.
+
+    ``ready(mom)`` returns the two gates as ``(buy, sell)``: inside the window
+    the flag is False, and it stays False if the range was never seen, so a
+    missing opening tape can never be read as a break of it.
+
+    ``seed=True`` (the index engine) lets the first bar the engine sees seed a
+    range whose own window it missed — a scan starting at 10:00 still gets a
+    number instead of NaN all day. The sector scoring leaves the range NaN in
+    that case (``seed=False``): it must not report an early rotation off a range
+    it never watched form.
+    """
+
+    __slots__ = ("hi", "lo", "lo_s", "seed")
+
+    def __init__(self, seed: bool = False):
+        self.seed = seed
+        self.reset()
+
+    def reset(self) -> None:
+        self.hi = np.nan      # buy side high, 09:15-09:45
+        self.lo = np.nan      # buy side low, 09:15-09:45
+        self.lo_s = np.nan    # sell side low, 09:15-09:30
+
+    def extend(self, mom: float, high: float, low: float) -> None:
+        if mom < OR_MINUTES or (self.seed and np.isnan(self.hi)):
+            self.hi = high if np.isnan(self.hi) else max(self.hi, high)
+            self.lo = low if np.isnan(self.lo) else min(self.lo, low)
+        if mom < OR_MINUTES_SHORT or (self.seed and np.isnan(self.lo_s)):
+            self.lo_s = low if np.isnan(self.lo_s) else min(self.lo_s, low)
+
+    def ready(self, mom: float) -> tuple[bool, bool]:
+        buy = mom >= OR_MINUTES and not np.isnan(self.hi)
+        sell = mom >= OR_MINUTES_SHORT and not np.isnan(self.lo_s)
+        return bool(buy), bool(sell)
 
 
 def _htf_last_close_vs_ema(df5: pd.DataFrame, minutes: int, ema_len: int = 20):
@@ -315,9 +361,9 @@ def run_market(
     mtf_bull = int(sum(mtf_flags))
     mtf_bear = 3 - mtf_bull
 
-    # Opening range on today
-    or_high = np.nan
-    or_low = np.nan
+    # Opening range on today, one per side (see OpeningRange): 30 minutes for a
+    # buy, 15 for a sell. Nothing else about the two sides changes.
+    opening = OpeningRange(seed=True)
     above_vwap = 0
     below_vwap = 0
     bull_setup = 0
@@ -336,15 +382,13 @@ def run_market(
         e9, e21, e50 = float(row["EMA9"]), float(row["EMA21"]), float(row["EMA50"])
         vwap = float(row["VWAP"])
         adx = float(row["ADX"]) if not np.isnan(row["ADX"]) else 0.0
-        if mom < OR_MINUTES or np.isnan(or_high):
-            or_high = h if np.isnan(or_high) else max(or_high, h)
-            or_low = l if np.isnan(or_low) else min(or_low, l)
-        n_or_ready = mom >= OR_MINUTES and not np.isnan(or_high)
+        opening.extend(mom, h, l)
+        n_or_ready, n_or_ready_s = opening.ready(mom)
         vwap_slope = vwap - float(n["VWAP"].shift(3).loc[ts]) if ts in n.index else 0.0
         if np.isnan(vwap_slope):
             vwap_slope = 0.0
-        or_up = n_or_ready and c > or_high
-        or_dn = n_or_ready and c < or_low
+        or_up = n_or_ready and c > opening.hi        # buy side: 30-minute range
+        or_dn = n_or_ready_s and c < opening.lo_s    # sell side: 15-minute range
 
         if c > vwap:
             above_vwap += 1
@@ -709,7 +753,7 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
 
     last_sid = None
     d_h = d_l = np.nan
-    or_h = or_l = np.nan
+    opening = OpeningRange()      # 30 minutes buy side, 15 minutes sell side
     bt = 0
     session_prev = np.nan
 
@@ -717,7 +761,7 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
         if sids[i] != last_sid:
             session_prev = float(close[i - 1]) if i > 0 else prev
             d_h, d_l = high[i], low[i]
-            or_h = or_l = np.nan
+            opening.reset()
             bt = 1
             last_sid = sids[i]
         else:
@@ -725,9 +769,7 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
             d_l = min(d_l, low[i])
             bt += 1
         mom = market_open_minutes(to_ist(x.index[i]))
-        if mom < OR_MINUTES:
-            or_h = high[i] if np.isnan(or_h) else max(or_h, high[i])
-            or_l = low[i] if np.isnan(or_l) else min(or_l, low[i])
+        opening.extend(mom, high[i], low[i])
 
         pc = prev if sids[i] == sid else (session_prev if session_prev == session_prev and session_prev != 0.0 else opn[i])
         dr = (close[i] - pc) / pc * 100.0 if pc else 0.0
@@ -770,16 +812,17 @@ def _sector_snap(name, df5, d1, sid, nifty_df, vol_mult, last_ts) -> SectorSnap:
         bear_pen *= 0.70 if close[i] > ev else 1.0
         bear_pen *= 0.80 if hr_bear < RECENT_HOLD_MIN else 1.0
 
-        n_or_ready = mom >= OR_MINUTES and not np.isnan(or_h) and not np.isnan(or_l)
+        n_or_ready, n_or_ready_s = opening.ready(mom)
         early = mom <= EARLY_ROT_UNTIL and n_or_ready
+        early_s = mom <= EARLY_ROT_UNTIL and n_or_ready_s
         rs_prev = rs_s if i == 0 or np.isnan(rs_smooth_arr[i - 1]) else float(rs_smooth_arr[i - 1])
         rs_accel = rs_s - rs_prev
         early_bull = (
-            early and close[i] > or_h and close[i] > ev and rs_s > 0 and rs_accel >= 0
+            early and close[i] > opening.hi and close[i] > ev and rs_s > 0 and rs_accel >= 0
             and recent >= 0 and pos_i >= 55
         )
         early_bear = (
-            early and close[i] < or_l and close[i] < ev and rs_s < 0 and rs_accel <= 0
+            early_s and close[i] < opening.lo_s and close[i] < ev and rs_s < 0 and rs_accel <= 0
             and recent <= 0 and pos_i <= 45
         )
         bull_raw[i] = min(100.0, bull_base * bull_pen + (EARLY_ROT_BOOST if early_bull else 0.0))

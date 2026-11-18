@@ -694,7 +694,6 @@ python -m nse_scanner live
 | `python -m nse_scanner live` | always-on loop: early pass before each close, confirmed scan after it |
 | `python -m nse_scanner live --exit-at-close --max-minutes 170` | same, for hosts with a job time limit (GitHub Actions) |
 | `python -m nse_scanner early-check --date D --sector S` | measure early alerts against their closes |
-| `python -m nse_scanner or-compare --or 30,15,10,5 --days 5` | measure several opening-range lengths on the same sessions |
 
 State (dedupe) is `state/scan_state.json`.
 
@@ -765,7 +764,10 @@ Nifty 50 / VIX: `^NSEI`, `^INDIAVIX`.
 - True options OPEX (the Pine “OPEX” block is a volume-CVD proxy, not F&O)  
 - Earnings highlight, TV dashboard cosmetics  
 
-Direction uses Nifty EMA/VWAP/ADX/MTF + opening range. Institutional vote is **VIX-only**. That is enough for the complementary-sector lock you asked for.
+Direction uses Nifty EMA/VWAP/ADX/MTF + opening range — **30 minutes on the buy side
+(09:15–09:45), 15 on the sell side (09:15–09:30)**, so a short can be committed from 09:30
+while a long still waits for 09:45 (`OR_MINUTES` / `OR_MINUTES_SHORT`; see
+`docs/audit-2026-11-18-12.md`). Institutional vote is **VIX-only**. That is enough for the complementary-sector lock you asked for.
 
 ---
 
