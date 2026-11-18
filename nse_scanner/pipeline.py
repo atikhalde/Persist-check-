@@ -517,7 +517,7 @@ def _live_text(x: dict) -> str:
 
 
 def _summary_no_index(x: dict) -> str:
-    n = int(x.get("candle_no_index") or 0)
+    n = len(x.get("no_index") or {})
     if not n:
         return ""
     return (f"Candles skipped: {n} — Nifty had not published its bar when the run "
@@ -607,6 +607,7 @@ def format_summary(st: dict) -> str | None:
              _summary_catchup(st),
              _summary_scan_lag(x),
              _summary_pending(st),
+             _summary_mirror(),
              _summary_open(st),
              f"At the confirm scan: {age(avg('close_age'))}"]
     return "\n".join(line for line in lines if line)
@@ -628,6 +629,19 @@ def _summary_catchup(st: dict) -> str:
             + (f" · not sent (per name-check): {refused}" if refused else "")
             + (f" · youngest refused fire {float(youngest):.0f} min old"
                if youngest is not None and refused else ""))
+
+
+def _summary_mirror() -> str:
+    """The mirror bot's silence, said out loud once at the end of the day.
+
+    18 Nov: ``TELEGRAM_CHAT_ID_2`` named a chat bot 2 is not in, so every mirrored
+    alert was refused — 30-odd of them — and the summary said nothing about it.
+    """
+    n = telegram.secondary_failures()
+    if not n:
+        return ""
+    return (f"⚠ mirror alerts not delivered: {n} — TELEGRAM_CHAT_ID_2 names a chat that"
+            f" bot 2 is not a member of (bot 1's own alerts were delivered)")
 
 
 def _summary_pending(st: dict) -> str:
@@ -1363,11 +1377,6 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     session = str(last.date())
     if session != today and not allow_stale:
         log.info("no NSE bar for %s (last %s) — skip (pass --backfill to scan last session)", today, session)
-        # 18 Nov 09:40: Yahoo had not published the 09:35 Nifty bar ten seconds
-        # after its close, so the candle was abandoned although the alert
-        # deadline was 09:43 — one of the three candles missing from "72 of 75",
-        # and nothing in the day's report said which or why.
-        _bump(st, "candle_no_index")
         return {
             "session": session,
             "bar": last.strftime("%Y-%m-%d %H:%M"),
@@ -1836,6 +1845,32 @@ def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict]) -> None:
                  md.pick_sector, bar.strftime("%H:%M"), hit["r"], hit["age"])
 
 
+#: How long a candle is polled while today's index bar is still missing (seconds).
+#:
+#: 18 Nov 09:40: the 09:35 Nifty bar was ten seconds late, and ``_run_until_ready``
+#: gave up at once — "CLOSED market after 09:30 = holiday" — although the alert
+#: deadline was 09:43. The bar was there by 09:45, so a minute of polling would
+#: have judged the candle. A holiday is still decided by the live loop's own rule
+#: (three closed candles in a row), not by one bar being a minute behind.
+NO_BAR_WAIT = 120.0
+
+
+def _note_no_index(expected: str) -> None:
+    """Record a candle that was never judged because the index bar never arrived.
+
+    Keyed by candle, so the retries of one candle count once and a candle that
+    does arrive late — and is judged — is never recorded.
+    """
+    try:
+        st = state.reset_if_new_day(state.load(), expected[:10])
+        book = st.setdefault("stats", {}).setdefault("no_index", {})
+        if expected not in book:
+            book[expected] = 1
+            _save(st)
+    except Exception:                      # never break the scan over bookkeeping
+        log.exception("could not record the missing index bar for %s", expected)
+
+
 def _retry_delay(close_time: datetime, remaining: float) -> float:
     """Poll fast right after the close (where it buys entry time), then back off."""
     since = (now_ist() - close_time).total_seconds()
@@ -1867,6 +1902,7 @@ def _run_until_ready(*, expected_bar: datetime | None = None, force_sector: str 
     last_error: RuntimeError | None = None
     result: dict | None = None
     delivered: list[dict] = []
+    closed_since: datetime | None = None
     while now_ist() <= deadline:
         try:
             result = run_once(force_sector=force_sector)
@@ -1883,15 +1919,24 @@ def _run_until_ready(*, expected_bar: datetime | None = None, force_sector: str 
         remaining = (deadline - now_ist()).total_seconds()
         if remaining <= 0:
             break
-        if (result is not None and result.get("market") == "CLOSED"
-                and expected_bar.time() >= clock_time(9, 30)):
-            break  # no bar at all today by 09:35 = holiday; polling cannot help
+        if result is not None and result.get("market") == "CLOSED":
+            # Keep polling: a bar one candle behind is Yahoo, not a holiday.
+            closed_since = closed_since or now_ist()
+            waited = (now_ist() - closed_since).total_seconds()
+            if waited >= NO_BAR_WAIT:
+                log.warning("no NSE bar for %s after %.0fs of polling — leaving this candle",
+                            expected, waited)
+                break
+        else:
+            closed_since = None
         delay = _retry_delay(close_time, remaining)
         log.info("waiting for completed Yahoo bar %s (%.0fs until deadline); retry in %.0fs",
                  expected, remaining, delay)
         time.sleep(delay)
     if result is not None:
         result["signals"] = delivered
+        if result.get("market") == "CLOSED":
+            _note_no_index(expected)       # this candle is never judged today
         if result.get("pending"):
             log.warning("Yahoo stock bars did not publish by %s IST: %s; no late entries sent",
                         deadline.strftime("%H:%M:%S"), ", ".join(result["pending"]))

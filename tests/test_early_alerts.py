@@ -554,12 +554,32 @@ class LiveLoopTests(TestCase):
             self.assertEqual(pipeline.live_loop(exit_at_close=True), "holiday")
         self.assertEqual(ready.call_count, 3)
 
-    def test_holiday_stops_the_per_bar_retry(self):
+    def test_a_late_index_bar_is_polled_for_instead_of_dropping_the_candle(self):
+        """18 Nov 09:40: the 09:35 Nifty bar was 10s late, and the candle was dropped.
+
+        The alert deadline was 09:43 and the bar was there by 09:45, so a minute of
+        polling judges a candle that used to be thrown away ten seconds after the
+        close — one of the three missing from "72 of 75".
+        """
         self.now = BAR + timedelta(minutes=5, seconds=10)
-        with patch.object(pipeline, "run_once", return_value={"bar": "2026-11-06 15:25",
-                                                              "market": "CLOSED", "action": "WAIT"}) as once:
-            pipeline.run_until_ready(expected_bar=BAR)
-        once.assert_called_once()
+        missing = {"bar": "2026-11-06 15:25", "market": "CLOSED", "action": "WAIT"}
+        judged = {"bar": BAR.strftime("%Y-%m-%d %H:%M"), "market": "BEAR", "action": "WAIT"}
+        with patch.object(pipeline, "run_once", side_effect=[missing, missing, judged]) as once:
+            out = pipeline.run_until_ready(expected_bar=BAR)
+        self.assertEqual(out["market"], "BEAR")
+        self.assertEqual(once.call_count, 3)                      # not one and done
+        self.assertIsNone((state.load().get("stats") or {}).get("no_index"))
+
+    def test_a_bar_that_never_arrives_is_abandoned_after_the_wait_and_counted(self):
+        self.now = BAR + timedelta(minutes=5, seconds=10)
+        missing = {"bar": "2026-11-06 15:25", "market": "CLOSED", "action": "WAIT"}
+        with (patch.object(pipeline, "NO_BAR_WAIT", 20.0),
+              patch.object(pipeline, "run_once", return_value=missing) as once):
+            out = pipeline.run_until_ready(expected_bar=BAR)
+        self.assertEqual(out["market"], "CLOSED")
+        self.assertGreater(once.call_count, 1)                    # retried, then gave up
+        self.assertLess(self.now, BAR + timedelta(minutes=6))     # and did not poll all day
+        self.assertIn(BAR.strftime("%Y-%m-%d %H:%M"), state.load()["stats"]["no_index"])
 
 
 class EarlyCheckReplayTests(TestCase):
