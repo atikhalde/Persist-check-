@@ -729,6 +729,103 @@ class AlertParityTests(Scan1mFixture):
             self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))
 
 
+class CancelReasonTests(TestCase):
+    """A projection that dies at the close has to say which gate killed it.
+
+    18 Nov, both of the morning's only two CDUR projections:
+
+        ❌ EARLY CANCELLED — SELL LGEINDIA (NORMAL SELL)
+        projected 10:16:06 @ 1714.80 · close 1712.10 (+0.16%)
+        did not hold · 10:15 close — no entry recorded
+
+    The price moved *in the trade's favour* and the bot said "did not hold": every
+    refusal but the per-candle cap printed the same words, so the reader could not
+    tell a signal that faded from a feed that was late, a stop that was missing or
+    a target that was not there.
+    """
+
+    def _cancel(self, code, *, side="SELL", price=1714.80, close=1712.10, stats=None):
+        st = {"early": {"LGEINDIA": {"bar": BAR.isoformat(), "session": str(BAR.date()),
+                                     "side": side, "name": "NORMAL SELL", "price": price,
+                                     "at": "10:16:06", "result": None}},
+              "stats": stats or {}}
+        with patch.object(scan1m.telegram, "send_bot3", return_value=True) as send, \
+                patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_CANCEL_MESSAGE": "1"}):
+            scan1m._settle(st, BAR, set(), checked={"LGEINDIA"},
+                           reasons={"LGEINDIA": code} if code else None,
+                           closes={"LGEINDIA": close}, scanned={"LGEINDIA"})
+        return send.call_args.args[0], st
+
+    def test_the_gate_is_named_in_the_message(self):
+        text, _ = self._cancel("no_target")
+        self.assertIn("no pivot target — the trade would have had no exit", text)
+        self.assertNotIn("did not hold\n", text)
+
+    def test_a_cancel_in_our_favour_says_the_price_held(self):
+        text, _ = self._cancel("no_signal")          # SELL: 1712.10 is better than 1714.80
+        self.assertIn("+0.16%", text)
+        self.assertIn("price moved in our favour, the signal did not repeat", text)
+
+    def test_a_cancel_against_us_does_not_claim_otherwise(self):
+        text, _ = self._cancel("no_signal", price=627.25, close=628.15)
+        self.assertIn("-0.14%", text)
+        self.assertNotIn("in our favour", text)
+
+    def test_every_cancellation_is_counted_by_gate(self):
+        _, st = self._cancel("no_signal")
+        self.assertEqual(st["stats"]["cancel_why"], {"no_signal": 1})
+        line = scan1m._projected_line({"early": 2, "confirmed": 0, "cancelled": 2,
+                                       "cancel_why": {"no_signal": 1, "cap": 1}})
+        self.assertIn("Not held: no signal on the closed candle 1", line)
+        self.assertIn("the sector already had its entries 1", line)
+
+    def test_an_uncoded_refusal_still_counts(self):
+        _, st = self._cancel(None)
+        self.assertEqual(st["stats"]["cancel_why"], {"unchecked": 1})
+
+
+class CatchupTextTests(TestCase):
+    """The LATE LEADER text of 18 Nov, line by line."""
+
+    def _hit(self, price=671.75):
+        from nse_scanner.stock import StockSignal
+        plan = TradePlan(678.60, 682.17, 682.17, 3.57, 667.67, 652.58, 628.97,
+                         ("S1", "S2", "S3"))
+        sig = StockSignal("KALYANKJIL", 1, "ENTRY SELL", "SELL", "09:20", 678.60, 5, "Low",
+                          21, 0, "base 21/21 cond22=0 score=5", 682.17)
+        return {"sig": sig, "plan": plan, "price": price, "age": 23.0, "r": 1.9}
+
+    def test_targets_quote_the_risk_that_is_on_screen(self):
+        """KALYANKJIL read "T1 … (3.1R)" next to "Risk if taken now ≈ 10.42"."""
+        text = scan1m.format_catchup("KALYANKJIL", self._hit(), {"sector": "CDUR"}, BAR,
+                                     BAR + timedelta(minutes=4), sector="CDUR")
+        self.assertIn("Risk if taken now ≈ 10.42", text)
+        self.assertIn("T1 S1 667.67 (0.4R", text)      # 4.08 / 10.42, not 3.06 / 3.57
+        self.assertNotIn("(3.1R", text)
+
+    def test_a_straggler_is_counted_against_the_window_already_sent(self):
+        """18 Nov: a ×6 digest at 09:46, then KALYANKJIL alone at 09:48."""
+        hit = self._hit()
+        st = {"sent": {}, "stats": {}, "catchup": {
+            "HAVELLS": {"bar": BAR.isoformat()}, "TITAN": {"bar": BAR.isoformat()}}}
+        with patch.object(scan1m, "catchup_candidate", return_value=hit), \
+                patch.object(scan1m, "save_ledger"), \
+                patch.object(scan1m.telegram, "send_bot3", return_value=True) as send, \
+                patch.dict("os.environ", {"DRY_RUN": "0"}):
+            scan1m._catch_up(st, {"sector": "CDUR"}, ["KALYANKJIL"],
+                             {"KALYANKJIL": pd.DataFrame()},
+                             {"KALYANKJIL": [base.signal(time="09:20")]}, {}, BAR,
+                             BAR + timedelta(minutes=4), sector_of={"KALYANKJIL": "CDUR"})
+        self.assertIn("2 more from the same pick", send.call_args.args[0])
+        self.assertIn("KALYANKJIL", st["catchup"])
+
+    def test_a_follow_up_says_it_is_the_same_pick(self):
+        text = scan1m.format_catchup("KALYANKJIL", self._hit(), {"sector": "CDUR"}, BAR,
+                                     BAR + timedelta(minutes=4), sector="CDUR", more=6)
+        self.assertIn("6 more from the same pick", text)
+        self.assertNotIn("fired before its sector was picked", text)
+
+
 class SummarySectorArithmeticTests(TestCase):
     """The sector line has one definition, and the counts add up to the header.
 

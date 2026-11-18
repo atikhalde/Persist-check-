@@ -73,6 +73,7 @@ what gives bot 3 its lead.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -717,6 +718,22 @@ def _targets(plan) -> str:
     return _target_text(plan)
 
 
+def _targets_now(plan, price: float, risk: float) -> str:
+    """The same targets, measured from *now*.
+
+    A catch-up quotes the risk of taking the trade now and the targets of the
+    original fire; rendering both from the fire entry made KALYANKJIL read
+    "T1 … (3.1R)" next to "Risk if taken now ≈ 10.42" when that target is 1.1R
+    from the price on screen.
+    """
+    from .pipeline import _target_text
+
+    try:
+        return _target_text(dataclasses.replace(plan, entry=float(price), risk=float(risk)))
+    except Exception:                        # never lose an alert over a label
+        return _target_text(plan)
+
+
 def _pick_source(scan: dict) -> str:
     """Which pick the projection judged — visible on every EARLY alert.
 
@@ -804,9 +821,13 @@ def _projected_line(stats: dict) -> str:
     gone = int(stats.get("cancelled") or 0)
     open_n = max(0, sent - ok - gone)
     capped = int(stats.get("alert_capped") or 0)
+    why = stats.get("cancel_why") or {}
+    refused = " · ".join(f"{_CANCEL_WHY.get(k, k)} {why[k]}"
+                         for k in _CANCEL_WHY_ORDER if why.get(k))
     return (f"Projected alerts {sent} · of which confirmed at the close {ok}"
             f" · did not hold {gone}" + (f" · still open {open_n}" if open_n else "")
-            + (f" · {capped} held back by the per-candle cap" if capped else ""))
+            + (f" · {capped} held back by the per-candle cap" if capped else "")
+            + (f"\nNot held: {refused}" if refused else ""))
 
 
 def _entries_line(stats: dict) -> str:
@@ -906,6 +927,26 @@ _CATCHUP_WHY = {
 
 _CATCHUP_WHY_ORDER = ("stop", "chased", "old", "bar", "plan", "none")
 
+# Why a projection did not survive its close. Every refusal names one of these in
+# the cancellation message and is counted in the summary: before this, all but the
+# per-candle cap printed the same "did not hold", so a name cancelled *in favour*
+# (LGEINDIA 18 Nov: +0.16% at the close) looked like a bug to the reader.
+_CANCEL_WHY = {
+    "no_signal": "no signal on the closed candle",
+    "opposite": "the closed candle fired the opposite side",
+    "no_stop": "no EMA9 stop beyond the entry on the closed candle",
+    "no_target": "no pivot target — the trade would have had no exit",
+    "oi": "open interest veto at the close",
+    "cap": "the sector already had its entries",
+    "late": "the close scan ran past the alert deadline",
+    "pick_wait": "not checked — the pick dropped to WAIT",
+    "sector_moved": "not checked — the close picked another sector",
+    "unchecked": "could not be checked in time",
+}
+
+_CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap",
+                     "late", "sector_moved", "pick_wait", "unchecked")
+
 
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
                       bar: datetime, now: datetime, daily=None,
@@ -977,7 +1018,7 @@ _LATE_BY_BOT = {
 
 def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime, *,
                    sector: str | None = None, bot: str = "1m",
-                   closed: bool = False) -> str:
+                   closed: bool = False, more: int = 0) -> str:
     """One labelled message; unmistakably not an entry alert.
 
     ``closed`` is the 5m scan's case: it is judging a candle that has already
@@ -989,10 +1030,12 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
     left = max(0, int((close - now).total_seconds()))
     risk_now = abs(hit["price"] - plan.sl)
     pct_now = risk_now / hit["price"] * 100.0 if hit["price"] else 0.0
-    target = _targets(plan)
+    target = _targets_now(plan, hit["price"], risk_now)
     return (
-        f"⏰ {arrow} <b>LATE LEADER {sig.side}</b> — fired before its sector was picked\n"
-        f"<b>{raw}</b> · {_sector_text(sector, pick.get('sector'))}  |  "
+        f"⏰ {arrow} <b>LATE LEADER {sig.side}</b> — "
+        + (f"{more} more from the same pick\n" if more
+           else "fired before its sector was picked\n")
+        + f"<b>{raw}</b> · {_sector_text(sector, pick.get('sector'))}  |  "
         f"Market {pick.get('label')} ({pick.get('conf')}%)\n"
         f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
         f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
@@ -1010,7 +1053,7 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
 
 
 def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: datetime,
-                          *, bot: str = "1m", closed: bool = False) -> str:
+                          *, bot: str = "1m", closed: bool = False, more: int = 0) -> str:
     """All of a pick window's late leaders in one message (best first).
 
     17 Nov sent 17 of these in 35 minutes, one per name, each closing with "not
@@ -1020,8 +1063,9 @@ def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: dat
     side = items[0]["hit"]["sig"].side
     arrow = "🟢" if side == "BUY" else "🔴"
     shown = sorted(items, key=lambda i: -i["hit"]["r"])[:8]
-    lines = [f"⏰ {arrow} <b>LATE LEADER {side} ×{len(items)}</b> — fired before their "
-             f"sector was picked",
+    lines = [f"⏰ {arrow} <b>LATE LEADER {side} ×{len(items)}</b> — "
+             + (f"{more} more from the same pick" if more
+                else "fired before their sector was picked"),
              f"Market {pick.get('label')} ({pick.get('conf')}%)  ·  sector picked "
              f"{bar:%H:%M}  ·  {close:%H:%M} bar forming"]
     for item in shown:
@@ -1321,12 +1365,19 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
     # A burst becomes one message; a single late leader keeps its detail. One
     # message per name is `SCAN1M_CATCHUP_DIGEST=0`.
     digest = catchup_digest() and len(found) > 1
-    sent_all = (telegram.send_bot3(format_catchup_digest(found, pick, bar, now), dry_run=_dry())
-                if digest else True)
+    # The catch-up window spans several minutes, so a digest and a straggler can
+    # both go out for one pick (18 Nov: ×6 at 09:46, then KALYANKJIL alone at
+    # 09:48, same "sector picked 09:45"). The follow-up says so, so it cannot be
+    # read as a duplicate of the message above it.
+    more = sum(1 for e in caught.values() if e.get("bar") == bar.isoformat())
+    sent_all = (telegram.send_bot3(
+        format_catchup_digest(found, pick, bar, now, more=more), dry_run=_dry())
+        if digest else True)
     for item in found:
         raw, hit = item["raw"], item["hit"]
         if not digest and not telegram.send_bot3(
-                format_catchup(raw, hit, pick, bar, now, sector=item["sector"]), dry_run=_dry()):
+                format_catchup(raw, hit, pick, bar, now, sector=item["sector"], more=more),
+                dry_run=_dry()):
             continue
         if not sent_all:
             break
@@ -1421,6 +1472,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     confirmed: set[str] = set()
     checked: set[str] = set()
     closes: dict[str, float] = {}
+    # Every name the close judged and refused, with the gate that refused it.
+    reasons: dict[str, str] = {}
     # Same ceiling on the same pick: one sector on one side is one risk factor.
     # Bot 3 used to confirm every name that fired, so on a six-name candle it
     # announced six entries where bot 1 announced three — the cap is an entry
@@ -1446,9 +1499,11 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
             if fires:                   # same reject book as the 5m scan
                 if any(s.time == hhmm for s in fires):
                     _note_reject(st, "opposite", raw, f"{raw} {hhmm}", per_bar=hhmm)
+                    reasons[raw] = "opposite"
                 before = [s.time for s in fires if s.side == want and s.time < hhmm]
                 if before:
                     _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
+            reasons.setdefault(raw, "no_signal")
             continue
         best = fresh[-1]
         plan = build_plan(best, frame, bar, sd1.get(ysym))
@@ -1456,14 +1511,17 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
             log.warning("1m SKIP %s @ %s: missing EMA9 or EMA9 stop not beyond entry close",
                         raw, best.time)
             _note_reject(st, "no_stop", raw, f"{raw} {best.time}", per_bar=best.time)
+            reasons[raw] = "no_stop"
             continue
         if require_target() and not _has_target(plan):
             log.info("1m SKIP %s @ %s: no pivot target — the trade has no exit", raw, best.time)
             _note_reject(st, "no_target", raw, f"{raw} {best.time}", per_bar=best.time)
+            reasons[raw] = "no_target"
             continue
         reading = oi_reader.snapshot(raw, bar) if oi_reader else None
         if oi_reader and _oi_mode() == "require" and not should_take_entry(best.side, reading):
             _note_reject(st, "oi", raw, f"{raw} {best.time}", per_bar=best.time)
+            reasons[raw] = "oi"
             continue
         early = book.get(raw) or None
         if early and early.get("bar") != bar.isoformat():
@@ -1477,13 +1535,12 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
                            "early": early, "lead": lead, "close": closes.get(raw)})
 
     rank_candidates(candidates)
-    capped: dict[str, str] = {}
     for cand in candidates:
         raw, best, plan = cand["raw"], cand["best"], cand["plan"]
         own_key = pick_cap_key(sector_of[raw], int(pick["side"]))
         if not entry_cap_room(st, own_key):
             _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
-            capped[raw] = f"not taken — {own_key} already has its entries"
+            reasons[raw] = "cap"
             log.info("1m cap: %s not taken — %s already has its entries", raw, own_key)
             continue
         text = format_confirmed(best, pick, plan, early=cand["early"], sector=sector_of[raw],
@@ -1514,7 +1571,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
                  plan.entry, now_ist().strftime("%H:%M:%S"))
         out.append({**best.__dict__, "confirmed": True})
     _settle(st, bar, confirmed, checked, "did not hold", closes=closes,
-            scanned=set(names), reasons=capped)
+            scanned=set(names), reasons=reasons)
     # A candle the feed had not finished is retried by ``tick`` until the alert
     # deadline — ``_run_until_ready`` does the same for the 5m scan.
     if checked != set(names):
@@ -1622,23 +1679,35 @@ def _settle(st: dict, bar: datetime, confirmed: set[str], checked: set[str] | No
     for raw, early in list((st.get("early") or {}).items()):
         if early.get("result") or early.get("bar") != bar.isoformat() or raw in confirmed:
             continue
-        why = (reasons or {}).get(raw) or reason
+        code = (reasons or {}).get(raw) or ""
+        why = _CANCEL_WHY.get(code) or (reasons or {}).get(raw) or reason
         if checked is not None and raw not in checked:
             if scanned is None or raw in scanned:
                 continue                 # the feed had not published: retried
-            why = "not checked — the close picked another sector"
+            code = code or "sector_moved"
+            why = _CANCEL_WHY["sector_moved"]
         early["result"] = "cancelled"
-        st.setdefault("stats", {})["cancelled"] = st.get("stats", {}).get("cancelled", 0) + 1
+        stats = st.setdefault("stats", {})
+        stats["cancelled"] = stats.get("cancelled", 0) + 1
+        # The book the summary reads: a cancellation is a refusal, and every
+        # refusal has to be countable by the gate that made it.
+        book = stats.setdefault("cancel_why", {})
+        key = code or "unchecked"
+        book[key] = book.get(key, 0) + 1
         log.info("1m projection for %s did not hold (%s) — no message", raw, why)
         if cancel_message():
             price = early.get("price")
             px = (closes or {}).get(raw)
             move = ""
+            favour = False
             if px is not None and price:
                 pct = (px - price) / price * 100.0
                 if str(early.get("side") or "").upper() == "SELL":
                     pct = -pct                    # "beyond" always means "in our favour"
+                favour = pct > 0
                 move = f" · close {px:.2f} ({pct:+.2f}%)"
+                if favour and key == "no_signal":
+                    move += " — price moved in our favour, the signal did not repeat"
             code = early.get("name")
             who = f"{early.get('side')} {raw}" + (f" ({code})" if code else "")
             telegram.send_bot3(
