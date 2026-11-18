@@ -184,6 +184,9 @@ jobs:
           # Bot 3 reads the 5m pick, so the 5m entry rules are forwarded too: the
           # two loops must agree on the sector, the stock and the ceiling.
           SCAN5M_REQUIRE_TARGET: ${{ vars.SCAN5M_REQUIRE_TARGET || '1' }}
+          SCAN5M_LEADER_CATCHUP: ${{ vars.SCAN5M_LEADER_CATCHUP || '1' }}
+          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '30' }}
+          SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also report a projection that did not survive the close.

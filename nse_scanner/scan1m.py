@@ -909,7 +909,8 @@ _CATCHUP_WHY_ORDER = ("stop", "chased", "old", "bar", "plan", "none")
 
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
                       bar: datetime, now: datetime, daily=None,
-                      report: dict | None = None) -> dict | None:
+                      report: dict | None = None, max_minutes: float | None = None,
+                      max_r: float | None = None) -> dict | None:
     """The name's day-first fire of this side, if a catch-up is still justified.
 
     Valid means all of: the fire is on an earlier candle of today's session, its
@@ -935,7 +936,7 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
     if fire is None:
         return _no("bar")
     age = (now - (fire + timedelta(minutes=BAR_MINUTES))).total_seconds() / 60.0
-    if age < 0 or age > leader_max_minutes():
+    if age < 0 or age > (leader_max_minutes() if max_minutes is None else max_minutes):
         return _no("old")
     upto = frame.loc[frame.index <= pd.Timestamp(fire)]
     if upto.empty or to_ist(upto.index[-1]) != to_ist(fire):
@@ -953,7 +954,7 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
     price = float(frame["Close"].iloc[-1])
     signed = (price - plan.entry) if sig.side == "BUY" else (plan.entry - price)
     r = signed / plan.risk if plan.risk else 0.0
-    if r > leader_max_r():
+    if r > (leader_max_r() if max_r is None else max_r):
         return _no("chased")
     return {"sig": sig, "plan": plan, "price": price, "r": r, "fire": fire, "age": age}
 
@@ -967,9 +968,21 @@ def _fire_bar(bar: datetime, hhmm: str) -> datetime | None:
     return bar.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
+_LATE_BY_BOT = {
+    "1m": "no signal fired on this candle; the 5m scan reports its own ⏰ LATE LEADER",
+    "5m": ("the crossover candle is over and no position was opened for it — the levels "
+           "below are that fire's own"),
+}
+
+
 def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime, *,
-                   sector: str | None = None) -> str:
-    """One labelled message; unmistakably not an entry alert."""
+                   sector: str | None = None, bot: str = "1m",
+                   closed: bool = False) -> str:
+    """One labelled message; unmistakably not an entry alert.
+
+    ``closed`` is the 5m scan's case: it is judging a candle that has already
+    closed, so the bar is not "forming" and there is no time left to say.
+    """
     sig, plan = hit["sig"], hit["plan"]
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close = bar + timedelta(minutes=BAR_MINUTES)
@@ -988,13 +1001,16 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
         f"(the fire candle's EMA9 stop, untouched since)\n"
         f"Risk if taken now ≈ {risk_now:.2f} ({pct_now:.2f}%)  |  next pivot target: {target}\n"
         f"Score {sig.score} {sig.strength}   {sig.reason}\n"
-        f"5m bar {bar:%H:%M}–{close:%H:%M} forming · {left // 60}m {left % 60:02d}s left\n"
-        f"<b>Not an entry alert</b> — no signal fired on this candle; bot 1 has none for "
-        f"this name either. Check the stop yourself before acting."
+        + (f"5m bar {bar:%H:%M}–{close:%H:%M} closed · reported as soon as the sector was "
+           f"picked\n" if closed else
+           f"5m bar {bar:%H:%M}–{close:%H:%M} forming · {left // 60}m {left % 60:02d}s left\n")
+        + f"<b>Not an entry alert</b> — {_LATE_BY_BOT.get(bot, 'no signal fired on this candle')}. "
+        f"Check the stop yourself before acting."
     )
 
 
-def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: datetime) -> str:
+def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: datetime,
+                          *, bot: str = "1m", closed: bool = False) -> str:
     """All of a pick window's late leaders in one message (best first).
 
     17 Nov sent 17 of these in 35 minutes, one per name, each closing with "not
@@ -1017,8 +1033,8 @@ def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: dat
                      f"now {hit['price']:.2f} ({hit['r']:+.1f}R) · SL {plan.sl:.2f}")
     if len(items) > len(shown):
         lines.append(f"… and {len(items) - len(shown)} more")
-    lines.append("<b>Not entry alerts</b> — no 5m signal fired on this candle; bot 1 has "
-                 "none for these either. Check the stop yourself before acting.")
+    lines.append(f"<b>Not entry alerts</b> — {_LATE_BY_BOT.get(bot, 'no signal fired on this candle')}. "
+                 f"Check the stops yourself before acting.")
     return "\n".join(lines)
 
 
