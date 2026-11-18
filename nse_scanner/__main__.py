@@ -7,6 +7,7 @@
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
+  python -m nse_scanner or-compare --or 30,15 --days 5
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def _setup_log(level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
-    p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | once-1m | live-1m | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow")
+    p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow", "or-compare"], help="once | live | once-1m | live-1m | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow | or-compare")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
@@ -55,6 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lead", type=int, default=60,
                    help="early-check: seconds before the 5m close at which the forming candle is judged")
     p.add_argument("--date", default="2026-10-01", help="backtest session YYYY-MM-DD (IST)")
+    p.add_argument("--dates", default=None,
+                   help="or-compare: sessions to replay, comma separated YYYY-MM-DD")
+    p.add_argument("--days", type=int, default=3,
+                   help="or-compare: weekdays to replay when --dates is empty")
+    p.add_argument("--end", default=None,
+                   help="or-compare: last session to replay (default: yesterday, IST)")
+    p.add_argument("--or", dest="or_values", default="30,15",
+                   help="or-compare: opening-range minutes to compare, e.g. 30,15")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args(argv)
     if args.backfill and not args.dry_run:
@@ -145,6 +154,38 @@ def main(argv: list[str] | None = None) -> int:
 
         d = _date.fromisoformat(args.date)
         print(render(run(d, args.sector, args.lead), d, args.lead))
+        return 0
+    if args.cmd == "or-compare":
+        from datetime import date as _date, timedelta as _td
+        from pathlib import Path          # `backtest` imports it locally too
+        from .or_compare import compare_day, render_report
+        from .session import now_ist
+
+        ors = [int(v) for v in (args.or_values or "").replace(" ", "").split(",") if v]
+        if not ors:
+            p.error("--or needs at least one value, e.g. --or 30,15")
+        if args.dates:
+            days = [_date.fromisoformat(c.strip()) for c in args.dates.split(",") if c.strip()]
+        else:
+            end = _date.fromisoformat(args.end) if args.end else (now_ist().date() - _td(days=1))
+            days, probe = [], end
+            while len(days) < max(1, args.days):
+                if probe.weekday() < 5:
+                    days.append(probe)
+                probe -= _td(days=1)
+            days.reverse()
+        done = []
+        for day in days:
+            try:
+                done.append(compare_day(day, tuple(ors)))
+            except Exception:            # one bad session must not lose the others
+                logging.getLogger("nse_scanner.or_compare").exception("could not replay %s", day)
+        text = render_report(done, tuple(ors))
+        out = Path("state") / f"or_compare_{days[0]}_{days[-1]}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(text)
+        print(f"Saved {out}")
         return 0
     if args.cmd == "backtest":
         from datetime import date as _date
