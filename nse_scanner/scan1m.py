@@ -559,7 +559,7 @@ def market_alert(st: dict, pick: dict | None) -> bool:
                   and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta())
     if not (market_changed or sector_changed or conf_moved):
         return False
-    if not telegram.send_bot3(format_market(md, prev_conf), dry_run=_dry()):
+    if not telegram.send_bot3(format_market(md, prev_conf, sent=now_ist()), dry_run=_dry()):
         return False
     st["market"] = {"dir_state": md.dir_state, "label": md.dir_label,
                     "conf": md.dir_conf, "regime": md.regime}
@@ -904,12 +904,18 @@ def catchup_due(st: dict, pick: dict, bar: datetime) -> bool:
     key = f"{pick.get('sector')}|{pick.get('side')}"
     prev = st.get("catchup_pick") or {}
     if prev.get("key") != key:
-        st["catchup_pick"] = {"key": key, "since": bar.isoformat()}
+        # The window remembers the label/conf of the candle it opened on. Bot 3
+        # re-derives the pick every minute, so without this the same window spoke
+        # with two voices — 18 Nov, one pick: "Market BEAR (81%)" in the ×6 digest
+        # and "Market BEAR (67%)" in the straggler 90 seconds later.
+        st["catchup_pick"] = {"key": key, "since": bar.isoformat(),
+                              "label": pick.get("label"), "conf": pick.get("conf")}
         return True
     try:
         since = pd.Timestamp(prev.get("since") or bar.isoformat())
     except (TypeError, ValueError):
-        st["catchup_pick"] = {"key": key, "since": bar.isoformat()}
+        st["catchup_pick"] = {"key": key, "since": bar.isoformat(),
+                              "label": pick.get("label"), "conf": pick.get("conf")}
         return True
     if since.tzinfo is None and bar.tzinfo is not None:
         since = since.tz_localize(bar.tzinfo)
@@ -1341,6 +1347,13 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
         return []
     caught = st.setdefault("catchup", {})
     sent = st.setdefault("sent", {})
+    # One window, one voice: the conf/label the pick had when the window opened,
+    # not whichever re-derivation this minute produced.
+    window = st.get("catchup_pick") or {}
+    if window.get("key") == f"{pick.get('sector')}|{pick.get('side')}":
+        pick = {**pick, "label": window.get("label") or pick.get("label"),
+                "conf": window.get("conf") if window.get("conf") is not None
+                else pick.get("conf")}
     hhmm = bar.strftime("%H:%M")
     out: list[dict] = []
     found: list[dict] = []

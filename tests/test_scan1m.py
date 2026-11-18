@@ -803,6 +803,31 @@ class CatchupTextTests(TestCase):
         self.assertIn("T1 S1 667.67 (0.4R", text)      # 4.08 / 10.42, not 3.06 / 3.57
         self.assertNotIn("(3.1R", text)
 
+    def test_one_window_speaks_with_one_confidence(self):
+        """18 Nov: "Market BEAR (81%)" in the ×6 digest, "(67%)" in the straggler."""
+        hit = self._hit()
+        pick = {"sector": "CDUR", "side": -1, "label": "BEAR", "conf": 81}
+        st = {"sent": {}, "stats": {}}
+        self.assertTrue(scan1m.catchup_due(st, pick, BAR))
+        self.assertEqual(st["catchup_pick"]["conf"], 81)
+        with patch.object(scan1m, "catchup_candidate", return_value=hit), \
+                patch.object(scan1m, "save_ledger"), \
+                patch.object(scan1m.telegram, "send_bot3", return_value=True) as send, \
+                patch.dict("os.environ", {"DRY_RUN": "0"}):
+            scan1m._catch_up(st, {**pick, "conf": 67}, ["KALYANKJIL"],
+                             {"KALYANKJIL": pd.DataFrame()},
+                             {"KALYANKJIL": [base.signal(time="09:20")]}, {}, BAR,
+                             BAR + timedelta(minutes=3), sector_of={"KALYANKJIL": "CDUR"})
+        self.assertIn("Market BEAR (81%)", send.call_args.args[0])   # the window's conf
+        self.assertNotIn("(67%)", send.call_args.args[0])
+
+    def test_a_new_window_takes_the_new_confidence(self):
+        st = {"sent": {}, "stats": {}}
+        scan1m.catchup_due(st, {"sector": "CDUR", "side": -1, "label": "BEAR", "conf": 81}, BAR)
+        self.assertTrue(scan1m.catchup_due(
+            st, {"sector": "MET", "side": -1, "label": "BEAR", "conf": 94}, BAR))
+        self.assertEqual(st["catchup_pick"]["conf"], 94)
+
     def test_a_straggler_is_counted_against_the_window_already_sent(self):
         """18 Nov: a ×6 digest at 09:46, then KALYANKJIL alone at 09:48."""
         hit = self._hit()

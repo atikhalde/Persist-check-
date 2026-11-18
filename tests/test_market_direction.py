@@ -412,6 +412,63 @@ class MtfLineTests(TestCase):
         self.assertIn("Breadth 2▲/13▼  TRANSITION", text)
 
 
+class MarketBlockProvenanceTests(TestCase):
+    """A market block must say *when* it was computed and on what index lag.
+
+    18 Nov, two blocks both stamped `09:45 IST` disagreed on the bear book
+    (`MET 78 · AUTO 67` vs `MET 85 · DEF 65`) and neither said when it was
+    calculated. The stamp is the candle's **open**, so a block computed at
+    09:50:03 from one feed and at 09:50:09 from another printed the same
+    timestamp and different PERSIST scores, with nothing on screen to explain it.
+    """
+
+    def md(self, **over):
+        base = dict(pick_side=-1, dir_label="BEAR", dir_conf=68, dir_tier="BUILDING",
+                    commit_side=-1, nifty=25243.4, nifty_day_ret=-0.57, nifty_intra=-0.32,
+                    vix=15.77, vix_chg=-1.02, adx=40, mtf_bull=1, regime="TREND DOWN",
+                    breadth_adv=1, breadth_dec=14,
+                    persist_plus=[("PHA", 34.0)],
+                    persist_minus=[("CDUR", 93.0), ("MET", 78.0), ("AUTO", 67.0)],
+                    live_flow="CDUR", live_flow_side=-1, live_flow_score=86,
+                    live_flow_qualified=True, stale_sectors=[],
+                    pick_sector="CDUR", pick_reason="PERSIST − CDUR qualified (score 93)",
+                    action="SCAN SHORT", bar_time="2026-11-18 09:45")
+        return SimpleNamespace(**{**base, **over})
+
+    def test_the_calculated_time_is_printed_when_it_is_known(self):
+        from datetime import datetime
+        from nse_scanner.pipeline import format_market
+        from nse_scanner.session import IST
+        sent = datetime(2026, 11, 18, 9, 45, 7, tzinfo=IST)
+        text = format_market(self.md(), None, sent=sent)
+        self.assertIn("2026-11-18 09:45 IST · calculated 09:45:07", text)
+
+    def test_a_block_without_a_clock_keeps_the_old_stamp(self):
+        from nse_scanner.pipeline import format_market
+        text = format_market(self.md())
+        self.assertIn("<i>2026-11-18 09:45 IST</i>", text)
+        self.assertNotIn("calculated", text)
+
+    def test_a_lag_inside_the_limit_is_disclosed(self):
+        from nse_scanner.pipeline import format_market
+        text = format_market(self.md(sector_lag={"CDUR": 0, "MET": 1, "AUTO": 2}))
+        # worst lag first; CDUR at 0 is not listed
+        self.assertIn("index lag  AUTO 2 · MET 1", text)
+
+    def test_a_stale_sector_is_not_listed_twice(self):
+        from nse_scanner.pipeline import format_market
+        text = format_market(self.md(sector_lag={"MET": 3, "AUTO": 1},
+                                     stale_sectors=[("MET", 3)]))
+        self.assertIn("⚠ stale index  MET 3 bars behind", text)
+        self.assertIn("index lag  AUTO 1", text)
+        self.assertNotIn("index lag  MET", text)
+
+    def test_no_lag_line_when_every_index_is_current(self):
+        from nse_scanner.pipeline import format_market
+        self.assertNotIn("index lag", format_market(self.md(sector_lag={"CDUR": 0})))
+        self.assertNotIn("index lag", format_market(self.md()))   # field absent
+
+
 class FlowAgainstTests(TestCase):
     """A qualified live flow on the other side is named on the pick line.
 

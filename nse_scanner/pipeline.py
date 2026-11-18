@@ -210,7 +210,7 @@ def _intra_of(snap: dict | None) -> float | None:
         return None
 
 
-def format_market(md, prev_conf: int | None = None) -> str:
+def format_market(md, prev_conf: int | None = None, *, sent=None) -> str:
     from .market import mtf_text
     side = "BULL" if md.pick_side == 1 else "BEAR" if md.pick_side == -1 else "FLAT"
     plus = " · ".join(f"{n} {s:.0f}" for n, s in md.persist_plus)
@@ -224,6 +224,16 @@ def format_market(md, prev_conf: int | None = None) -> str:
     stale = getattr(md, "stale_sectors", None) or []
     stale_line = ("⚠ stale index  "
                   + " · ".join(f"{n} {b} bars behind" for n, b in stale) + "\n") if stale else ""
+    # Lag inside the limit is legal and used, but it moves every PERSIST score
+    # with it. Two blocks of the same candle then disagree with nothing on screen
+    # to explain it (18 Nov: MET 78 vs MET 85, both stamped 09:45), and the block
+    # does not say when it was computed either — the stamp is the candle's open.
+    lag = {n: b for n, b in (getattr(md, "sector_lag", None) or {}).items()
+           if b > 0 and n not in {x for x, _ in stale}}
+    lag_line = ("index lag  "
+                + " · ".join(f"{n} {b}" for n, b in sorted(lag.items(),
+                                                            key=lambda kv: (-kv[1], kv[0])))
+                + "\n") if lag else ""
     moved = ""
     if prev_conf is not None and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta() > 0:
         moved = f"  <i>(was {int(prev_conf)}%)</i>"
@@ -265,13 +275,15 @@ def format_market(md, prev_conf: int | None = None) -> str:
         f"PERSIST +  {plus}\n"
         f"PERSIST −  {minus}\n"
         f"{stale_line}"
+        f"{lag_line}"
         f"{watch}"
         f"Live flow  {md.live_flow}{flow_arrow} {'Q' if md.live_flow_qualified else 'uQ'} "
         f"({md.live_flow_score:.0f})\n"
         f"\n<b>SECTOR PICK: {md.pick_sector}</b>  {side}\n"
         f"{md.pick_reason}\n"
         f"Action: <b>{md.action}</b>\n"
-        f"<i>{md.bar_time} IST</i>"
+        f"<i>{md.bar_time} IST"
+        + (f" · calculated {sent:%H:%M:%S}" if sent is not None else "") + "</i>"
     )
 
 
@@ -1273,7 +1285,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     prev_conf = prev_m.get("conf")
     conf_moved = (prev_conf is not None and _conf_delta() > 0
                   and abs(int(md.dir_conf) - int(prev_conf)) >= _conf_delta())
-    if (market_changed or sector_changed or conf_moved) and (allow_stale or _recent_bar(last, now_ist())) and telegram.send(format_market(md, prev_conf), dry_run=_dry()):
+    if (market_changed or sector_changed or conf_moved) and (allow_stale or _recent_bar(last, now_ist())) and telegram.send(format_market(md, prev_conf, sent=now_ist()), dry_run=_dry()):
         st["market"] = {
             "dir_state": md.dir_state,
             "label": md.dir_label,
