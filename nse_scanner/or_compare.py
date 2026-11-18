@@ -6,11 +6,17 @@ what a running scanner does.
 
 Why it exists — 18 Nov: the 09:15–09:45 opening range was still being completed
 while KALYANKJIL (09:20), CROMPTON / DIXON / HAVELLS / TITAN / VOLTAS (09:25) and
-WHIRLPOOL (09:40) fired. That is seven of the twelve names of the sector the
-engine picked at **09:45**. With a fifteen-minute range the same pick would have
-existed at 09:30, while those fires were still live — so the question "would the
-shorter range have caught them, and what would it have cost" is answerable on the
-same tape.
+WHIRLPOOL (09:40) fired — seven of the twelve names of the sector the engine only
+picked at **09:45**.
+
+Which of them a shorter range rescues is not obvious, and the arithmetic is worth
+stating: the gate is ``mom = bar_time - 09:15 >= OR_MINUTES``, so a pick becomes
+possible on the **09:45** bar at OR 30 (judged 09:50, exactly as the live log
+shows), on the **09:30** bar at OR 15, on **09:25** at OR 10 and on **09:20** at
+OR 5. A fire is eligible only if its own candle is one where the pick was live —
+so OR 15 rescues the 09:30–09:40 fires (WHIRLPOOL 09:40), OR 10 rescues the 09:25
+cluster, and KALYANKJIL's 09:20 fire needs 5. That is the sort of thing to
+measure rather than argue about, hence this tool.
 
 Every day is replayed through the same engine the scanner uses: ``market.run_market``
 for the direction and the pick, ``stock.scan_stock`` for the fires, the fire's own

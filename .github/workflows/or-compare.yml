@@ -10,6 +10,8 @@
 #
 # 18 Nov is the case it was built for: seven of the twelve names of the sector
 # picked at 09:45 had fired between 09:20 and 09:40, inside the thirty-minute range.
+# The gate is mom = bar time - 09:15 >= OR, so 30 allows a pick on the 09:45 bar,
+# 15 on 09:30, 10 on 09:25 and 5 on 09:20 — try `30,15,10,5` to see the whole ladder.
 #
 # Inputs
 #   or     — opening ranges to compare, in minutes ("30,15" or "30,20,15")
