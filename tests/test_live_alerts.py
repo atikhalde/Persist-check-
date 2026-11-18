@@ -299,7 +299,10 @@ class MarketBlockTests(TestCase):
         self.assertIn("MARKET STAND ASIDE", text)
         self.assertIn("BULL lean", text)                 # the lean is still shown
         self.assertNotIn("<b>MARKET BULL", text)
-        self.assertIn("conf 41 < 55", text)              # what it is waiting for
+        # what it is waiting for — escaped, or Telegram refuses the whole block
+        # ("can't parse entities: Unsupported start tag", 18 Nov, nine messages)
+        self.assertIn("conf 41 &lt; 55", text)
+        self.assertNotIn("conf 41 < 55", text)
 
     def test_the_day_s_movers_are_named_when_nothing_is_traded(self):
         text = REAL_FORMAT_MARKET(market_decision(

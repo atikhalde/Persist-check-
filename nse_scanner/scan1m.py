@@ -774,7 +774,7 @@ def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, min
         f"<b>{left // 60}m {left % 60:02d}s left</b> — projected from 1m prints up to {now:%H:%M}\n"
         f"SL ≈ {plan.sl:.2f} (EMA9 so far)  |  Risk ≈ {plan.risk:.2f}\n"
         f"next pivot target: {_targets(plan)}\n"
-        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
         f"Rules: identical to the 5m scan · judged on minute {minute}/4 of the candle\n"
         f"Confirmed entry follows at the {close:%H:%M} close if the candle holds"
     )
@@ -1083,7 +1083,7 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
         f"({hit['r']:+.1f}R from the fire) · SL {plan.sl:.2f} "
         f"(the fire candle's EMA9 stop, untouched since)\n"
         f"Risk if taken now ≈ {risk_now:.2f} ({pct_now:.2f}%)  |  next pivot target: {target}\n"
-        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
         + (f"5m bar {bar:%H:%M}–{close:%H:%M} closed · reported as soon as the sector was "
            f"picked\n" if closed else
            f"5m bar {bar:%H:%M}–{close:%H:%M} forming · {left // 60}m {left % 60:02d}s left\n")

@@ -309,7 +309,7 @@ def format_market(md, prev_conf: int | None = None, *, sent=None) -> str:
         f"Live flow  {md.live_flow}{flow_arrow} {'Q' if md.live_flow_qualified else 'uQ'} "
         f"({md.live_flow_score:.0f})\n"
         f"\n<b>SECTOR PICK: {md.pick_sector}</b>  {side}\n"
-        f"{md.pick_reason}\n"
+        f"{telegram.esc(md.pick_reason or '')}\n"
         f"Action: <b>{md.action}</b>\n"
         f"<i>{md.bar_time} IST"
         + (f" · calculated {sent:%H:%M:%S}" if sent is not None else "") + "</i>"
@@ -442,7 +442,7 @@ def format_stock(sig: StockSignal, md, plan: TradePlan, *, sector: str | None = 
         f"SL {plan.sl:.2f} (0.02% {below} EMA9)\n"
         f"Risk {plan.risk:.2f}  |  next pivot target: {targets}\n"
         f"{_basis_text(plan)}"
-        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
         f"5m bar {sig.time}–{close_time} IST (signal confirmed at close)\n"
         f"Signal calculated {now_ist().strftime('%H:%M:%S')} IST{_lag_text(sig.time)}"
     )
@@ -516,6 +516,14 @@ def _live_text(x: dict) -> str:
     return f"{live} of them with live 1m data"
 
 
+def _summary_no_index(x: dict) -> str:
+    n = int(x.get("candle_no_index") or 0)
+    if not n:
+        return ""
+    return (f"Candles skipped: {n} — Nifty had not published its bar when the run "
+            f"reached the candle")
+
+
 def _summary_sectors(x: dict) -> str:
     """Candles per picked sector — the pick only, once per candle.
 
@@ -585,6 +593,7 @@ def format_summary(st: dict) -> str | None:
     lines = [f"📊 <b>Scanner summary {st.get('session', '')}</b>",
              f"Candles scanned {x['candles']} of 75 · with a sector pick {x.get('picks', 0)}",
              _summary_sectors(x),
+             _summary_no_index(x),
              f"Early passes {x.get('early_passes', 0)} · {_live_text(x)}"
              f" · {age(avg('early_age'))}",
              _summary_early_skip(x),
@@ -686,7 +695,7 @@ def format_early(sig: StockSignal, scan: dict, plan: TradePlan, bar: datetime) -
         f" still forming ({left}s left)\n"
         f"SL ≈ {plan.sl:.2f} (EMA9 so far)  |  Risk ≈ {plan.risk:.2f}\n"
         f"next pivot target: {_target_text(plan)}\n"
-        f"Score {sig.score} {sig.strength}   {sig.reason}\n"
+        f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
         f"Holds only if the {close.strftime('%H:%M')} close keeps the signal — "
         f"✅ confirm or ❌ cancel follows\n"
         f"Calculated {now.strftime('%H:%M:%S')} IST"
@@ -1354,6 +1363,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     session = str(last.date())
     if session != today and not allow_stale:
         log.info("no NSE bar for %s (last %s) — skip (pass --backfill to scan last session)", today, session)
+        # 18 Nov 09:40: Yahoo had not published the 09:35 Nifty bar ten seconds
+        # after its close, so the candle was abandoned although the alert
+        # deadline was 09:43 — one of the three candles missing from "72 of 75",
+        # and nothing in the day's report said which or why.
+        _bump(st, "candle_no_index")
         return {
             "session": session,
             "bar": last.strftime("%Y-%m-%d %H:%M"),
