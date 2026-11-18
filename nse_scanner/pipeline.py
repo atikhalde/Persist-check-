@@ -500,10 +500,15 @@ def _summary_rejects(st: dict) -> str:
     x = st.get("stats") or {}
     rejected = x.get("rejected") or {}
     alerted = set(st.get("sent") or {})
+    # A name that got a labelled LATE LEADER *was* alerted — just not as an
+    # entry. 18 Nov's summary listed seven names under "Signals not alerted:
+    # fired before their sector was picked" (KALYANKJIL 09:20, TITAN 09:25, …)
+    # that the same report's first line counted as "LATE LEADER catch-ups 7".
+    active = alerted | set(st.get("catchup") or {})
     parts = []
     for kind, text in _REJECT_TEXT:
         items = {k: v for k, v in (rejected.get(kind) or {}).items()
-                 if not (kind == "earlier" and k in alerted)}
+                 if not (kind == "earlier" and k in active)}
         if not items:
             continue
         shown = ", ".join(list(items.values())[:6]) + (" …" if len(items) > 6 else "")
@@ -562,7 +567,7 @@ def _summary_catchup(st: dict) -> str:
     refused = " · ".join(f"{_CATCHUP_WHY.get(k, k)} {skips[k]}"
                          for k in _CATCHUP_WHY_ORDER if skips.get(k))
     return (f"LATE LEADER catch-ups {sent} (signal fired before its sector was picked)"
-            + (f" · not sent: {refused}" if refused else ""))
+            + (f" · not sent (per name-check): {refused}" if refused else ""))
 
 
 def _summary_pending(st: dict) -> str:
@@ -585,6 +590,11 @@ def _summary_open(st: dict) -> str:
     """
     positions = st.get("positions") or {}
     if not positions:
+        # "every entry got its exit alert" is vacuous on a day with no entry at
+        # all — 18 Nov had 73 candles, 57 picks and 0 entries, and the summary
+        # still closed by promising exits for trades that never existed.
+        if not int((st.get("stats") or {}).get("entries") or 0):
+            return "Open at the close: none — no entry was opened today"
         return "Open at the close: none — every entry got its exit alert"
     shown = []
     for raw, pos in list(positions.items())[:5]:

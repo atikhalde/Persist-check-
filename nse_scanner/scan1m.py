@@ -851,7 +851,8 @@ def format_summary(st: dict) -> str:
 
     stats = st.get("stats") or {}
     lines = [f"📊 <b>1m projected scan {st.get('session', '')}</b>",
-             f"Candles confirmed {stats.get('candles', 0)} · with a sector pick {stats.get('picks', 0)}",
+             f"Candles confirmed {stats.get('candles', 0)} of 75"
+             f" · with a sector pick {stats.get('picks', 0)}",
              _summary_sectors(stats),
              _projected_line(stats)]
     leads = stats.get("lead_n") or 0
@@ -862,9 +863,13 @@ def format_summary(st: dict) -> str:
         skips = stats.get("catchup_skip") or {}
         refused = " · ".join(f"{_CATCHUP_WHY.get(k, k)} {skips[k]}"
                              for k in _CATCHUP_WHY_ORDER if skips.get(k))
+        # The counters are per name-check — one name can be re-checked on its
+        # window's next minute and skipped again — while the reject list below is
+        # per name. Unlabelled, "older than the window 48" next to "20 fired
+        # before their sector was picked" reads as a contradiction.
         lines.append(f"LATE LEADER catch-ups {stats.get('catchup', 0)} "
                      f"(signal fired before its sector was picked)"
-                     + (f" · not sent: {refused}" if refused else ""))
+                     + (f" · not sent (per name-check): {refused}" if refused else ""))
     skips = stats.get("proj_skip") or {}
     if skips:
         bits = [f"{_SKIP_LABEL[k]} {skips[k]}" for k in _SKIP_LABEL if skips.get(k)]

@@ -607,14 +607,15 @@ class SummaryCounterTests(TestCase):
               "sent": {}}
         text = scan1m.format_summary(st)
         self.assertIn("LATE LEADER catch-ups 0", text)
-        self.assertIn("not sent: stop taken since the fire 3 · already ran (chase) 2"
-                      " · no earlier fire 9", text)
+        self.assertIn("not sent (per name-check): stop taken since the fire 3"
+                      " · already ran (chase) 2 · no earlier fire 9", text)
 
     def test_skips_alone_still_print_the_late_leader_line(self):
         st = {"session": "2026-11-16", "stats": {"candles": 1, "picks": 1,
                                                 "catchup_skip": {"stop": 1}}, "sent": {}}
         self.assertIn("LATE LEADER catch-ups 0 (signal fired before its sector was picked)"
-                      " · not sent: stop taken since the fire 1", scan1m.format_summary(st))
+                      " · not sent (per name-check): stop taken since the fire 1",
+                      scan1m.format_summary(st))
 
     def test_a_refusal_names_its_reason(self):
         signal = base.signal(time="09:30")
@@ -727,6 +728,76 @@ class AlertParityTests(Scan1mFixture):
         scan1m._md_cache[md.bar_time] = market_md(dir_conf=80)      # 7 points
         with patch.dict("os.environ", {"MARKET_CONF_DELTA": "10"}):
             self.assertFalse(scan1m.market_alert(st, {"bar": md.bar_time}))
+
+
+class SummaryReconciliationTests(TestCase):
+    """The 18 Nov 1m summary contradicted itself in two places.
+
+    ```
+    LATE LEADER catch-ups 7 (signal fired before its sector was picked) · not sent: already ran (chase) 2 · older than the window 48 · no earlier fire 12
+    …
+    Signals not alerted: 20 fired before their sector was picked (CROMPTON 09:25, DIXON 09:25, HAVELLS 09:25, KALYANKJIL 09:20, TITAN 09:25, VOLTAS 09:25 …)
+    ```
+
+    Seven names were alerted as labelled heads-ups *and* listed as "not alerted",
+    and 48 name-*checks* sat next to 20 name-*rejects* with nothing to say why one
+    is bigger than the other.
+    """
+
+    CAUGHT = ["CROMPTON", "DIXON", "HAVELLS", "KALYANKJIL", "TITAN", "VOLTAS", "WHIRLPOOL"]
+    OTHERS = ["AMBER", "BATAINDIA", "BLUESTARCO", "LGEINDIA", "PGEL", "MOTHERSON",
+              "BOSCHLTD", "MRF", "APOLLOTYRE", "BALKRISIND", "EXIDEIND", "SONACOMS",
+              "ENDURANCE"]
+
+    def st(self):
+        earlier = {n: f"{n} 09:25" for n in self.CAUGHT + self.OTHERS}
+        return {
+            "session": "2026-11-18",
+            "stats": {"candles": 73, "picks": 57,
+                      "sectors": {"CDUR short": 50, "MET short": 7},
+                      "early": 2, "confirmed": 0, "cancelled": 2,
+                      "lead_sum": 7.0, "lead_n": 2, "lead_min": 3,
+                      "catchup": 7,
+                      "catchup_skip": {"chased": 2, "old": 48, "none": 12},
+                      "proj_skip": {"no_signal": 2513, "no_1m_frame": 72},
+                      "rejected": {"earlier": earlier,
+                                   "opposite": {"AMBER@09:50": "AMBER 09:50",
+                                                "BLUESTARCO@09:50": "BLUESTARCO 09:50",
+                                                "PGEL@09:50": "PGEL 09:50"}}},
+            "sent": {}, "positions": {},
+            "catchup": {n: {"bar": "2026-11-18 09:45"} for n in self.CAUGHT},
+        }
+
+    def test_a_late_leader_is_not_listed_as_not_alerted(self):
+        text = scan1m.format_summary(self.st())
+        self.assertIn("LATE LEADER catch-ups 7", text)
+        self.assertIn("13 fired before their sector was picked", text)
+        for name in self.CAUGHT:
+            self.assertNotIn(f"{name} 09:25", text.split("Signals not alerted:")[1])
+
+    def test_the_day_s_own_numbers_still_add_up(self):
+        text = scan1m.format_summary(self.st())
+        self.assertIn("Candles confirmed 73 of 75 · with a sector pick 57", text)
+        self.assertIn("CDUR short 50 · MET short 7", text)
+        self.assertIn("3 on the opposite side to the pick", text)
+
+    def test_a_day_with_no_entry_does_not_promise_exits(self):
+        text = scan1m.format_summary(self.st())
+        self.assertIn("Open at the close: none — no entry was opened today", text)
+        self.assertNotIn("every entry got its exit alert", text)
+
+    def test_the_skips_say_they_are_per_check(self):
+        text = scan1m.format_summary(self.st())
+        self.assertIn("not sent (per name-check): already ran (chase) 2"
+                      " · older than the window 48 · no earlier fire 12", text)
+
+    def test_bot_1_says_the_same_thing(self):
+        line = pipeline._summary_catchup(self.st())
+        self.assertIn("LATE LEADER catch-ups 7", line)
+        self.assertIn("not sent (per name-check)", line)
+        # …and drops the same names from its own reject list
+        self.assertIn("13 fired before their sector was picked",
+                      pipeline._summary_rejects(self.st()))
 
 
 class CancelReasonTests(TestCase):
