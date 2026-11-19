@@ -8,6 +8,7 @@ part is refused the session is not marked as reported).
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from datetime import timedelta
@@ -226,6 +227,13 @@ class ContentTests(base.TestCase):
             trade(entry=100.0, exit=100.05, r=0.02, qty=1000),
             trade(raw="B", entry=100.0, exit=100.04, r=0.02, qty=1000)]))
         self.assertIn("costs ate ₹", text)
+
+    def test_a_ledger_with_no_sector_histogram_still_names_the_picks(self):
+        st = day()
+        st["stats"].pop("sector_hist", None)
+        text = eod.format_eod(st, bot="1m")
+        self.assertIn("<b>How the day was picked</b>", text)
+        self.assertIn("Pick (candles): AUTO", text)
 
     def test_the_day_shape_names_the_pick_history(self):
         text = eod.format_eod(day())
@@ -464,6 +472,55 @@ class BookTests(base.TestCase):
         text = eod.format_eod(st)
         self.assertIn("ABC BUY 900q @ 100.00", text)
         self.assertIn("SL HIT", text)
+
+
+class FiveMinuteDayBookTests(base.TestCase):
+    """One real 5m pass must leave every book the report reads behind it."""
+
+    def setUp(self):
+        base.LiveAlertTests.setUp(self)
+        self.env = patch.dict(os.environ, {"AUDIT_DIR": self.tmp.name}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def market_at_bar(self, df, *args, **kwargs):
+        md = base.LiveAlertTests.market_at_bar(self, df, *args, **kwargs)
+        md.sectors = {"IT": {"side": 1, "persist_bull": 88, "persist_bear": 9,
+                             "day_ret": 1.2, "intra_ret": 0.4, "rs": 0.6, "pos": 72.0,
+                             "qualified": True}}
+        return md
+
+    def test_a_real_pass_writes_the_timeline_the_board_and_the_ranking(self):
+        pipeline.run_once()
+        st = state.load()
+        self.assertTrue(st["stats"]["timeline"], "no timeline written")
+        row = st["stats"]["timeline"][-1]
+        self.assertEqual(row["pick"], "IT")
+        self.assertEqual(row["sec"]["IT"], [88, 9, 1.2, 0.4, 1])
+        self.assertIn("IT", st["stats"]["sector_hist"])
+        self.assertTrue(st["stats"]["leadership"], "no leadership rows")
+        self.assertEqual(st["stats"]["leadership"][-1]["b"], row["b"])
+        self.assertEqual(st["scan"]["sector"], "IT")
+
+    def test_the_report_renders_from_what_the_pass_wrote(self):
+        pipeline.run_once()
+        text = eod.format_eod(state.load())
+        self.assertIn("<b>Sector momentum timeline</b>", text)
+        self.assertIn("<b>Persistent-sector performance</b>", text)
+        self.assertIn("IT P+ 88–88→88", text)
+        self.assertIn("<b>Top-5 leadership activity</b>", text)
+
+    def test_the_audit_is_written_from_a_real_pass(self):
+        from nse_scanner import audit
+
+        pipeline.run_once()
+        json_path, xlsx_path, payload = audit.write(state.load(), bot="5m")
+        data = json.loads(json_path.read_text())
+        self.assertTrue(data["timeline"])
+        self.assertTrue(data["sectors"])
+        self.assertEqual(data["timeline"][-1]["sectors"]["IT"]["persist_bull"], 88)
+        self.assertTrue(data["leadership"])
+        self.assertTrue(xlsx_path.exists())
 
 
 # ── the two scanners actually send it, by default ───────────────────────────

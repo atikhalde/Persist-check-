@@ -22,6 +22,18 @@ def state(**stats) -> dict:
     return {"session": "2026-11-20", "sent": {}, "positions": {}, "stats": stats}
 
 
+def _frame(close: float):
+    import pandas as pd
+
+    idx = pd.DatetimeIndex([base.BAR, ])
+    return pd.DataFrame({"Open": [close], "High": [close + 0.5], "Low": [close - 0.5],
+                         "Close": [close], "Volume": [1000]}, index=idx)
+
+
+def _last():
+    return base.BAR
+
+
 def trade(**kw) -> dict:
     rec = {"raw": "MARUTI", "side": "BUY", "time": "10:15", "entry": 100.0, "exit": 110.0,
            "r": 2.0, "why": "EMA9 EXIT", "t_hit": 1, "sector": "AUTO",
@@ -257,6 +269,22 @@ class AuditTests(base.TestCase):
             {"b": "09:25", "tilt": 1, "conf": 70, "label": "BULL", "pick": "IT",
              "side": 1, "sec": {"IT": [38, 22, 0, 0, 0]}}])
         self.assertEqual(audit.sector_stats(st)["IT"]["transitions"], [])
+
+    def test_the_trim_s_three_nearest_misses_are_recorded_too(self):
+        from nse_scanner import pipeline
+
+        record: dict = {}
+        sector_of = {f"N{i}": "AUTO" for i in range(8)}
+        side_of = {f"N{i}": 1 for i in range(8)}
+        frames = {f"N{i}": _frame(100 + i) for i in range(8)}
+        tickers = list(frames)
+        with patch.dict(os.environ, {"SECTOR_TOP_N": "5", "NAME_RANK": "lead"}, clear=False):
+            pipeline.sector_leaders(list(sector_of), tickers, sector_of, side_of, frames,
+                                    tickers, {"AUTO": 0.0}, _last(), record=record)
+        rows = record["AUTO"]
+        self.assertEqual(len(rows), 8)                      # 5 kept + 3 near misses
+        self.assertEqual(sum(1 for r in rows if r["kept"]), 5)
+        self.assertFalse(rows[-1]["kept"])
 
     def test_the_entries_of_the_day_land_on_their_sector(self):
         stats = audit.sector_stats(self.day())

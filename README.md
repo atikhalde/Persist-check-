@@ -137,12 +137,18 @@ What to look at tomorrow
 • ⚠ the book fell ₹968 from its peak — the exits that caused it are in the ledger
 ```
 
-**The attachments carry what a message cannot.** `reports/audit-<session>.json` is
-the day in full: every candle with the market's tilt and every sector's
+**Both scanners keep the same books, so both get the whole report.** The 5m scan
+and bot 3 write the same per-candle record — the pick, the sector board, the
+top-5 ranking with its three legs, every refusal by name — so the 1m report has
+the same sections as the 5m one instead of falling back to "last pick WAIT". The
+only difference is the heading (`bot 5m` / `bot 1m`) and the ledger file.
+
+**The attachments carry what a message cannot.** `reports/audit-<session>-<bot>.json`
+(`-5m` / `-1m`, so the two scanners never overwrite each other) is the day in full: every candle with the market's tilt and every sector's
 persistence, day/intra move and gate state; every blocked signal with its rule and
 detail; every leadership row per candle with its components; the trader ledger;
-diagnostics; and every knob's effective value. `reports/audit-<session>.xlsx` is
-the same day as sheets — `Summary`, `Trades`, `Blocked`, `Timeline`, `Sectors`,
+diagnostics; and every knob's effective value. `reports/audit-<session>-<bot>.xlsx`
+is the same day as sheets — `Summary`, `Trades`, `Blocked`, `Timeline`, `Sectors`,
 `SectorSeries`, `Leadership`, `Diagnostics` — written by a small built-in writer
 (`xlsx.py`), so the workflow installs nothing new.
 

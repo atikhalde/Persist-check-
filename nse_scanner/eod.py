@@ -121,26 +121,39 @@ def _sent(st: dict) -> str:
     return line
 
 
+def _picked_from_timeline(st: dict) -> dict[str, int]:
+    """Candles per picked sector, read off the tape (bot 3 keeps no histogram)."""
+    counts: dict[str, int] = {}
+    for row in (st.get("stats") or {}).get("timeline") or []:
+        pick = row.get("pick") or "WAIT"
+        if pick != "WAIT":
+            counts[pick] = counts.get(pick, 0) + 1
+    return counts
+
+
 def _day_shape(st: dict) -> list[str]:
     """Picks by sector and side, how often the pick changed, first and last times."""
     x = st.get("stats") or {}
     hist = x.get("sector_hist") or {}
-    if not hist and not _pick_trail(st):
+    if not hist and not _pick_trail(st) and not _picked_from_timeline(st):
         return []
     picked = {name: h for name, h in hist.items() if int(h.get("picks") or 0)}
+    counted = {name: int(h.get("picks") or 0) for name, h in picked.items()}
+    if not counted:                # bot 3 (and any day with no histogram)
+        counted = _picked_from_timeline(st)
     lines = ["<b>How the day was picked</b>"]
-    if not hist:
+    if not hist and not counted:
         pass                       # only the pick trail: say nothing about sectors
-    elif not picked:
+    elif not counted and not picked:
         lines.append("No sector was picked all session — the market said WAIT on every candle.")
     else:
-        order = sorted(picked.items(), key=lambda kv: -int(kv[1].get("picks") or 0))
+        order = sorted(counted.items(), key=lambda kv: -kv[1])
         lines.append("Pick (candles): " + " · ".join(
-            f"{name} {int(h['picks'])}" for name, h in order[:8]))
+            f"{name} {n}" for name, n in order[:8]))
         longest = order[0]
-        lines.append(f"Longest run {longest[0]} {int(longest[1]['picks'])} candles "
-                     f"({int(longest[1]['picks']) * 5} min) · "
-                     f"{len(picked)} sector(s) picked in all")
+        lines.append(f"Longest run {longest[0]} {longest[1]} candles "
+                     f"({longest[1] * 5} min) · "
+                     f"{len(counted)} sector(s) picked in all")
     trail = _pick_trail(st)
     if trail:
         lines.append(trail)
@@ -159,7 +172,13 @@ def _pick_trail(st: dict) -> str:
     """
     log_book = (st.get("scan") or {}).get("log")
     if not isinstance(log_book, dict) or not log_book:
-        return ""
+        # bot 3 keeps no pick log: the tape it writes per candle is the same
+        # record, so the first pick and the number of changes still come out
+        rows = (st.get("stats") or {}).get("timeline") or []
+        log_book = {r["b"]: {"name": r.get("pick") or "WAIT", "side": r.get("side") or 0}
+                    for r in rows if r.get("b")}
+        if not log_book:
+            return ""
     bars = sorted(log_book)
     trail = [(b, rec) for b in bars
              if isinstance((rec := log_book[b]), dict) and rec]
@@ -246,7 +265,7 @@ def _persistence(st: dict) -> list[str]:
         lines.append(f"{name} {flow} {int(s['min'])}–{int(s['max'])}→{int(s['now'])} · "
                      f"{s['above_70']}/{s['candles']} candles ≥70 · "
                      f"{s['gate_candles']} gate-open{span}"
-                     f" · {s['pick_candles']} candles as pick{runs}"
+                     f" · {_n(s['pick_candles'], 'candle')} as pick{runs}"
                      f"{cross_txt} · {_n(s.get('entries', 0), 'entry', 'entries')}")
     if len(order) > 6:
         lines.append(f"… {len(order) - 6} more sector(s) in the audit")
@@ -255,7 +274,7 @@ def _persistence(st: dict) -> list[str]:
 
 def _leadership(st: dict) -> list[str]:
     """Which names each scanned sector kept putting forward, and what became of them."""
-    rows = audit.leadership_rows(st)
+    rows = [r for r in audit.leadership_rows(st) if r.get("scanned")]
     if not rows:
         return []
     entered = {r.get("raw") or r.get("name")

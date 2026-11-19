@@ -306,7 +306,25 @@ def _pick_dict(md, *, projected: bool = False) -> dict:
         "alt_intra": _intra_of(md, alt) if alt else None,
         "alt_reason": (getattr(md, "alt_reason", "") or "") if alt else "",
         "projected": projected,
+        # The sector board as the engine saw it, in the 5m timeline's own cell
+        # format — bot 3's report draws the same timeline from this.
+        "snap": _snap_cells(md),
     }
+
+
+def _snap_cells(md) -> dict[str, list]:
+    """``{sector: [persist bull, persist bear, day %, intra %, gate open]}``."""
+    out: dict[str, list] = {}
+    for name, snap in (getattr(md, "sectors", None) or {}).items():
+        try:
+            out[name] = [round(float(snap.get("persist_bull") or 0.0)),
+                         round(float(snap.get("persist_bear") or 0.0)),
+                         round(float(snap.get("day_ret") or 0.0), 2),
+                         round(float(snap.get("intra_ret") or 0.0), 2),
+                         1 if snap.get("qualified") else 0]
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _intra_of(md, sector: str) -> float | None:
@@ -642,7 +660,8 @@ def _want(side_of: dict[str, int], raw: str, pick: dict) -> str:
 
 
 def _leaders(stocks: list[str], symbols: dict[str, str], sector_of: dict[str, str],
-             side_of: dict[str, int], sm5: dict, pick: dict, last) -> set[str]:
+             side_of: dict[str, int], sm5: dict, pick: dict, last,
+             record: dict | None = None) -> set[str]:
     """The top ``SECTOR_TOP_N`` names of each scanned sector (``pipeline``'s rule)."""
     from .pipeline import sector_leaders
 
@@ -656,7 +675,7 @@ def _leaders(stocks: list[str], symbols: dict[str, str], sector_of: dict[str, st
             current.append(sym)
     intra_of = {name: _sector_intra(pick, name) for name in set(sector_of.values())}
     return sector_leaders(stocks, [symbols[raw] for raw in stocks], sector_of, side_of,
-                          done, current, intra_of, last)
+                          done, current, intra_of, last, record=record)
 
 
 # ── frames ───────────────────────────────────────────────────────────────────
@@ -1374,8 +1393,14 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     # Only a sector's leaders are projected: the tail is the sector moving, and
     # its "signal" is the sector's, not the name's. Ranked before the 1m fetch,
     # so a follower costs nothing — the same trim the 5m scan applies.
+    lead_rank: dict = {}
     leaders = _leaders(wanted, everything, sector_of, side_of, sm5, pick,
-                       bar - timedelta(minutes=BAR_MINUTES))
+                       bar - timedelta(minutes=BAR_MINUTES), record=lead_rank)
+    if lead_rank:
+        from .pipeline import _note_leadership
+
+        _note_leadership(st, (bar - timedelta(minutes=BAR_MINUTES)).strftime(
+            "%Y-%m-%d %H:%M"), lead_rank)
     names = [raw for raw in names if raw in leaders]
     catching = [raw for raw in catching if raw in leaders]
     wanted = list(dict.fromkeys(names + catching))
@@ -1674,11 +1699,13 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     market_alert(st, pick)
     if pick.get("sector") in (None, "WAIT") or pick.get("side") not in (1, -1):
         _count_candle(stats, pick)
+        _note_pick(st, pick)              # a WAIT candle is still a candle of the tape
         _settle(st, bar, set(), None, code="pick_wait")
         _mark_judged(st, bar)          # nothing to scan on this candle, as on bot 1
         save_ledger(st)
         return []
     _count_candle(stats, pick)
+    _note_pick(st, pick)
 
     session = str(bar.date())
     uni = data.load_universe()
@@ -1699,8 +1726,16 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     # as the 5m scan. Ranked on the previous completed candle (as the projection
     # pass does) so a 5m row Yahoo publishes late cannot drop a leader here.
     # Everything below works on the kept names only.
+    lead_rank: dict = {}
     leaders = _leaders(names, tickers, sector_of, side_of, sm5, pick,
-                       bar - timedelta(minutes=BAR_MINUTES))
+                       bar - timedelta(minutes=BAR_MINUTES), record=lead_rank)
+    if lead_rank:
+        from .pipeline import _note_leadership
+
+        # keyed by the candle the names were ranked on, exactly as bot 1 keys its
+        # own table: the same bar as the timeline row it sits beside
+        _note_leadership(st, (bar - timedelta(minutes=BAR_MINUTES)).strftime(
+            "%Y-%m-%d %H:%M"), lead_rank)
     followers = [raw for raw in names if raw not in leaders]
     names = [raw for raw in names if raw in leaders]
     if not names:
@@ -1915,6 +1950,39 @@ def _track_once(bar: datetime) -> None:
         raise
     except Exception:
         log.exception("hit tracking failed for %s", bar.strftime("%H:%M"))
+
+
+def _note_pick(st: dict, pick: dict | None) -> None:
+    """Record the pick and the sector board for this candle, for the day's report.
+
+    ``st["scan"]`` is the same book bot 1 keeps (bot 3 had none, so its report
+    could only say "WAIT"), and the timeline is the same row format, written
+    through ``pipeline._record_timeline`` so ``audit.sector_stats`` reads it.
+    """
+    if not pick or not pick.get("bar"):
+        return
+    side = pick.get("side") if pick.get("side") in (1, -1) else 0
+    st["scan"] = {"bar": pick.get("bar"), "sector": pick.get("sector") or "WAIT",
+                  "side": side, "label": pick.get("label") or "",
+                  "conf": pick.get("conf") or 0,
+                  "extra": list(pick.get("extra") or ()),
+                  "follow": bool(pick.get("follow")),
+                  "alt": ({"sector": pick["alt"], "side": pick.get("alt_side") or 0}
+                          if pick.get("alt") else None),
+                  "intra": pick.get("intra")}
+    cells = pick.get("snap") or {}
+    if not cells:
+        return
+    from .pipeline import _record_timeline
+
+    label = str(pick.get("label") or "")
+    _record_timeline(st, {
+        "b": str(pick["bar"])[-5:],
+        "tilt": 1 if label.startswith("BULL") else -1 if label.startswith("BEAR") else 0,
+        "conf": int(pick.get("conf") or 0), "label": label, "regime": "",
+        "pick": pick.get("sector") if side else "WAIT", "side": side,
+        "sec": cells,
+    })
 
 
 def _count_candle(stats: dict, pick: dict | None) -> None:

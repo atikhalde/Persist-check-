@@ -673,7 +673,9 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
                  "strength": parts.get("strength"), "volume": parts.get("volume"),
                  "structure": parts.get("structure"), "lead": parts.get("lead"),
                  "kept": i < n}
-                for i, (score, raw, parts) in enumerate(items[:n])]
+                # the kept names plus the three the trim dropped: the audit can
+                # then show who nearly made it, and by how much
+                for i, (score, raw, parts) in enumerate(items[:n + 3])]
         if len(items) > n:
             def _fmt(item) -> str:
                 score, raw, parts = item
@@ -843,8 +845,17 @@ def _note_timeline(st: dict, md, bar: str, pick: str, side: int) -> None:
                 return 0
         row["sec"][name] = [num("persist_bull"), num("persist_bear"), num("day_ret", 2),
                             num("intra_ret", 2), 1 if snap.get("qualified") else 0]
+    _record_timeline(st, row)
+
+
+def _record_timeline(st: dict, row: dict) -> None:
+    """Append one candle to the day's tape, replacing it if it is the same one.
+
+    Bot 3 has its own ledger and sees the pick rather than the whole decision, so
+    it builds the row itself and calls this — one format, one reader, two bots.
+    """
     book = st.setdefault("stats", {}).setdefault("timeline", [])
-    if book and book[-1].get("b") == row["b"]:
+    if book and book[-1].get("b") == row.get("b"):
         book[-1] = row                      # the same candle, polled again
     else:
         book.append(row)
