@@ -1074,6 +1074,20 @@ class AlertInventoryTests(TestCase):
         self.assertIn("not checked this session (no 5m candle): PNB",
                       self.summary(pending=["PNB"]))
 
+    def test_a_trade_checked_all_day_is_not_called_never_evaluated(self):
+        # 19 Nov: BAJAJ-AUTO's last candle was missing from the feed, and the
+        # summary said its stops, targets and EMA9 exit "were never evaluated" on
+        # the same page as its T1 and T2 hits.
+        text = self.summary(pending=["BAJAJ-AUTO"], checked=["BAJAJ-AUTO"])
+        self.assertIn("not checked on the last candle (no 5m candle): BAJAJ-AUTO", text)
+        self.assertNotIn("never evaluated", text)
+
+    def test_a_name_never_checked_still_says_so(self):
+        text = self.summary(pending=["PNB", "BAJAJ-AUTO"], checked=["BAJAJ-AUTO"])
+        self.assertIn("not checked this session (no 5m candle): PNB", text)
+        self.assertIn("never evaluated", text)
+        self.assertIn("not checked on the last candle (no 5m candle): BAJAJ-AUTO", text)
+
     def test_a_name_the_pick_named_but_could_not_be_scanned_is_reported(self):
         text = self.summary(rejected={
             "no_data": {"X@09:20": "X 09:20"},
