@@ -16,14 +16,12 @@ OPEN_MINUTES = 9 * 60 + 15  # 555
 # dead code: nothing called them, and the master scanner's own windows
 # (BUY_W1 09:16-09:59 ... FIN_BUY 09:26-11:15) are the rules that actually
 # bound an entry. They are gone rather than left looking like a safeguard.
-OR_MINUTES = 30              # opening range 09:15-09:45 — the BUY side
-# The opening range is not one number: the buy side keeps the full thirty
-# minutes, the sell side reads a fifteen-minute one (09:15-09:30). A short is
-# the side that gets there first — 18 Nov fired DIXON and TITAN at 09:25 and
-# KALYANKJIL at 09:20, all before the 09:45 buy-side range was complete — so
-# the sell side is allowed to be committed from 09:30 while the buy side still
-# waits for 09:45. Nothing else about the two sides changes.
-OR_MINUTES_SHORT = 15        # opening range 09:15-09:30 — the SELL side
+# One range for both sides, 25 minutes: 09:15-09:35 inclusive on the 5m grid, so
+# the range closes on the 09:35 bar and `mom >= 25` first holds on the 09:40 bar
+# — one bar earlier than the old 30 (which opened at 09:45) and later than the
+# short-lived 15/30 split it replaces. The 5m bars are the clock, so 25 buys
+# exactly one candle of head start, for longs and shorts alike.
+OR_MINUTES = 25              # opening range 09:15-09:35, pick possible on 09:40
 
 # Master scanner aggressive windows (bar OPEN time, IST)
 BUY_W1 = ((9, 16), (9, 59))

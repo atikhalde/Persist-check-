@@ -1,12 +1,13 @@
-"""The opening range per side: 30 minutes for a buy, 15 for a sell.
+"""The opening range: one range, 25 minutes, for both sides.
 
-The engine used to run one range for both sides, fifteen minutes shorter than
-the one it now gives the sell side. On 18 Nov the misses were all shorts fired
-between 09:20 and 09:40, while the 09:45 buy-side range was still completing, so
-the two sides no longer share a clock: ``OR_MINUTES`` (30) is the buy side,
-``OR_MINUTES_SHORT`` (15) the sell side, and nothing else moved.
+The engine ran a 30-minute range (09:15-09:45) for most of its life, then briefly
+one range per side (30 for a buy, 15 for a sell). It is back to a single range,
+now 25 minutes: the bars of 09:15, 09:20, 09:25, 09:30 and 09:35 are in it, the
+09:40 bar is the first one it has closed on, so ``mom >= 25`` is the gate and the
+first bar a pick can be committed on is **09:40** — one candle earlier than the
+old 30, for longs and shorts alike.
 
-``market_open_minutes`` is 0 at 09:15, so 09:30 is 15 and 09:45 is 30.
+``market_open_minutes`` is 0 at 09:15, so 09:35 is 20 and 09:40 is 25.
 """
 from unittest import TestCase
 from unittest.mock import patch
@@ -20,56 +21,50 @@ from nse_scanner.session import IST
 from test_sector_pick import DAYS, bars, daily, nifty, series
 
 
-class ConstantsTests(TestCase):
-    def test_the_buy_side_keeps_the_full_thirty_minutes(self):
-        self.assertEqual(session.OR_MINUTES, 30)
-        self.assertEqual(market.OR_MINUTES, 30)
+class ConstantTests(TestCase):
+    def test_the_range_is_twenty_five_minutes(self):
+        self.assertEqual(session.OR_MINUTES, 25)
+        self.assertEqual(market.OR_MINUTES, 25)
 
-    def test_the_sell_side_reads_fifteen(self):
-        self.assertEqual(session.OR_MINUTES_SHORT, 15)
-        self.assertEqual(market.OR_MINUTES_SHORT, 15)
-
-    def test_the_two_sides_are_not_the_same_number(self):
-        self.assertNotEqual(session.OR_MINUTES, session.OR_MINUTES_SHORT)
+    def test_both_sides_read_the_same_number(self):
+        # The per-side split is gone: there is no second constant to drift from.
+        self.assertFalse(hasattr(session, "OR_MINUTES_SHORT"))
+        self.assertFalse(hasattr(market, "OR_MINUTES_SHORT"))
 
 
 class GateTests(TestCase):
-    """When each side is allowed to act, and that neither can act earlier."""
+    """When the range is closed, and that it cannot be used before that."""
 
-    def test_nothing_is_ready_inside_the_shortest_window(self):
+    def test_the_gate_opens_on_the_0940_bar(self):
         rng = OpeningRange()
-        for mom in (0, 5, 10):
+        for mom in (0, 5, 10, 15, 20):
             rng.extend(mom, high=101.0, low=99.0)
-            self.assertEqual(rng.ready(mom), (False, False))
+            self.assertFalse(rng.ready(mom))       # inside the window
+        self.assertTrue(rng.ready(25))             # 09:40
 
-    def test_the_sell_side_opens_at_0930_and_the_buy_side_at_0945(self):
-        rng = OpeningRange()
-        for mom in range(0, 30, 5):          # 09:15 ... 09:40
-            rng.extend(mom, high=101.0, low=99.0)
-            buy, sell = rng.ready(mom)
-            self.assertEqual(buy, mom >= 30)
-            self.assertEqual(sell, mom >= 15)
+    def test_the_gate_is_a_boundary_and_not_a_count(self):
+        rng = OpeningRange(seed=True)
+        rng.extend(25, high=101.0, low=99.0)       # a tape that starts at 09:40
+        self.assertTrue(rng.ready(25))
 
-    def test_a_missing_opening_tape_is_never_read_as_a_break(self):
-        # The tape starts at 10:00: no range was watched, so neither side gets
-        # to claim a break of it. This is what seed=False is for.
-        rng = OpeningRange()
+    def test_an_unseen_opening_tape_is_never_read_as_a_break(self):
+        rng = OpeningRange()                       # sector scoring: no seeding
         rng.extend(45, high=101.0, low=99.0)
-        self.assertTrue(np.isnan(rng.hi) and np.isnan(rng.lo_s))
-        self.assertEqual(rng.ready(45), (False, False))
+        self.assertTrue(np.isnan(rng.hi) and np.isnan(rng.lo))
+        self.assertFalse(rng.ready(45))
 
 
 class RangeExtentTests(TestCase):
-    """Each range stops on its own clock — that is the whole change."""
+    """The five bars 09:15-09:35 build it; the 09:40 bar does not touch it."""
 
     BARS = [  # (minutes after 09:15, high, low)
         (0, 100.4, 99.6),
-        (5, 100.8, 99.4),      # both windows open: sell low 99.4
-        (10, 101.0, 99.2),     # both windows open: sell low 99.2
-        (15, 101.6, 98.9),     # sell window shut: 98.9 must NOT reach the sell low
-        (20, 102.0, 98.5),
-        (25, 101.2, 98.7),
-        (30, 103.0, 98.0),     # buy window shut too
+        (5, 100.8, 99.4),
+        (10, 101.0, 99.2),
+        (15, 100.6, 98.9),
+        (20, 101.2, 99.1),     # 09:35 — the last bar that counts
+        (25, 103.0, 98.0),     # 09:40 — the first bar after it
+        (30, 104.0, 97.0),
     ]
 
     def walk(self):
@@ -78,26 +73,19 @@ class RangeExtentTests(TestCase):
             rng.extend(mom, high, low)
         return rng
 
-    def test_the_sell_low_is_only_the_first_fifteen_minutes(self):
-        self.assertEqual(self.walk().lo_s, 99.2)
+    def test_the_range_is_the_first_five_bars(self):
+        self.assertEqual((self.walk().hi, self.walk().lo), (101.2, 98.9))
 
-    def test_the_buy_range_is_the_first_thirty_minutes(self):
-        rng = self.walk()
-        self.assertEqual((rng.hi, rng.lo), (102.0, 98.5))
-
-    def test_a_break_of_the_sell_range_can_happen_before_the_buy_range_exists(self):
-        rng = OpeningRange()
-        for mom, high, low in self.BARS[:4]:     # up to and including 09:30
-            rng.extend(mom, high, low)
-        buy, sell = rng.ready(15)                # the 09:30 bar
-        self.assertFalse(buy)                    # the buy side still waits for 09:45
-        self.assertTrue(sell)
-        self.assertLess(98.6, rng.lo_s)          # 98.6 under 99.2 is a sell break
-
-    def test_a_bar_after_both_windows_moves_neither(self):
+    def test_a_bar_after_the_range_moves_neither_edge(self):
         rng = self.walk()
         rng.extend(350, high=110.0, low=95.0)
-        self.assertEqual((rng.hi, rng.lo, rng.lo_s), (102.0, 98.5, 99.2))
+        self.assertEqual((rng.hi, rng.lo), (101.2, 98.9))
+
+    def test_a_new_session_starts_with_no_range(self):
+        rng = self.walk()
+        rng.reset()
+        self.assertTrue(np.isnan(rng.hi) and np.isnan(rng.lo))
+        self.assertFalse(rng.ready(45))
 
 
 class SeedTests(TestCase):
@@ -106,55 +94,44 @@ class SeedTests(TestCase):
     def test_a_late_starting_index_engine_still_has_a_range(self):
         rng = OpeningRange(seed=True)
         rng.extend(45, high=101.0, low=99.0)
-        self.assertEqual((rng.hi, rng.lo, rng.lo_s), (101.0, 99.0, 99.0))
-        self.assertEqual(rng.ready(45), (True, True))
+        self.assertEqual((rng.hi, rng.lo), (101.0, 99.0))
+        self.assertTrue(rng.ready(45))
 
     def test_a_late_starting_sector_scorer_does_not(self):
         rng = OpeningRange(seed=False)
         rng.extend(45, high=101.0, low=99.0)
-        self.assertEqual(rng.ready(45), (False, False))
-
-    def test_a_new_session_starts_with_no_range(self):
-        rng = OpeningRange()
-        rng.extend(5, high=101.0, low=99.0)
-        rng.reset()
-        self.assertTrue(np.isnan(rng.hi) and np.isnan(rng.lo) and np.isnan(rng.lo_s))
-        self.assertEqual(rng.ready(45), (False, False))
+        self.assertFalse(rng.ready(45))
 
 
 class DirectionConfidenceTests(TestCase):
-    """The confidence boost follows the side's own break, not a shared one."""
+    """Confidence still follows the side's own break of that one range."""
 
     def conf(self, dir_state, or_up, or_dn):
         return _dir_conf(2, 1, 4, 2, 25.0, 60.0, dir_state, or_up, or_dn, 0.0)
 
-    def test_a_sell_break_boosts_only_a_bear(self):
-        self.assertEqual(self.conf(-1, False, True) - self.conf(-1, False, False), 7)
-        self.assertEqual(self.conf(1, False, True), self.conf(1, False, False))
-
-    def test_a_buy_break_boosts_only_a_bull(self):
+    def test_a_break_boosts_the_side_it_belongs_to(self):
         self.assertEqual(self.conf(1, True, False) - self.conf(1, False, False), 7)
+        self.assertEqual(self.conf(-1, False, True) - self.conf(-1, False, False), 7)
         self.assertEqual(self.conf(-1, True, False), self.conf(-1, False, False))
 
 
-class SellSideOnATapeTests(TestCase):
-    """The rule, on a tape: a dip through the 15-minute low but not the 30-minute one.
+class BonusArrivesOnThe0940BarTests(TestCase):
+    """The rule on a tape: the early-rotation boost starts one bar earlier.
 
-    Bars 09:15-09:30 hold above 99.5, so the sell-side range has a low of 99.5 and
-    a close under it from 09:35. Split falls to 98.4 and back, so the *thirty*
-    minute low is 98.4 — a close of 99.0 is nowhere near it. Under the old shared
-    range the sell side therefore saw no break at all until 11:30, and earned no
-    early-rotation boost; now it earns it from 09:35.
+    Bars 09:15-09:35 hold above 99.5 (that is the 25-minute low); 09:40 closes at
+    99.0, through it. Under the old 30-minute range nothing was closed at 09:40,
+    so the sell side saw no break and earned no boost — and by 09:45 its low was
+    the 09:40 wick at 98.9, still below the close, so it never earned one at all.
     """
 
     FALLING_DAY = [
         (100.2, 100.4, 100.0, 100.2),   # 09:15
         (100.2, 100.3, 99.9, 100.0),    # 09:20
         (100.0, 100.1, 99.7, 99.8),     # 09:25
-        (99.8, 99.9, 99.5, 99.6),       # 09:30  sell range low = 99.5
-        (99.6, 99.7, 98.4, 99.2),       # 09:35  the dip that only the 30-min range sees
-        (99.2, 99.4, 98.9, 99.0),       # 09:40  close 99.0 < 99.5
-        (99.0, 99.2, 98.9, 99.0),       # 09:45  buy range completes here
+        (99.8, 99.9, 99.5, 99.6),       # 09:30
+        (99.6, 99.7, 99.55, 99.7),      # 09:35  range low = 99.5
+        (99.7, 99.8, 98.9, 99.0),       # 09:40  close 99.0 < 99.5
+        (99.0, 99.2, 98.9, 99.0),       # 09:45
     ]
 
     @staticmethod
@@ -174,30 +151,21 @@ class SellSideOnATapeTests(TestCase):
         out.append(self.frame(DAYS[-1], self.FALLING_DAY[:today_bars]))
         return pd.concat(out)
 
-    def snap(self, today_bars: int, **env):
+    def snap(self, today_bars: int):
         df = self.tape(today_bars)
-        with patch.dict("os.environ", {"SECTOR_MAX_LAG_BARS": "-1", **env}):
+        with patch.dict("os.environ", {"SECTOR_MAX_LAG_BARS": "-1"}):
             return market._sector_snap("TEST", df, daily(df), DAYS[-1], nifty(), 1.0,
                                        df.index[-1])
 
-    def test_the_sell_side_earns_the_rotation_boost_before_0945(self):
-        now = self.snap(6)                     # last bar 09:40
-        with patch.object(market, "OR_MINUTES_SHORT", 30):   # the old shared range
-            then = self.snap(6)
+    def test_the_break_earns_the_boost_from_the_0940_bar(self):
+        now = self.snap(7)                                    # last bar 09:45
+        with patch.object(market, "OR_MINUTES", 30):          # the old range
+            then = self.snap(7)
         self.assertEqual(now.side, -1)
         self.assertGreater(now.bear, then.bear + 2.0)
 
-    def test_the_buy_side_is_where_it_was(self):
-        now = self.snap(6)
-        with patch.object(market, "OR_MINUTES_SHORT", 30):
-            then = self.snap(6)
-        self.assertEqual(now.bull, then.bull)
-
-    def test_before_0930_the_two_rules_score_the_same(self):
-        # 09:30 is the first bar either rule can act on for a sell: nothing at
-        # 09:25 differs, which is what "only the sell side's clock moved" means.
-        now = self.snap(3)                     # last bar 09:25
-        with patch.object(market, "OR_MINUTES_SHORT", 30):
-            then = self.snap(3)
-        self.assertEqual((now.bear, now.side), (then.bear, then.side))
-        self.assertEqual(self.snap(4).side, -1)    # 09:30 still scored and sideable
+    def test_the_boost_is_not_there_at_0935(self):
+        now = self.snap(5)                                    # last bar 09:35
+        with patch.object(market, "OR_MINUTES", 30):
+            then = self.snap(5)
+        self.assertEqual(now.bear, then.bear)                 # neither rule is ready
