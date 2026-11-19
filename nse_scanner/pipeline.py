@@ -73,7 +73,7 @@ def scan5m_leader_catchup() -> bool:
 def late_max_minutes() -> float:
     """How old a pre-pick fire may be and still be worth a catch-up (30 min)."""
     try:
-        return max(5.0, min(120.0, float(os.environ.get("SCAN5M_LEADER_MAX_MINUTES", "30"))))
+        return max(5.0, min(120.0, float(os.environ.get("SCAN5M_LEADER_MAX_MINUTES", "40"))))
     except ValueError:
         return 30.0
 
@@ -129,6 +129,85 @@ def scan_require_target() -> bool:
 
 def _plan_has_target(plan) -> bool:
     return any(getattr(plan, key, None) is not None for key in ("t1", "t2", "t3"))
+
+
+def name_rank_mode() -> str:
+    """How the names inside a scanned sector are ranked (``NAME_RANK``).
+
+    ``combined`` (default) = strength, volume and structure together;
+    ``lead`` = the day's lead alone, as before.
+    """
+    mode = os.environ.get("NAME_RANK", "combined").strip().lower()
+    return mode if mode in ("combined", "lead") else "combined"
+
+
+#: Weights of the three legs of the combined rank. Strength is what the trade is
+#: about, volume is what says the move is real, structure is what says it is not
+#: exhausted. They sum to 1.
+RANK_WEIGHTS = {"strength": 0.5, "volume": 0.25, "structure": 0.25}
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x != x else max(0.0, min(1.0, x))
+
+
+def name_rank(df5: pd.DataFrame, last, close: float | None, long_side: bool,
+              sector_intra: float | None) -> tuple[float, dict]:
+    """0-100 rank of one name inside its sector: strength, volume, structure.
+
+    "Not day-% alone" — the lead alone is a *distance travelled*, so it ranks the
+    name that already ran hardest first and cannot tell a move with participation
+    from a thin drift. The three legs:
+
+    * **strength** — the lead vs the sector (pp), the number the entry cap already
+      uses: 0.5 at parity, 1.0 at +2pp ahead (or 1.0 at 2pp behind, on a short).
+    * **volume** — the decision candle's volume against the session's median 5m
+      candle (``apply_1m_volume`` has already spread the 1m prints): 2x the median
+      is full marks. No usable volume scores a neutral 0.5, not a zero.
+    * **structure** — the mean of three readings in the trade's direction: where
+      the close sits in the day's range, whether it is the right side of EMA9, and
+      how many of the last three candles closed the trade's way.
+
+    Returns ``(score, {"strength": %, "volume": %, "structure": %, "lead": pp})``.
+    """
+    if df5 is None or df5.empty or close is None:
+        return 0.0, {}
+    side = 1.0 if long_side else -1.0
+    lead = sector_lead(df5, last, close, sector_intra, long_side)
+    strength = _clamp01(0.5 + (float(lead) if lead is not None else 0.0) / 4.0)
+
+    try:
+        sid = session_date(last)
+        day = df5.loc[[session_date(ts) == sid for ts in df5.index]]
+    except Exception:                     # no calendar → judge the whole frame
+        day = df5
+    vol = 0.5
+    try:
+        vols = [float(v) for v in day["Volume"].tolist() if float(v) > 0]
+        if len(vols) >= 3 and float(day["Volume"].iloc[-1]) > 0:
+            med = sorted(vols)[len(vols) // 2]
+            if med > 0:
+                vol = _clamp01((float(day["Volume"].iloc[-1]) / med) / 2.0)
+    except Exception:
+        vol = 0.5
+
+    try:
+        hi, lo = float(day["High"].max()), float(day["Low"].min())
+        pos = (float(close) - lo) / (hi - lo) if hi > lo else 0.5
+        ema9 = trade.ema9_on_bar(df5, last)
+        above = 0.5 if ema9 is None else (1.0 if (float(close) - ema9) * side > 0 else 0.0)
+        tail = day.tail(3)
+        bars_way = (sum(1 for o, c in zip(tail["Open"], tail["Close"])
+                        if (float(c) - float(o)) * side > 0) / max(1, len(tail)))
+        structure = (pos if long_side else 1.0 - pos) * 0.5 + above * 0.25 + bars_way * 0.25
+    except Exception:
+        structure = 0.5
+
+    score = 100.0 * (RANK_WEIGHTS["strength"] * strength + RANK_WEIGHTS["volume"] * vol
+                     + RANK_WEIGHTS["structure"] * structure)
+    return round(score, 1), {"strength": round(strength * 100), "volume": round(vol * 100),
+                             "structure": round(structure * 100),
+                             "lead": None if lead is None else round(float(lead), 1)}
 
 
 def rank_by_sector_lead() -> bool:
@@ -205,6 +284,8 @@ def rank_candidates(candidates: list[dict]) -> None:
         score = -float(getattr(c.get("best"), "score", 0) or 0)
         if not rank_by_sector_lead():
             return (0.0, score)
+        if c.get("rank") is not None:          # the trim's combined number
+            return (-float(c["rank"]), score)
         lead = c.get("lead")
         return (-(lead if lead is not None else 0.0), score)
     candidates.sort(key=key)
@@ -454,26 +535,42 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
     n = sector_top_n()
     if not n:
         return set(stocks)
+    combined = name_rank_mode() == "combined"
     current_set = set(current)
-    groups: dict[str, list[tuple[float, str]]] = {}
+    groups: dict[str, list[tuple[float, str, dict]]] = {}
     for raw, sym in zip(stocks, tickers):
-        lead = None
+        score, parts = float("-inf"), {}
         if sym in current_set:
             df5 = sm5.get(sym)
             if df5 is not None and not df5.empty:
-                lead = sector_lead(df5, last, float(df5["Close"].iloc[-1]),
-                                   (intra_of or {}).get(sector_of[raw]),
-                                   side_of.get(raw, 1) == 1)
-        groups.setdefault(sector_of[raw], []).append(
-            (lead if lead is not None else float("-inf"), raw))
+                close = float(df5["Close"].iloc[-1])
+                intra = (intra_of or {}).get(sector_of[raw])
+                long_side = side_of.get(raw, 1) == 1
+                if combined:
+                    score, parts = name_rank(df5, last, close, long_side, intra)
+                    if score <= 0:
+                        score = float("-inf")
+                else:
+                    lead = sector_lead(df5, last, close, intra, long_side)
+                    score = lead if lead is not None else float("-inf")
+                    parts = {"lead": lead}
+        groups.setdefault(sector_of[raw], []).append((score, raw, parts))
     keep: set[str] = set()
     for sector, items in groups.items():
         items.sort(key=lambda t: (-t[0], t[1]))
-        keep.update(raw for _, raw in items[:n])
+        keep.update(raw for _, raw, _ in items[:n])
         if len(items) > n:
-            log.info("%s: top %d of %d names by lead — %s", sector, n, len(items),
-                     ", ".join(f"{raw} {lead:+.1f}pp" if lead != float("-inf")
-                               else f"{raw} (no candle)" for lead, raw in items[:n]))
+            def _fmt(item) -> str:
+                score, raw, parts = item
+                if score == float("-inf"):
+                    return f"{raw} (no candle)"
+                if not combined:
+                    return f"{raw} {parts.get('lead') or 0.0:+.1f}pp"
+                return (f"{raw} {score:.0f} (strength {parts.get('strength')} · "
+                        f"volume {parts.get('volume')} · structure {parts.get('structure')})")
+            log.info("%s: top %d of %d names by %s — %s", sector, n, len(items),
+                     "combined rank" if combined else "lead",
+                     ", ".join(_fmt(item) for item in items[:n]))
     return keep
 
 
@@ -1870,8 +1967,13 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if rank_by_sector_lead():
             lead = _lead_vs_sector(df5, last, float(df5["Close"].iloc[-1]), md,
                                    sector_of[raw], want_buy)
+        cand_rank = None
+        if name_rank_mode() == "combined":
+            cand_rank, _ = name_rank(df5, last, float(df5["Close"].iloc[-1]), want_buy,
+                                     (getattr(md, "sectors", None) or {}).get(
+                                         sector_of[raw], {}).get("intra_ret"))
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
-                           "early": early, "lead": lead,
+                           "early": early, "lead": lead, "rank": cand_rank,
                            "close": float(df5["Close"].iloc[-1])})
 
     cap = max_entries_per_pick()

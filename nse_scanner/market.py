@@ -564,18 +564,25 @@ def run_market(
                 reason = diverge["reason"]
 
     # The pick is one sector; a trend day rarely has only one leader on that side.
+    # Three of them above 85 and the scan takes three books, and the dual pick is
+    # dropped with them (a fourth book would be a hedge, not a leader).
+    triple = ""
     if pick and commit_side in (1, -1):
-        runner_up = _runner_up_sectors(pick, pick_side, persist_plus, persist_minus,
-                                       sector_extra_max())
-        if runner_up:
-            extra_sectors = list(dict.fromkeys([*extra_sectors, *runner_up]))
-            reason = f"{reason}; also scanning {', '.join(runner_up)}"
+        extra, triple = extra_sectors_for(pick, pick_side, persist_plus, persist_minus)
+        if extra:
+            extra_sectors = list(dict.fromkeys([*extra_sectors, *extra]))
+            shown = ", ".join(f"{n} {_persist_of(snaps.get(n), pick_side):.0f}"
+                              for n in extra)
+            reason = f"{reason}; also scanning {shown}"
+            if triple:
+                reason += f" (three sectors above {triple_min_persist():.0f})"
 
     # The other side of the same tape, when it has a leader of its own. Only on a
     # committed market: the NEUTRAL follow is one long book by design, and it has
-    # been measured as it stands.
+    # been measured as it stands. Dropped when the market already holds three
+    # leading sectors on the pick's side.
     alt = (_dual_leader(pick, pick_side, persist_plus, persist_minus)
-           if pick and commit_side in (1, -1) else None)
+           if pick and commit_side in (1, -1) and not triple else None)
     alt_sector = alt["sector"] if alt else ""
     alt_side = int(alt["side"]) if alt else 0
     alt_reason = ""
@@ -991,24 +998,58 @@ def sector_extra_max() -> int:
         return 1
 
 
-def _runner_up_sectors(pick, pick_side, plus, minus, most: int) -> list[str]:
-    """The strongest other sectors on the pick's own side that are leading too.
+def triple_pick() -> bool:
+    """Three books when the pick's own side has three sectors above 85 (``TRIPLE_PICK``).
 
-    Same test as the NEUTRAL follow, in the pick's direction, so a quiet or
-    counter-trend sector can never widen the scan. The pick itself is skipped.
+    19 Nov, 09:45-11:45: AUTO 99, CDUR 92-99 and PSUBK 91-99 were all leading at
+    the same time, all above 85, and the scanner could see one of them — the
+    second only while the market was NEUTRAL, and nothing at all once it was
+    committed. The names inside the two it could not see (HAVELLS, WHIRLPOOL,
+    VOLTAS, AMBER, KALYANKJIL, LGEINDIA, DIXON; IOB, UNIONBANK, INDIANB) fired
+    into nothing. ``TRIPLE_PICK=0`` keeps the pick plus one runner-up.
     """
-    if most <= 0 or not pick or pick_side not in (1, -1):
+    return os.environ.get("TRIPLE_PICK", "1").strip() != "0"
+
+
+def triple_min_persist() -> float:
+    """The score all three must beat (``TRIPLE_MIN_PERSIST``, 85)."""
+    try:
+        return float(os.environ.get("TRIPLE_MIN_PERSIST", "85"))
+    except ValueError:
+        return 85.0
+
+
+def _leading_pool(pick_side: int, plus, minus) -> list:
+    """The same-side sectors that are leading in their own right, strongest first."""
+    if pick_side not in (1, -1):
         return []
     pool, test = ((plus, _is_leading) if pick_side == 1 else (minus, _is_leading_short))
     need = follow_min_persist()
-    out: list[str] = []
-    for s in pool[:3]:
-        if len(out) >= most:
-            break
-        if s.name == pick or not test(s, need):
-            continue
-        out.append(s.name)
-    return out
+    return [s for s in (pool or [])[:4] if s.name and test(s, need)]
+
+
+def extra_sectors_for(pick, pick_side, plus, minus) -> tuple[list[str], str]:
+    """The other sectors to scan beside the pick, and why (``"triple"`` or ``""``).
+
+    Two rules, in this order:
+
+    * **triple** — the top three sectors of the pick's own side are all above
+      ``TRIPLE_MIN_PERSIST`` (85): scan the two strongest other ones as well, and
+      the opposite-side dual pick is dropped. Three books, not a pick and a hedge.
+    * otherwise ``SECTOR_EXTRA_MAX`` (1) more, when that sector is leading too.
+    """
+    if not pick:
+        return [], ""
+    pool = _leading_pool(pick_side, plus, minus)
+    others = [s for s in pool if s.name != pick]
+    if not others:
+        return [], ""
+    if triple_pick():
+        top = pool[:3]
+        if len(top) >= 3 and all(_persist_of(s, pick_side) > triple_min_persist()
+                                 for s in top):
+            return [s.name for s in others][:2], "triple"
+    return [s.name for s in others][:sector_extra_max()], ""
 
 
 def _follow_leaders(plus, need: float | None = None) -> list:

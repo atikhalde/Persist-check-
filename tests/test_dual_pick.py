@@ -22,8 +22,8 @@ import numpy as np
 import pandas as pd
 
 from nse_scanner import pipeline
-from nse_scanner.market import (_dual_leader, _is_leading_short, _runner_up_sectors,
-                                run_market, sector_extra_max)
+from nse_scanner.market import (_dual_leader, _is_leading_short, extra_sectors_for,
+                                run_market, sector_extra_max, triple_min_persist)
 from nse_scanner.session import IST
 from test_sector_pick import DAYS, bars, daily, series
 
@@ -37,13 +37,14 @@ def snap(name, **over):
     return type("S", (), {**base, **over})()
 
 
-class RunnerUpSectorTests(TestCase):
+class ExtraSectorTests(TestCase):
     """A committed pick is one sector; the day rarely has only one leader.
 
     19 Nov: AUTO was the pick from 10:00 at 99 while CDUR ran 92-99 all afternoon
     and was never scanned on a committed bar, so every CDUR name that fired at
     09:30-09:40 (HAVELLS, WHIRLPOOL, KALYANKJIL, LGEINDIA, DIXON, VOLTAS, AMBER)
-    was already "earlier" by the time CDUR became the pick at 11:45.
+    was already "earlier" by the time CDUR became the pick at 11:45 — and PSUBK
+    91 was invisible too.
     """
 
     def setUp(self):
@@ -56,37 +57,57 @@ class RunnerUpSectorTests(TestCase):
         self.quiet = snap("FMCG", side=1, persist_bull=95.0, day_ret=0.10, pos=55.0, rs=0.02,
                           bull=58.0, recent=0.01)
 
-    def test_the_strongest_other_leader_is_scanned_with_the_pick(self):
-        got = _runner_up_sectors("AUTO", 1, [self.auto, self.cdur, self.psubk], [], 1)
+    def test_one_runner_up_by_default(self):
+        with patch.dict("os.environ", {"TRIPLE_PICK": "0"}):
+            got, note = extra_sectors_for("AUTO", 1, [self.auto, self.cdur, self.psubk], [])
+        self.assertEqual(got, ["CDUR"])
+        self.assertEqual(note, "")
+
+    def test_three_books_when_the_top_three_are_all_above_85(self):
+        got, note = extra_sectors_for("AUTO", 1, [self.auto, self.cdur, self.psubk], [])
+        self.assertEqual(got, ["CDUR", "PSUBK"])
+        self.assertEqual(note, "triple")
+
+    def test_two_books_when_the_third_is_below_the_threshold(self):
+        weak = snap("PSUBK", side=1, persist_bull=84.0, day_ret=1.40, pos=90.0, rs=0.7,
+                    bull=68.0, recent=0.15)
+        got, note = extra_sectors_for("AUTO", 1, [self.auto, self.cdur, weak], [])
+        self.assertEqual(note, "")
         self.assertEqual(got, ["CDUR"])
 
-    def test_the_pick_itself_is_never_the_runner_up(self):
-        got = _runner_up_sectors("AUTO", 1, [self.auto, self.cdur], [], 1)
+    def test_the_threshold_is_a_knob(self):
+        with patch.dict("os.environ", {"TRIPLE_MIN_PERSIST": "91"}):
+            self.assertEqual(triple_min_persist(), 91.0)
+            self.assertEqual(extra_sectors_for("AUTO", 1, [self.auto, self.cdur, self.psubk],
+                                               [])[1], "")
+        with patch.dict("os.environ", {"TRIPLE_PICK": "0"}):
+            self.assertEqual(extra_sectors_for("AUTO", 1, [self.auto, self.cdur, self.psubk],
+                                               []), (["CDUR"], ""))
+
+    def test_the_pick_itself_is_never_a_second_book(self):
+        got, _ = extra_sectors_for("AUTO", 1, [self.auto, self.cdur], [])
         self.assertNotIn("AUTO", got)
 
     def test_a_high_score_alone_is_not_a_leader(self):
         # PERSIST 95 with the sector flat on the day: a score, not a move.
-        self.assertEqual(_runner_up_sectors("AUTO", 1, [self.quiet], [], 2), [])
-
-    def test_the_knob_is_the_number_of_extra_sectors(self):
-        pool = [self.auto, self.cdur, self.psubk]
-        self.assertEqual(_runner_up_sectors("AUTO", 1, pool, [], 2), ["CDUR", "PSUBK"])
-        self.assertEqual(_runner_up_sectors("AUTO", 1, pool, [], 0), [])
-        with patch.dict("os.environ", {"SECTOR_EXTRA_MAX": "0"}):
-            self.assertEqual(sector_extra_max(), 0)
-        with patch.dict("os.environ", {"SECTOR_EXTRA_MAX": "2"}):
-            self.assertEqual(sector_extra_max(), 2)
+        self.assertEqual(extra_sectors_for("AUTO", 1, [self.auto, self.quiet], []), ([], ""))
 
     def test_a_short_pick_takes_the_next_short_leader(self):
         weak = snap("IT", side=-1, persist_bear=96.0, day_ret=-1.40, pos=8.0, rs=-1.1,
                     bear=78.0, recent=-0.25)
         other = snap("PSUBK", side=-1, persist_bear=88.0, day_ret=-1.10, pos=12.0, rs=-0.8,
                      bear=70.0, recent=-0.20)
-        got = _runner_up_sectors("IT", -1, [], [weak, other], 1)
+        got, _ = extra_sectors_for("IT", -1, [], [weak, other])
         self.assertEqual(got, ["PSUBK"])
 
     def test_a_flat_market_has_no_runner_up(self):
-        self.assertEqual(_runner_up_sectors(None, 0, [self.cdur], [], 2), [])
+        self.assertEqual(extra_sectors_for(None, 0, [self.cdur], []), ([], ""))
+
+    def test_the_knob_is_the_number_of_extra_sectors(self):
+        with patch.dict("os.environ", {"TRIPLE_PICK": "0", "SECTOR_EXTRA_MAX": "0"}):
+            self.assertEqual(extra_sectors_for("AUTO", 1, [self.auto, self.cdur], []), ([], ""))
+        with patch.dict("os.environ", {"SECTOR_EXTRA_MAX": "0"}):
+            self.assertEqual(sector_extra_max(), 0)
 
 
 class DualLeaderTests(TestCase):
@@ -149,6 +170,119 @@ class ShortLeadershipTests(TestCase):
         self.assertFalse(_is_leading_short(snap("IT", side=-1, persist_bear=96.0,
                                                 day_ret=-1.4, pos=72.0, rs=-1.1,
                                                 bear=78.0, recent=-0.25), 75.0))
+
+
+class TripleOnATapeTests(TestCase):
+    """Three sectors above 85 on the pick's side: three books, no dual hedge.
+
+    19 Nov, 09:45-11:45: AUTO 99, CDUR 92-99 and PSUBK 91-99 were all leading at
+    once. The scanner could see one of them; the names in the other two (HAVELLS,
+    WHIRLPOOL, VOLTAS, AMBER, KALYANKJIL, LGEINDIA, DIXON, IOB, UNIONBANK,
+    INDIANB) fired into nothing.
+    """
+
+    def decide(self, **env):
+        n5 = DualPickOnATapeTests.nifty(0.00012)
+        sectors = {"AUTO": sector(0.0006), "IT": sector(-0.0006),
+                   "CDUR": sector(0.00055), "PSUBK": sector(0.0005)}
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        with patch.dict("os.environ", {"SECTOR_FOLLOW": "1", **env}):
+            return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                              {k: daily(v) for k, v in sectors.items()})
+
+    def test_three_leading_sectors_become_three_books(self):
+        md = self.decide()
+        self.assertEqual((md.pick_sector, md.pick_side), ("AUTO", 1))
+        self.assertEqual(list(md.extra_sectors), ["CDUR", "PSUBK"])
+        self.assertIn("three sectors above 85", md.pick_reason)
+
+    def test_the_dual_pick_is_dropped_when_there_are_three(self):
+        md = self.decide()
+        self.assertEqual((md.alt_sector, md.alt_side), ("", 0))
+        self.assertEqual(md.alt_reason, "")
+
+    def test_the_knob_leaves_two_books(self):
+        md = self.decide(TRIPLE_PICK="0")
+        self.assertEqual(list(md.extra_sectors), ["CDUR"])
+        self.assertEqual((md.alt_sector, md.alt_side), ("IT", -1))   # dual pick back
+
+    def test_a_third_sector_below_the_threshold_keeps_two_books(self):
+        md = self.decide(TRIPLE_MIN_PERSIST="98")     # PSUBK 97 does not clear it
+        self.assertEqual(list(md.extra_sectors), ["CDUR"])
+        self.assertNotIn("three sectors", md.pick_reason)
+        self.assertEqual((md.alt_sector, md.alt_side), ("IT", -1))
+
+
+class CombinedNameRankTests(TestCase):
+    """Inside a sector: strength, volume and structure — not the day's lead alone.
+
+    A sector's leader is not always its best trade. The name that has already run
+    the furthest (biggest lead, the old ranking) is often the one with the thin
+    candle and the fader's structure, while the name that is *still* climbing on
+    heavy volume is the one to take.
+    """
+
+    def setUp(self):
+        t = pd.Timestamp(DAYS[-1], tz=IST) + pd.Timedelta(hours=9, minutes=15)
+        self.idx = [t + pd.Timedelta(minutes=5 * i) for i in range(20)]
+        self.last = self.idx[-1]
+        # Ran to 103.3 then faded, thin last candle, closes under its EMA9.
+        a_open = [100.0] * 10 + [103.2, 102.8, 102.4, 102.0, 101.8, 101.75, 101.7,
+                                 101.65, 101.6, 101.5]
+        a_close = [100.4] * 5 + [101.0, 101.6, 102.2, 102.8, 103.3, 102.6, 102.2, 101.9,
+                                 101.8, 101.75, 101.7, 101.65, 101.6, 101.55, 101.5]
+        self.fader = self.frame(a_open, a_close, [1000] * 19 + [100])
+        # Steady climb to the day high on three times the median volume.
+        self.climber = self.frame([100.0] * 20, [100.0 + 0.06 * i for i in range(19)] + [101.2],
+                                  [1000] * 19 + [3000])
+
+    def frame(self, opens, closes, vols):
+        return pd.DataFrame({"Open": opens,
+                             "High": [max(o, c) + 0.02 for o, c in zip(opens, closes)],
+                             "Low": [min(o, c) - 0.02 for o, c in zip(opens, closes)],
+                             "Close": closes, "Volume": vols},
+                            index=pd.DatetimeIndex(self.idx))
+
+    def rank(self, df, long_side=True):
+        return pipeline.name_rank(df, self.last, float(df["Close"].iloc[-1]),
+                                  long_side, 0.0)
+
+    def test_the_furthest_run_name_is_not_automatically_first(self):
+        fader, fader_parts = self.rank(self.fader)
+        climber, climber_parts = self.rank(self.climber)
+        self.assertGreater(fader_parts["lead"], climber_parts["lead"])   # it ran further
+        self.assertGreater(climber, fader)                               # but ranks lower
+        self.assertLess(fader_parts["volume"], climber_parts["volume"])
+        self.assertLess(fader_parts["structure"], climber_parts["structure"])
+
+    def test_the_trim_keeps_the_combined_leader(self):
+        with patch.dict("os.environ", {"SECTOR_TOP_N": "1"}):
+            keep = pipeline.sector_leaders(["AAA", "BBB"], ["AAA.NS", "BBB.NS"],
+                                           {"AAA": "IT", "BBB": "IT"}, {"AAA": 1, "BBB": 1},
+                                           {"AAA.NS": self.fader, "BBB.NS": self.climber},
+                                           ["AAA.NS", "BBB.NS"], {"IT": 0.0}, self.last)
+        self.assertEqual(keep, {"BBB"})
+
+    def test_the_knob_restores_the_day_lead(self):
+        with patch.dict("os.environ", {"SECTOR_TOP_N": "1", "NAME_RANK": "lead"}):
+            keep = pipeline.sector_leaders(["AAA", "BBB"], ["AAA.NS", "BBB.NS"],
+                                           {"AAA": "IT", "BBB": "IT"}, {"AAA": 1, "BBB": 1},
+                                           {"AAA.NS": self.fader, "BBB.NS": self.climber},
+                                           ["AAA.NS", "BBB.NS"], {"IT": 0.0}, self.last)
+        self.assertEqual(keep, {"AAA"})
+
+    def test_a_feed_without_volume_scores_neutral_not_zero(self):
+        thin = self.climber.drop(columns=["Volume"])
+        score, parts = self.rank(thin)
+        self.assertEqual(parts["volume"], 50)
+        self.assertGreater(score, 50.0)
+
+    def test_a_short_is_ranked_on_the_same_legs(self):
+        faller = self.frame([100.0] * 20, [100.0 - 0.06 * i for i in range(19)] + [98.8],
+                            [1000] * 19 + [3000])
+        score, parts = self.rank(faller, long_side=False)
+        self.assertGreater(score, 80.0)
+        self.assertGreater(parts["structure"], 80)
 
 
 class DualPickOnATapeTests(TestCase):

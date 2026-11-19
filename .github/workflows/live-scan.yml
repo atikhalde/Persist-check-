@@ -169,6 +169,9 @@ jobs:
           SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '75' }}
           SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           SECTOR_EXTRA_MAX: ${{ vars.SECTOR_EXTRA_MAX || '1' }}
+          TRIPLE_PICK: ${{ vars.TRIPLE_PICK || '1' }}
+          TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
+          NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
           # An early print older than this is never shown as live (README: 100).
           EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
           # Seconds after the close before the confirmed scan asks Yahoo.
@@ -217,7 +220,7 @@ jobs:
           # while the trade is still valid. 18 Nov: CDUR was the pick from 09:45
           # with PERSIST - 93->99 and no CDUR stock was alerted all morning.
           SCAN5M_LEADER_CATCHUP: ${{ vars.SCAN5M_LEADER_CATCHUP || '1' }}
-          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '30' }}
+          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '40' }}
           LATE_LEADER_ENTRY: ${{ vars.LATE_LEADER_ENTRY || '1' }}
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           # 1 = look the incumbent pick up in a per-bar log, so the early pass

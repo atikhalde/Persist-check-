@@ -165,8 +165,8 @@ def leader_catchup() -> bool:
 
 
 def leader_max_minutes() -> int:
-    """How old a pre-pick fire may be and still be worth a catch-up (30 min)."""
-    return _env_int("SCAN1M_LEADER_MAX_MINUTES", 30, 5, 120)
+    """How old a pre-pick fire may be and still be worth a catch-up (40 min)."""
+    return _env_int("SCAN1M_LEADER_MAX_MINUTES", 40, 5, 120)
 
 
 def early_retries() -> int:
