@@ -379,7 +379,10 @@ class LiveAlertTests(TestCase):
         self.ctx = patch.object(state, "STATE_PATH", Path(self.tmp.name) / "state.json")
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
-        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0"})
+        # The end-of-day *report* has its own tests (tests/test_eod.py); this
+        # class asserts the short summary's lines, so ask for that one.
+        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0",
+                                             "EOD_REPORT": "0"})
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
         self.now = BAR + timedelta(minutes=6)
@@ -423,6 +426,12 @@ class LiveAlertTests(TestCase):
         self.scan = self.mocks[8]
         self.send = self.mocks[9]
         self.settled = self.contexts[10]
+        # The end-of-day report also uploads its audit; a test must not post.
+        # Patched here rather than in ``contexts``: the indices above are part of
+        # this fixture's contract.
+        upload = patch.object(pipeline.telegram, "send_document", return_value=True)
+        upload.start()
+        self.addCleanup(upload.stop)
 
     def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")

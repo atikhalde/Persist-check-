@@ -227,6 +227,16 @@ jobs:
           ENTRY_RANK_BAND: ${{ vars.ENTRY_RANK_BAND || '0.75' }}
           TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
           NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
+          EOD_REPORT: ${{ vars.EOD_REPORT || '1' }}
+          # 1 = also upload the day's JSON audit and XLSX workbook.
+          EOD_AUDIT: ${{ vars.EOD_AUDIT || '1' }}
+          EOD_MAX_CHARS: ${{ vars.EOD_MAX_CHARS || '3800' }}
+          AUDIT_DIR: ${{ vars.AUDIT_DIR || 'reports' }}
+          # The trader ledger's money: all-in cost per side (bps of
+          # turnover), the floor per order, and the notional per trade.
+          COST_BPS: ${{ vars.COST_BPS || '5' }}
+          COST_MIN: ${{ vars.COST_MIN || '20' }}
+          TRADE_CAPITAL: ${{ vars.TRADE_CAPITAL || '100000' }}
           MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
           BAR_SETTLE_SECONDS: "45"                              # used by the shared hit tracker
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170

@@ -13,3 +13,4 @@ state/*.md
 .vscode/
 *.log
 .DS_Store
+reports/

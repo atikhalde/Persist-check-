@@ -11,7 +11,7 @@ from math import isfinite
 
 import pandas as pd
 
-from . import data, state, telegram
+from . import costs, data, state, telegram
 from .market import (lapsed_stickiness, pick_sticky_log, previous_pick,
                      record_pick, run_market, SECTOR_ORDER)
 from .oi_data import CSV_OIReader, StubOIReader
@@ -407,7 +407,8 @@ def take_entry_slot(st: dict, key: str) -> None:
     book[key] = int(book.get(key) or 0) + 1
 
 
-def new_position(side: str, plan: TradePlan, bar_iso: str, session: str) -> dict:
+def new_position(side: str, plan: TradePlan, bar_iso: str, session: str,
+                 sector: str = "") -> dict:
     """The open-trade record — one builder, so the two loops cannot drift.
 
     Bot 3 used to hand-copy this dict and silently lost ``t_names``, ``sl0`` and
@@ -420,6 +421,11 @@ def new_position(side: str, plan: TradePlan, bar_iso: str, session: str) -> dict
         "risk": plan.risk, "t_names": list(plan.pivot_names),
         "entry_ema9": plan.ema9, "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
         "entry_bar": bar_iso, "last_bar": bar_iso, "session": session,
+        # Which book the trade belongs to: the end-of-day report scores entries
+        # per sector, and at the close the state's ``scan`` names a later pick.
+        "sector": sector,
+        # The ledger's size: the report turns R into rupees at ``TRADE_CAPITAL``.
+        "qty": costs.quantity(plan.entry),
     }
 
 
@@ -607,17 +613,17 @@ def _scan_sides(uni: dict, sector: str, side: int, extra=(), alt: str = "",
 
 def _sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, str],
                     side_of: dict[str, int], sm5: dict, current: list[str], md,
-                    last) -> set[str]:
+                    last, record: dict | None = None) -> set[str]:
     """``sector_leaders`` with each sector's intraday % looked up on the decision."""
     intra_of = {sector: ((getattr(md, "sectors", None) or {}).get(sector) or {}).get("intra_ret")
                 for sector in set(sector_of.values())}
     return sector_leaders(stocks, tickers, sector_of, side_of, sm5, current,
-                          intra_of, last)
+                          intra_of, last, record=record)
 
 
 def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, str],
                    side_of: dict[str, int], sm5: dict, current: list[str],
-                   intra_of: dict, last) -> set[str]:
+                   intra_of: dict, last, record: dict | None = None) -> set[str]:
     """The names of each scanned sector worth judging: its top ``SECTOR_TOP_N``.
 
     Ranked by ``sector_lead`` — the stock's move from its own open minus its
@@ -628,6 +634,10 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
     ``intra_of`` is ``{sector: move from its own open, %}``, so the 1m scan —
     which holds the pick rather than the whole decision — trims on the same
     numbers as the 5m scan.
+
+    ``record``, when given, is filled with each sector's kept names and the three
+    ranking legs behind them — the audit's leadership table, and the only place
+    the components survive the log.
     """
     n = sector_top_n()
     if not n:
@@ -656,6 +666,16 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
     for sector, items in groups.items():
         items.sort(key=lambda t: (-t[0], t[1]))
         keep.update(raw for _, raw, _ in items[:n])
+        if record is not None:
+            record[sector] = [
+                {"name": raw,
+                 "rank": None if score == float("-inf") else round(float(score), 1),
+                 "strength": parts.get("strength"), "volume": parts.get("volume"),
+                 "structure": parts.get("structure"), "lead": parts.get("lead"),
+                 "kept": i < n}
+                # the kept names plus the three the trim dropped: the audit can
+                # then show who nearly made it, and by how much
+                for i, (score, raw, parts) in enumerate(items[:n + 3])]
         if len(items) > n:
             def _fmt(item) -> str:
                 score, raw, parts = item
@@ -760,6 +780,162 @@ def _lag_text(hhmm: str) -> str:
 # What actually happened today, sent once after the close: how many candles were
 # scanned, whether Yahoo's 1m feed was live enough for early alerts, and how long
 # after each close the confirmed alerts went out.
+
+SECTOR_HIST_EVERY = 3          # one persistence sample every three candles
+
+
+def _note_sector_day(st: dict, md, bar: str) -> None:
+    """Keep the day's persistent-sector history, for the end-of-day report.
+
+    Every sector's persistence is computed on every candle and then thrown away.
+    The report needs the shape of the day: who led at 09:30, who was still
+    leading at 14:00, and what the score did in between. One sample every three
+    candles (15 minutes) is enough to draw that and cheap enough to keep.
+    """
+    book = st.setdefault("stats", {}).setdefault("sector_hist", {})
+    snaps = getattr(md, "sectors", None) or {}
+    if not snaps:
+        return
+    picked = md.pick_sector if md.pick_side in (1, -1) else ""
+    for name, snap in snaps.items():
+        side = int(snap.get("side") or 0) or 1
+        persist = float(snap.get(f"persist_{'bull' if side == 1 else 'bear'}") or 0.0)
+        h = book.get(name)
+        if h is None:
+            h = book[name] = {"first": bar, "max": persist, "min": persist, "n": 0,
+                              "series": [], "picks": 0}
+        h["n"] = int(h.get("n") or 0) + 1
+        h["last"] = bar
+        h["max"] = max(float(h.get("max") or 0.0), persist)
+        h["min"] = min(float(h.get("min", 999.0)), persist)
+        h["persist"] = persist
+        h["side"] = side
+        h["day_ret"] = round(float(snap.get("day_ret") or 0.0), 2)
+        h["intra"] = round(float(snap.get("intra_ret") or 0.0), 2)
+        h["rs"] = round(float(snap.get("rs") or 0.0), 2)
+        h["pos"] = round(float(snap.get("pos") or 0.0), 1)
+        h["qualified"] = bool(snap.get("qualified"))
+        if name == picked:
+            h["picks"] = int(h.get("picks") or 0) + 1
+        series = h.setdefault("series", [])
+        if not series or (h["n"] % SECTOR_HIST_EVERY == 0):
+            series.append([bar[-5:], round(persist)])
+
+
+def _note_timeline(st: dict, md, bar: str, pick: str, side: int) -> None:
+    """One row per candle: the market's tilt and every sector's numbers.
+
+    This is the day's tape as the scanner saw it — what the report's timeline is
+    drawn from and what the audit attachment ships in full. Short keys on
+    purpose: it is written on every candle of a five-hour session and lives in
+    the same JSON as the alert ledger.
+    """
+    snaps = getattr(md, "sectors", None) or {}
+    if not snaps:
+        return
+    row = {"b": bar[-5:], "tilt": int(getattr(md, "dir_state", 0) or 0),
+           "conf": int(getattr(md, "dir_conf", 0) or 0),
+           "label": getattr(md, "dir_label", ""), "regime": getattr(md, "regime", ""),
+           "pick": pick, "side": int(side or 0), "sec": {}}
+    for name, snap in snaps.items():
+        def num(key, nd=0):
+            try:
+                return round(float(snap.get(key) or 0.0), nd)
+            except (TypeError, ValueError):
+                return 0
+        row["sec"][name] = [num("persist_bull"), num("persist_bear"), num("day_ret", 2),
+                            num("intra_ret", 2), 1 if snap.get("qualified") else 0]
+    _record_timeline(st, row)
+
+
+def _record_timeline(st: dict, row: dict) -> None:
+    """Append one candle to the day's tape, replacing it if it is the same one.
+
+    Bot 3 has its own ledger and sees the pick rather than the whole decision, so
+    it builds the row itself and calls this — one format, one reader, two bots.
+    """
+    book = st.setdefault("stats", {}).setdefault("timeline", [])
+    if book and book[-1].get("b") == row.get("b"):
+        book[-1] = row                      # the same candle, polled again
+    else:
+        book.append(row)
+    del book[:-120]                          # a session is 75 candles; keep a day
+
+
+def _note_leadership(st: dict, bar: str, record: dict) -> None:
+    """The five names each scanned sector put forward on this candle.
+
+    ``sector_leaders`` already ranks them (strength · volume · structure) and
+    logs the three legs; the report needs the same numbers *after* the fact, to
+    say which names kept leading and what happened to them.
+    """
+    if not record:
+        return
+    book = st.setdefault("stats", {}).setdefault("leadership", [])
+    row = {"b": bar[-5:], "sec": record}
+    if book and book[-1].get("b") == bar[-5:]:
+        book[-1] = row
+    else:
+        book.append(row)
+    del book[:-120]
+
+
+def _note_weak(st: dict, why: str) -> None:
+    """Count a momentum-gate refusal by *why*, not just as "weak"."""
+    key = ("reversing" if "reversing" in why else
+           "sideways" if "sideways" in why else
+           "behind its sector's runners" if "runners" in why else
+           "weak momentum")
+    book = st.setdefault("stats", {}).setdefault("weak", {})
+    book[key] = int(book.get(key, 0)) + 1
+
+
+def _note_trim(st: dict, sector: str, kept: int, total: int) -> None:
+    """How many names of a sector the trim dropped on this candle."""
+    if total <= kept:
+        return
+    book = st.setdefault("stats", {}).setdefault("trim", {})
+    slot = book.setdefault(sector, {"kept": 0, "dropped": 0, "candles": 0})
+    slot["kept"] = int(slot.get("kept") or 0) + kept
+    slot["dropped"] = int(slot.get("dropped") or 0) + (total - kept)
+    slot["candles"] = int(slot.get("candles") or 0) + 1
+
+
+def _close_trade(st: dict, raw: str, pos: dict, price: float, why: str, hhmm: str) -> None:
+    """File a finished trade with its R, so the day's report can score it.
+
+    Positions are deleted when their exit alert goes out, which left the day's
+    summary able to count entries but not to say what they did.
+    """
+    try:
+        entry = float(pos.get("entry") or 0.0)
+        risk = float(pos.get("risk") or 0.0)
+        long = pos.get("side") == "BUY"
+        r = ((price - entry) if long else (entry - price)) / risk if risk else 0.0
+        qty = int(pos.get("qty") or costs.quantity(entry))
+        money = costs.round_trip(pos.get("side") or "BUY", entry, price, qty)
+        book = st.setdefault("stats", {}).setdefault("closed", [])
+        book.append({"raw": raw, "side": pos.get("side"), "time": hhmm, "why": why,
+                     "entry": round(entry, 2), "exit": round(float(price), 2),
+                     "r": round(r, 2),
+                     "qty": qty, "gross": money["gross"], "costs": money["costs"],
+                     "net": money["net"],
+                     "net_r": round(money["net"] / (risk * qty), 2) if risk and qty else 0.0,
+                     "t_hit": len(pos.get("hit_targets") or ()),
+                     "stop0": pos.get("sl0"),
+                     "t1": pos.get("t1"), "t2": pos.get("t2"), "t3": pos.get("t3"),
+                     "entry_bar": pos.get("entry_bar"),
+                     "sector": pos.get("sector") or (st.get("scan") or {}).get("sector") or ""})
+    except Exception:                      # bookkeeping must never break an alert
+        log.exception("could not file the closed trade for %s", raw)
+
+
+def _eod():
+    """The report module, imported lazily (it reads back from this one)."""
+    from . import eod
+
+    return eod
+
 
 def _bump(st: dict, key: str, n: float = 1) -> None:
     stats = st.setdefault("stats", {})
@@ -1627,6 +1803,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             sl_hit = bool(row["Low"] <= sl) if side == "BUY" else bool(row["High"] >= sl)
             if sl_hit:
                 if "SL" in announced:           # already delivered: just reconcile
+                    _close_trade(st, raw, pos, sl, "SL HIT", hhmm)
                     del positions[raw]
                     changed = True
                     log.warning("SL for %s already announced; dropping stale position", raw)
@@ -1635,6 +1812,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                     pending.append(raw)
                     break
                 ledger[_alert_key(raw, pos, "SL")] = hhmm
+                _close_trade(st, raw, pos, sl, "SL HIT", hhmm)
                 del positions[raw]
                 st.setdefault("sent", {}).setdefault(raw, {"code": "SL", "time": hhmm})
                 changed = True
@@ -1647,6 +1825,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
             if ema is not None and isfinite(ema) and trail_broken(side, close, float(ema),
                                                                   risk=_risk_of(pos)):
                 if "EXIT" in announced:         # already delivered: just reconcile
+                    _close_trade(st, raw, pos, close, "EMA9 EXIT", hhmm)
                     del positions[raw]
                     changed = True
                     log.warning("EMA9 exit for %s already announced; dropping stale position", raw)
@@ -1656,6 +1835,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                     pending.append(raw)
                     break
                 ledger[_alert_key(raw, pos, "EXIT")] = hhmm
+                _close_trade(st, raw, pos, close, "EMA9 EXIT", hhmm)
                 del positions[raw]
                 # Block a new entry on the same IST session after an exit.
                 st.setdefault("sent", {}).setdefault(raw, {"code": "EXIT", "time": hhmm})
@@ -1665,6 +1845,7 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                 break
 
             pos["last_bar"] = ts.isoformat()
+            pos["last_close"] = round(float(row["Close"]), 2)   # scored at the close
             changed = True
     if changed or pending:
         _store_pending(st, pending)
@@ -1838,6 +2019,10 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
 
     if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
+        _note_sector_day(st, md, md.bar_time)                # the day's sector shape
+        _note_timeline(st, md, md.bar_time,
+                       md.pick_sector if scanning else "WAIT",
+                       md.pick_side if scanning else 0)      # the day's tape
         _bump(st, "candles")
         _bump(st, "picks", 1 if scanning else 0)
         if scanning:
@@ -1941,7 +2126,18 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 raw for raw in unsettled if raw not in result.get("pending", []))
     sd1 = data.fetch_daily(current, period_1d)
 
-    leaders = _sector_leaders(stocks, tickers, sector_of, side_of, sm5, current, md, last)
+    lead_rank: dict = {}
+    leaders = _sector_leaders(stocks, tickers, sector_of, side_of, sm5, current, md, last,
+                              record=lead_rank)
+    if not allow_stale and sector_top_n():
+        _note_leadership(st, last.strftime("%Y-%m-%d %H:%M"), lead_rank)
+    if not allow_stale and sector_top_n():
+        per_sector: dict[str, list[int]] = {}
+        for raw in stocks:
+            slot = per_sector.setdefault(sector_of[raw], [0, 0])
+            slot[0 if raw in leaders else 1] += 1        # [kept, dropped]
+        for sector, (kept, dropped) in per_sector.items():
+            _note_trim(st, sector, kept, kept + dropped)
     _note_scan_lag(st, last, stale=allow_stale)
     new_signals: list[dict] = []
     handled: set[str] = set(missing)
@@ -2074,6 +2270,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if not runs:
             # The count is open by default; this is what keeps a name out.
             log.info("not running: %s @%s — %s (rank %.0f)", raw, best.time, why_not, cand_rank)
+            _note_weak(st, why_not)
             _note_reject(st, "weak", raw, f"{raw} {best.time} — {why_not}", per_bar=best.time)
             if early and not allow_stale:
                 _cancel_early(st, raw, early, why_not, code="weak", close=close_now)
@@ -2090,6 +2287,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         _note_reject(st, "weak", cand["raw"], f"{cand['raw']} {cand['best'].time} — "
                      f"rank {cand['rank']:.0f} is behind its sector's runners",
                      per_bar=cand["best"].time)
+        _note_weak(st, "behind its sector's runners")
         if cand.get("early") and not allow_stale:
             _cancel_early(st, cand["raw"], cand["early"],
                           "behind its sector's runners on momentum", code="weak",
@@ -2144,7 +2342,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "time": best.time,
             "price": best.price,
         }
-        positions[raw] = new_position(best.side, plan, last.isoformat(), session)
+        positions[raw] = new_position(best.side, plan, last.isoformat(), session,
+                                     sector=sector_of[raw])
         _save(st)  # persist each successful send in long-running live mode
         log.info("ALERT %s %s entry=%.2f sl=%.2f EMA9=%.4f @ %s (sent %s IST)",
                  best.name, raw, plan.entry, plan.sl, plan.ema9, best.time,
@@ -2359,7 +2558,8 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
                                       "time": hit["sig"].time, "price": plan.entry}
     st.setdefault("positions", {})[raw] = new_position(hit["sig"].side, plan,
                                                        bar.isoformat(),
-                                                       str(session_date(bar)))
+                                                       str(session_date(bar)),
+                                                       sector=(item or {}).get("sector") or "")
     st.setdefault("catchup", {})[raw] = {
         "bar": bar.strftime("%Y-%m-%d %H:%M"), "session": str(session_date(bar)),
         "fired": hit["sig"].time, "side": hit["sig"].side, "code": hit["sig"].code,
@@ -2593,7 +2793,20 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
         if t.hour > 15 or (t.hour == 15 and t.minute >= 33):
             try:  # one summary of the session, never repeated
                 st1 = state.reset_if_new_day(state.load(), str(now.date()))
-                text = None if (st1.get("stats") or {}).get("reported") else format_summary(st1)
+                if (st1.get("stats") or {}).get("reported"):
+                    text = None
+                elif _eod().report_enabled():
+                    text = None          # the full report is sent below, in parts
+                    if _eod().send_eod(st1, bot="5m", send=telegram.send, dry_run=_dry()):
+                        st1["stats"]["reported"] = True
+                        _save(st1)
+                        log.info("end-of-day report sent (%d candles)", int(
+                            (st1.get("stats") or {}).get("candles") or 0))
+                    else:
+                        log.error("end-of-day report was NOT delivered — Telegram refused a "
+                                  "part; the session is over, so no later run will send it")
+                else:
+                    text = format_summary(st1)
                 if text:
                     # Said out loud either way: 18 Nov's 1m summary went out (or did
                     # not) without a trace, and the log could not answer the question.

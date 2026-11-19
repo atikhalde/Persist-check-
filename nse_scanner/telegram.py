@@ -12,6 +12,7 @@ import requests
 log = logging.getLogger("nse_scanner.telegram")
 
 API = "https://api.telegram.org/bot{token}/sendMessage"
+API_DOC = "https://api.telegram.org/bot{token}/sendDocument"
 
 _PARSE_ERR = "can't parse entities"
 _TAGS = re.compile(r"</?(?:b|strong|i|em|u|s|code|pre)>", re.IGNORECASE)
@@ -172,6 +173,50 @@ def send_bot3(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> 
         print(text)
         return False
     return _send_to(token, chat, text, parse_mode=parse_mode, label="bot3")
+
+
+def send_document(path, caption: str = "", *, bot: int = 1, dry_run: bool = False) -> bool:
+    """Upload a file to a chat — the end-of-day audit's JSON and workbook.
+
+    Same bots as the messages: ``bot=1`` is the primary (5m) channel, ``bot=3``
+    the 1-minute one. A missing configuration prints the path instead of failing,
+    and the caller decides what an undelivered attachment means.
+    """
+    path = str(path)
+    if dry_run or os.environ.get("DRY_RUN", "0") == "1":
+        log.info("DRY-RUN telegram document (%s): %s", bot, path)
+        return True
+    if bot == 3:
+        token, chat = third_config_from_env()
+        label = "bot3-document"
+    else:
+        token, chat = config_from_env()
+        label = "document"
+    if not token or not chat:
+        log.error("TELEGRAM_BOT_TOKEN%s / TELEGRAM_CHAT_ID%s missing — not sending %s",
+                  "" if bot == 1 else f"_{bot}", "" if bot == 1 else f"_{bot}", path)
+        return False
+    last = None
+    for attempt in range(3):
+        try:
+            with open(path, "rb") as fh:
+                resp = requests.post(
+                    API_DOC.format(token=token),
+                    data={"chat_id": chat, "caption": caption or "",
+                          "disable_notification": True},
+                    files={"document": fh},
+                    timeout=60,
+                )
+            if resp.status_code == 200 and resp.json().get("ok"):
+                return True
+            last = f"{resp.status_code} {resp.text[:200]}"
+            if resp.status_code < 500 and "retry later" not in resp.text.lower():
+                break
+        except requests.RequestException as exc:
+            last = str(exc)
+        time.sleep(1.5 * (attempt + 1))
+    log.error("telegram %s upload failed for %s: %s", label, path, last)
+    return False
 
 
 def ping() -> bool:

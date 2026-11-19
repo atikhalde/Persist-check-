@@ -59,6 +59,7 @@ class Scan1mFixture(TestCase):
             "SCAN1M_ALERT_CAP": "0",
             "SCAN1M_EARLY_PER_DAY": "1", "SCAN1M_CANCEL_MESSAGE": "0",
             "SCAN1M_MARKET_SOURCE": "ledger", "TELEGRAM_BOT_TOKEN_3": "",
+            "EOD_REPORT": "0",          # the report itself: tests/test_eod.py
             "TELEGRAM_CHAT_ID_3": "",
         }, clear=False)
         self.env.start()
@@ -105,6 +106,11 @@ class Scan1mFixture(TestCase):
         self.bot3 = self.mocks[11]
         self.bot1 = self.mocks[12]
         self.engine = self.mocks[8]
+        # the end-of-day audit upload; patched outside ``self.patches`` so the
+        # indices above stay exactly where the tests expect them
+        upload = patch.object(scan1m.telegram, "send_document", return_value=True)
+        upload.start()
+        self.addCleanup(upload.stop)
 
     # ── fixtures ────────────────────────────────────────────────────────────
     def fetch(self, tickers, period, interval):
@@ -173,6 +179,77 @@ class FourNameWorld(Scan1mFixture):
         return [base.StockSignal(raw, 101, "BUY-EX", "BUY", BAR.strftime("%H:%M"),
                                  self.LAST[raw], 70, "Strong", 20, 1, "test",
                                  self.LAST[raw] - 1.0)]
+
+class Bot3DayBookTests(FourNameWorld):
+    """Bot 3 keeps the same day books as bot 1, so its report can describe the day.
+
+    Its ledger had no ``scan`` book at all, so the 1m report could only ever say
+    "last pick WAIT", and no timeline or leadership, so the sections that describe
+    the tape were missing from its half of the audit.
+    """
+
+    SNAP = {"IT": [78, 8, 1.4, 0.6, 1], "AUTO": [61, 12, 0.9, 0.3, 0]}
+
+    def setUp(self):
+        super().setUp()
+        self.pick["snap"] = dict(self.SNAP)
+
+    def ledger_now(self) -> dict:
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        return self.ledger()
+
+    def test_the_pick_is_written_to_the_ledger(self):
+        st = self.ledger_now()
+        self.assertEqual(st["scan"]["sector"], "IT")
+        self.assertEqual(st["scan"]["side"], 1)
+        self.assertEqual(st["scan"]["label"], "BULL")
+        # the decision bar: the last completed 5m candle, exactly as bot 1 keys it
+        self.assertEqual(st["scan"]["bar"],
+                         (BAR - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M"))
+
+    def test_the_sector_board_is_written_as_the_day_timeline(self):
+        st = self.ledger_now()
+        rows = st["stats"]["timeline"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["b"], "09:55")
+        self.assertEqual(rows[0]["pick"], "IT")
+        self.assertEqual(rows[0]["tilt"], 1)
+        self.assertEqual(rows[0]["sec"]["IT"], [78, 8, 1.4, 0.6, 1])
+
+    def test_the_same_candle_is_one_row_not_one_per_pass(self):
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        scan1m.confirm_pass(BAR, now=CLOSE)
+        rows = self.ledger()["stats"]["timeline"]
+        self.assertEqual(len(rows), 1)
+
+    def test_the_ranking_is_kept_with_its_three_legs(self):
+        st = self.ledger_now()
+        rows = st["stats"]["leadership"]
+        self.assertEqual(rows[-1]["b"], "09:55")
+        names = {r["name"]: r for r in rows[-1]["sec"]["IT"]}
+        self.assertIn("BBB", names)
+        self.assertIn("rank", names["BBB"])
+        self.assertIn("kept", names["BBB"])
+
+    def test_the_report_reads_the_bot3_books(self):
+        from nse_scanner import audit, eod
+
+        st = self.ledger_now()
+        stats = audit.sector_stats(st)
+        self.assertIn("IT", stats)
+        self.assertEqual(stats["IT"]["max"], 78.0)
+        text = eod.format_eod(st, bot="1m")
+        self.assertIn("ast pick <b>IT</b>", text)
+        self.assertIn("<b>Sector momentum timeline</b>", text)
+        self.assertIn("<b>Persistent-sector performance</b>", text)
+        self.assertIn("first pick 09:55", text)
+
+    def test_a_wait_candle_is_still_a_row_of_the_tape(self):
+        self.pick["sector"], self.pick["side"] = "WAIT", 0
+        st = self.ledger_now()
+        self.assertEqual(st["scan"]["sector"], "WAIT")
+        self.assertEqual(st["stats"]["timeline"][0]["pick"], "WAIT")
+
 
 class Bot3EntryRuleTests(FourNameWorld):
     """One pick is one risk factor on both bots, and the leader goes first.
@@ -707,6 +784,7 @@ class AlertParityTests(Scan1mFixture):
     def open_trade(self, **over):
         st = self.ledger() or {"session": str(BAR.date()), "sent": {}, "positions": {}}
         pos = {"side": "BUY", "entry": 100.0, "sl": 99.0, "entry_ema9": 100.0,
+               "qty": 1000, "sector": "IT", "risk": 1.0,
                "t1": None, "t2": None, "t3": None,
                "entry_bar": (BAR - timedelta(minutes=10)).isoformat(),
                "last_bar": (BAR - timedelta(minutes=10)).isoformat()}
@@ -737,6 +815,19 @@ class AlertParityTests(Scan1mFixture):
         self.assertEqual(st["positions"], {})
         self.assertEqual(st["sent"]["ABC"]["code"], "SL")     # no re-entry, as on bot 1
         self.bot1.assert_not_called()
+
+    def test_the_stop_lands_in_bot3_s_book_with_its_money(self):
+        self.open_trade(sl=99.995)                       # quiet bars dip to 99.99
+        self.minutes = one_minute(*range(0, 6))
+        scan1m.track_positions(BAR)
+        trade = self.ledger()["stats"]["closed"][-1]
+        self.assertEqual(trade["raw"], "ABC")
+        self.assertEqual(trade["qty"], 1000)
+        self.assertAlmostEqual(trade["gross"], -5.0, places=2)       # 1000 sh × 0.005
+        self.assertAlmostEqual(trade["costs"], 100.0, places=2)      # ₹50 a side
+        self.assertAlmostEqual(trade["net"], -105.0, places=2)
+        self.assertAlmostEqual(trade["net_r"], -0.10, places=2)      # 105 / (1.00 × 1000)
+        self.assertEqual(trade["sector"], "IT")
 
     def test_no_positions_no_message(self):
         self.assertEqual(scan1m.track_positions(BAR), [])
@@ -1454,7 +1545,8 @@ class LoopTests(TestCase):
         scan1m._md_cache.clear()
         scan1m._last_nifty_bar = None
         self.env = patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_SUMMARY": "1",
-                                             "SCAN1M_FIRST_MINUTE": "1"}, clear=False)
+                                             "SCAN1M_FIRST_MINUTE": "1",
+                                             "EOD_REPORT": "0"}, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.patches = [
