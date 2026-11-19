@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from types import SimpleNamespace
 from datetime import datetime, time as clock_time, timedelta
 from math import isfinite
 
@@ -695,6 +696,7 @@ def format_summary(st: dict) -> str | None:
              f" · cancelled {x.get('cancelled', 0)} · unverified {x.get('unverified', 0)}",
              _summary_not_held(x),
              f"Entries {x.get('entries', 0)}"
+             + (f" · {x['late_entries']} from late leaders" if x.get("late_entries") else "")
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
              _summary_rejects(st),
@@ -1931,7 +1933,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # here and forgotten — 18 Nov: the whole CDUR book. The fresh entries of this
     # candle go out first; then the labelled heads-up for what the pick missed.
     if late:
-        _send_late_leaders(st, md, last, late)
+        _send_late_leaders(st, md, last, late, side_of=side_of)
 
     if not allow_stale:
         # Early alerts on names the close scan never looked at (sector switched).
@@ -2008,7 +2010,129 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
     late.append({"raw": raw, "hit": hit, "sector": sector})
 
 
-def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict]) -> None:
+# ── the late leader as an entry, not only a heads-up ─────────────────────────
+#: ``LATE_LEADER_ENTRY`` (1): a leader that fired before its sector was picked
+#: may still be *entered* at the price now, with the fire candle's stop.
+#:
+#: The heads-up alone is what 19 Nov produced: at 10:01 bot 3 announced HAVELLS
+#: (+1.8R), WHIRLPOOL (+1.8R), KALYANKJIL (+1.4R), LGEINDIA (+1.3R), DIXON
+#: (+0.4R) and VOLTAS (+0.3R) as "LATE LEADER", labelled *not an entry*, and the
+#: day's five entries were TECHM, TATAELXSI, HCLTECH, BAJAJ-AUTO and EXIDEIND.
+#: AMBER and VOLTAS were never more than a word in that list.
+#:
+#: Two of those six were still live trades (VOLTAS, DIXON: under 0.5R from the
+#: fire, stop untouched); the other four had already run 1.3R-1.8R, and the ones
+#: that had passed T1 are refused by :func:`late_plan`. So the rule enters what
+#: is still there and refuses what has already paid — it cannot turn the list
+#: into a chase, and it keeps the existing age (30 min) and distance (2R) gates.
+def late_leader_entry() -> bool:
+    return os.environ.get("LATE_LEADER_ENTRY", "1").strip() != "0"
+
+
+def late_plan(hit) -> TradePlan | None:
+    """The late leader's trade taken *now*, or ``None`` if it is no longer there.
+
+    Entry is the current price (the candle the scan is judging), the stop is the
+    fire candle's untouched EMA9 stop, and the targets are the fire's pivots.
+    Refused when the price is already through that stop (the setup is dead) or at
+    and beyond T1 (the move has paid — taking it there is the chase the catch-up
+    window exists to avoid).
+    """
+    sig, plan = hit.get("sig"), hit.get("plan")
+    if sig is None or plan is None or plan.risk is None or plan.t1 is None:
+        return None
+    price = float(hit.get("price") or 0.0)
+    long = sig.side == "BUY"
+    if price <= 0:
+        return None
+    if (price - plan.sl if long else plan.sl - price) <= 0:
+        return None
+    if (price >= plan.t1) if long else (price <= plan.t1):
+        return None
+    return TradePlan(entry=price, ema9=plan.ema9, sl=plan.sl,
+                     risk=abs(price - plan.sl), t1=plan.t1, t2=plan.t2, t3=plan.t3,
+                     pivot_names=plan.pivot_names, basis=plan.basis, skipped=plan.skipped)
+
+
+def format_late_entry(raw: str, hit: dict, plan: TradePlan, md, bar: datetime,
+                      *, sector: str | None = None, bot: str = "5m",
+                      dual: str = "") -> str:
+    """The catch-up entry alert — every field says what it is, so it cannot be
+    mistaken for a signal that fired on this candle."""
+    sig, fire = hit["sig"], hit["plan"]
+    arrow = "🟢" if sig.side == "BUY" else "🔴"
+    risk_pct = plan.risk / plan.entry * 100.0 if plan.entry else 0.0
+    return (
+        f"⏰ {arrow} <b>LATE LEADER ENTRY — {sig.side}</b>  |  <b>{sig.name}</b>  {raw}\n"
+        f"{telegram.esc(sector or md.pick_sector)}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
+        + (f"<i>{telegram.esc(dual)}</i>\n" if dual else "")
+        + f"Fired <b>{sig.time}</b> as {sig.name} @ {fire.entry:.2f} · "
+        f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
+        f"Entry <b>{plan.entry:.2f}</b> (this candle's close) · SL {plan.sl:.2f} "
+        f"(the fire candle's EMA9 stop, untouched since)\n"
+        f"Risk {plan.risk:.2f} ({risk_pct:.2f}%) · {hit['r']:+.1f}R from the fire  |  "
+        f"targets: {_target_text(plan)}\n"
+        f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
+        + (f"Taken from the 5m close scan ({bot}).\n" if bot == "5m"
+           else "Taken by the 1m scanner on this minute.\n")
+        + "<b>Catch-up entry</b> — the crossover fired before its sector was picked and "
+        "the trade is still before T1. The stop is the fire candle's, not this candle's."
+    )
+
+
+def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
+                    bot: str = "5m", send=None, save=None, dry=None,
+                    side_of: dict | None = None, dual: str = "") -> bool:
+    """Send ``item`` as a catch-up entry and book it. ``False`` = keep the heads-up.
+
+    ``send``/``save``/``dry`` are the caller's: bot 3 has its own ledger file and
+    its own Telegram bot, and a shared bookkeeper must not write the 5m state.
+    """
+    raw, hit = item["raw"], item["hit"]
+    if isinstance(md, dict):                 # bot 3 passes its pick as a dict
+        md = SimpleNamespace(pick_sector=md.get("sector"), dir_label=md.get("label"),
+                             dir_conf=md.get("conf"))
+    if not late_leader_entry():
+        return False
+    plan = late_plan(hit)
+    if plan is None:
+        return False
+    if scan_require_target() and not _plan_has_target(plan):
+        return False
+    side = 1 if hit["sig"].side == "BUY" else -1
+    key = pick_cap_key(item.get("sector") or md.pick_sector,
+                       int((side_of or {}).get(raw, side)))
+    if not entry_cap_room(st, key):
+        log.info("cap: LATE LEADER ENTRY %s not taken — %s already has %d entries",
+                 raw, key, max_entries_per_pick())
+        return False
+    send = send or telegram.send
+    if not send(format_late_entry(raw, hit, plan, md, bar, sector=item.get("sector"),
+                                 bot=bot, dual=dual), dry_run=(dry or _dry)()):
+        log.warning("Telegram failed for the late-leader entry %s; leaving it unsent", raw)
+        return False
+    take_entry_slot(st, key)
+    _bump(st, "entries")
+    _bump(st, "late_entries")
+    st.setdefault("sent", {})[raw] = {"code": hit["sig"].code, "name": hit["sig"].name,
+                                      "time": hit["sig"].time, "price": plan.entry}
+    st.setdefault("positions", {})[raw] = new_position(hit["sig"].side, plan,
+                                                       bar.isoformat(),
+                                                       str(session_date(bar)))
+    st.setdefault("catchup", {})[raw] = {
+        "bar": bar.strftime("%Y-%m-%d %H:%M"), "session": str(session_date(bar)),
+        "fired": hit["sig"].time, "side": hit["sig"].side, "code": hit["sig"].code,
+        "price": plan.entry, "at": now.strftime("%H:%M:%S"), "entry": True}
+    (save or _save)(st)
+    log.info("LATE LEADER ENTRY %s %s fired %s as %s at %.2f (%.1fR from the fire), "
+             "sector %s picked %s", raw, hit["sig"].side, hit["sig"].time,
+             hit["sig"].name, plan.entry, hit["r"], item.get("sector"),
+             bar.strftime("%H:%M"))
+    return True
+
+
+def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict],
+                       *, side_of: dict | None = None) -> None:
     """Send the labelled heads-up — one per name, or one digest for a burst."""
     from .scan1m import catchup_digest, format_catchup, format_catchup_digest
 
@@ -2023,6 +2147,16 @@ def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict]) -> None:
     if not todo:
         return
     todo.sort(key=lambda item: -item["hit"]["r"])
+    # What is still a live trade becomes an entry; what has already paid, been
+    # stopped out or run past 2R stays a heads-up (``LATE_LEADER_ENTRY=0`` keeps
+    # every one of them a heads-up, as on 19 Nov).
+    rest = [item for item in todo
+            if not take_late_entry(st, md, bar, item, now,
+                                   side_of=side_of,
+                                   dual=alt_note if item["sector"] == alt else "")]
+    if not rest:
+        return
+    todo = rest
     digest = len(todo) > 1 and catchup_digest()
     all_sent = (telegram.send(format_catchup_digest(todo, pick, bar, now, bot="5m", closed=True),
                               dry_run=_dry()) if digest else True)

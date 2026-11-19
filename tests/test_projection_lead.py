@@ -423,11 +423,15 @@ class LeaderCatchupTests(LeaderFixture):
     signal on the candle being scanned — and before this it stayed silent while
     the followers, which fire on the later candles, got their alerts. Bot 3 now
     announces it once, labelled, bounded and only while the trade is still worth
-    taking. It is never an entry: ``sent`` and ``positions`` stay untouched.
+    These pin the heads-up itself, so the catch-up *entry* is switched off here;
+    ``LateLeaderEntryTests`` in ``test_live_alerts`` covers the entry path.
     """
 
     def setUp(self):
         super().setUp()
+        self.ctx = patch.dict("os.environ", {"LATE_LEADER_ENTRY": "0"}, clear=False)
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
         self.fire_time = "09:40"                  # fired before the 10:00 pick
         self.five = {s: frame_5m(*[BAR - timedelta(minutes=5 * i) for i in range(25, 0, -1)],
                                  close=100.0) for s in ("NIFTY", "VIX", "CNXFMCG", "CNXIT")}
@@ -456,6 +460,26 @@ class LeaderCatchupTests(LeaderFixture):
         self.assertNotIn("ITC", ledger["positions"])   # no trade opened
         scan1m.run_minute(BAR, now=MIN3)               # the loop's next minute
         self.assertEqual(len(self.bot3), 1)            # once per name per session
+
+    def test_the_late_leader_is_entered_while_it_is_still_before_its_target(self):
+        """Bot 3 took no CDUR entry on 19 Nov while CDUR was the pick for 30 candles.
+
+        AMBER and VOLTAS were in the 10:01 LATE LEADER list, labelled "not an
+        entry". A leader still before T1 is still a trade, so it is entered.
+        """
+        with patch.dict("os.environ", {"LATE_LEADER_ENTRY": "1"}, clear=False):
+            out = scan1m.run_minute(BAR, now=MIN1)
+        self.assertEqual([m["symbol"] for m in out], ["ITC"])
+        self.assertTrue(out[0]["late_entry"])
+        self.assertIn("LATE LEADER ENTRY", self.bot3[0])
+        self.assertIn("Catch-up entry", self.bot3[0])
+        ledger = scan1m.load_ledger()
+        self.assertIn("ITC", ledger["sent"])            # an entry, not a heads-up
+        self.assertIn("ITC", ledger["positions"])
+        self.assertEqual(ledger["positions"]["ITC"]["entry"], 100.0)
+        self.assertEqual(ledger["stats"]["late_entries"], 1)
+        self.assertEqual(ledger["stats"]["entries"], 1)
+        self.assertNotIn("catchup", ledger["stats"])    # no heads-up alongside it
 
     def test_the_knob_turns_it_off(self):
         with patch.dict("os.environ", {"SCAN1M_LEADER_CATCHUP": "0"}, clear=False):

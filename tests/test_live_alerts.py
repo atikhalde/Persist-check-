@@ -1200,8 +1200,15 @@ class LateLeaderTests(LiveAlertTests):
     nothing until the 15:33 summary.
     """
 
+    #: These tests pin the heads-up wording, so they switch the catch-up *entry*
+    #: off; ``LateLeaderEntryTests`` below turns it on.
+    LATE_ENTRY = "0"
+
     def setUp(self):
         super().setUp()
+        self.ctx = patch.dict("os.environ", {"LATE_LEADER_ENTRY": self.LATE_ENTRY})
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
         # The fire candle needs 9 in-session 5m slots before it for its EMA9 (the
         # stop of the catch-up plan) to exist at all: 09:15..09:55.
         self.times = ([BAR - timedelta(minutes=5 * i) for i in range(9, 0, -1)]
@@ -1258,6 +1265,70 @@ class LateLeaderTests(LiveAlertTests):
             pipeline.run_once()
         self.assertEqual([c for c in self.send.call_args_list if "LATE LEADER" in c.args[0]], [])
         self.assertIn("ABC 09:55", state.load()["stats"]["rejected"]["earlier"]["ABC"])
+
+
+class LateLeaderEntryTests(LiveAlertTests):
+    """The late leader as an *entry*, not only a heads-up (19 Nov, AMBER/VOLTAS).
+
+    The heads-up is a message about a trade nobody took: bot 3's 10:01 list named
+    nine CDUR names at 0.3R-1.8R, labelled "not an entry", and the day's five
+    entries were all elsewhere. A leader that is still before its first target is
+    still a trade, so it is taken at the price now with the fire candle's stop.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ctx = patch.dict("os.environ", {"LATE_LEADER_ENTRY": "1"})
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
+        self.times = ([BAR - timedelta(minutes=5 * i) for i in range(9, 0, -1)]
+                      + [BAR, BAR + timedelta(minutes=5)])
+
+    def test_a_late_leader_before_its_target_is_entered(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        entry = [t for t in texts if "LATE LEADER ENTRY" in t]
+        self.assertEqual(len(entry), 1, texts)
+        self.assertIn("Catch-up entry", entry[0])
+        self.assertIn("Fired <b>09:55</b>", entry[0])
+        self.assertNotIn("Not an entry alert", entry[0])
+        st = state.load()
+        self.assertEqual(st["stats"]["late_entries"], 1)
+        self.assertEqual(st["stats"]["entries"], 1)
+        self.assertEqual(st["positions"]["ABC"]["entry"], 100.0)
+        self.assertLess(st["positions"]["ABC"]["sl"], 100.0)   # the fire candle's EMA9 stop
+        self.assertTrue(st["catchup"]["ABC"]["entry"])
+
+    def test_the_entry_fills_the_pick_cap(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
+            pipeline.run_once()
+            self.now = BAR + timedelta(minutes=11)
+            self.times = self.times + [BAR + timedelta(minutes=10)]
+            pipeline.run_once()
+        st = state.load()
+        self.assertEqual(st["stats"]["late_entries"], 1)
+        self.assertEqual(st["pick_entries"], {"IT long": 1})
+
+    def test_a_trade_that_has_already_paid_is_refused_by_the_plan(self):
+        plan = TradePlan(100.0, 99.0, 99.0, 1.0, 101.0, 102.0, 103.0)
+        hit = {"sig": signal(), "plan": plan, "price": 100.5, "r": 0.5, "age": 5.0}
+        got = pipeline.late_plan(hit)
+        self.assertIsNotNone(got)
+        self.assertEqual((got.entry, got.sl, got.risk), (100.5, 99.0, 1.5))
+        self.assertEqual((got.t1, got.pivot_names), (101.0, (None, None, None)))
+        self.assertIsNone(pipeline.late_plan({**hit, "price": 101.0}))   # at T1: paid
+        self.assertIsNone(pipeline.late_plan({**hit, "price": 98.5}))    # through the stop
+
+    def test_the_knob_restores_the_plain_heads_up(self):
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
+        with patch.dict("os.environ", {"LATE_LEADER_ENTRY": "0"}):
+            pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        self.assertEqual([t for t in texts if "LATE LEADER ENTRY" in t], [])
+        self.assertEqual([t for t in texts if "Not an entry alert" in t].__len__(), 1)
+        self.assertNotIn("ABC", state.load()["positions"])
 
 
 class TradeRecordTests(TestCase):

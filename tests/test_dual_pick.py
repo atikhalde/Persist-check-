@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 
 from nse_scanner import pipeline
-from nse_scanner.market import _dual_leader, _is_leading_short, run_market
+from nse_scanner.market import (_dual_leader, _is_leading_short, _runner_up_sectors,
+                                run_market, sector_extra_max)
 from nse_scanner.session import IST
 from test_sector_pick import DAYS, bars, daily, series
 
@@ -34,6 +35,58 @@ def snap(name, **over):
                 pos=50.0, rs=0.0, bull=60.0, bear=60.0, recent=0.0, qualified=False,
                 lag_bars=0, stale=False)
     return type("S", (), {**base, **over})()
+
+
+class RunnerUpSectorTests(TestCase):
+    """A committed pick is one sector; the day rarely has only one leader.
+
+    19 Nov: AUTO was the pick from 10:00 at 99 while CDUR ran 92-99 all afternoon
+    and was never scanned on a committed bar, so every CDUR name that fired at
+    09:30-09:40 (HAVELLS, WHIRLPOOL, KALYANKJIL, LGEINDIA, DIXON, VOLTAS, AMBER)
+    was already "earlier" by the time CDUR became the pick at 11:45.
+    """
+
+    def setUp(self):
+        self.auto = snap("AUTO", side=1, persist_bull=99.0, day_ret=2.60, pos=98.0, rs=1.2,
+                         bull=75.0, recent=0.30)
+        self.cdur = snap("CDUR", side=1, persist_bull=92.0, day_ret=2.10, pos=95.0, rs=1.0,
+                         bull=72.0, recent=0.25)
+        self.psubk = snap("PSUBK", side=1, persist_bull=91.0, day_ret=1.90, pos=93.0, rs=0.9,
+                          bull=70.0, recent=0.20)
+        self.quiet = snap("FMCG", side=1, persist_bull=95.0, day_ret=0.10, pos=55.0, rs=0.02,
+                          bull=58.0, recent=0.01)
+
+    def test_the_strongest_other_leader_is_scanned_with_the_pick(self):
+        got = _runner_up_sectors("AUTO", 1, [self.auto, self.cdur, self.psubk], [], 1)
+        self.assertEqual(got, ["CDUR"])
+
+    def test_the_pick_itself_is_never_the_runner_up(self):
+        got = _runner_up_sectors("AUTO", 1, [self.auto, self.cdur], [], 1)
+        self.assertNotIn("AUTO", got)
+
+    def test_a_high_score_alone_is_not_a_leader(self):
+        # PERSIST 95 with the sector flat on the day: a score, not a move.
+        self.assertEqual(_runner_up_sectors("AUTO", 1, [self.quiet], [], 2), [])
+
+    def test_the_knob_is_the_number_of_extra_sectors(self):
+        pool = [self.auto, self.cdur, self.psubk]
+        self.assertEqual(_runner_up_sectors("AUTO", 1, pool, [], 2), ["CDUR", "PSUBK"])
+        self.assertEqual(_runner_up_sectors("AUTO", 1, pool, [], 0), [])
+        with patch.dict("os.environ", {"SECTOR_EXTRA_MAX": "0"}):
+            self.assertEqual(sector_extra_max(), 0)
+        with patch.dict("os.environ", {"SECTOR_EXTRA_MAX": "2"}):
+            self.assertEqual(sector_extra_max(), 2)
+
+    def test_a_short_pick_takes_the_next_short_leader(self):
+        weak = snap("IT", side=-1, persist_bear=96.0, day_ret=-1.40, pos=8.0, rs=-1.1,
+                    bear=78.0, recent=-0.25)
+        other = snap("PSUBK", side=-1, persist_bear=88.0, day_ret=-1.10, pos=12.0, rs=-0.8,
+                     bear=70.0, recent=-0.20)
+        got = _runner_up_sectors("IT", -1, [], [weak, other], 1)
+        self.assertEqual(got, ["PSUBK"])
+
+    def test_a_flat_market_has_no_runner_up(self):
+        self.assertEqual(_runner_up_sectors(None, 0, [self.cdur], [], 2), [])
 
 
 class DualLeaderTests(TestCase):
@@ -142,6 +195,29 @@ class DualPickOnATapeTests(TestCase):
         self.assertEqual((md.pick_sector, md.pick_side), ("IT", -1))
         self.assertEqual((md.alt_sector, md.alt_side), ("", 0))
         self.assertEqual(md.alt_reason, "")
+
+
+class RunnerUpOnATapeTests(TestCase):
+    """``run_market`` scans the runner-up sector on a committed pick's side."""
+
+    def decide(self, extra: str):
+        n5 = DualPickOnATapeTests.nifty(0.00012)
+        sectors = {"AUTO": sector(0.00035), "IT": sector(-0.00045), "CDUR": sector(0.00030)}
+        vix = bars(DAYS[-1], series(15.0, 0.0))
+        with patch.dict("os.environ", {"SECTOR_FOLLOW": "1", "SECTOR_EXTRA_MAX": extra}):
+            return run_market(n5, daily(n5), vix, daily(vix), sectors,
+                              {k: daily(v) for k, v in sectors.items()})
+
+    def test_the_second_leading_sector_is_scanned_with_the_pick(self):
+        md = self.decide("1")
+        self.assertEqual((md.pick_sector, md.pick_side), ("AUTO", 1))
+        self.assertEqual(list(md.extra_sectors), ["CDUR"])
+        self.assertIn("also scanning CDUR", md.pick_reason)
+
+    def test_the_knob_leaves_the_pick_alone(self):
+        md = self.decide("0")
+        self.assertEqual(list(md.extra_sectors), [])
+        self.assertNotIn("also scanning", md.pick_reason)
 
 
 def sector(step: float, n: int = 75):
