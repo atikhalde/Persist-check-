@@ -185,7 +185,7 @@ jobs:
           # two loops must agree on the sector, the stock and the ceiling.
           SCAN5M_REQUIRE_TARGET: ${{ vars.SCAN5M_REQUIRE_TARGET || '1' }}
           SCAN5M_LEADER_CATCHUP: ${{ vars.SCAN5M_LEADER_CATCHUP || '1' }}
-          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '30' }}
+          SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '40' }}
           LATE_LEADER_ENTRY: ${{ vars.LATE_LEADER_ENTRY || '1' }}
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
@@ -210,7 +210,7 @@ jobs:
           # Refuse an entry that has no pivot target at all (0 = old rule).
           SCAN1M_REQUIRE_TARGET: ${{ vars.SCAN1M_REQUIRE_TARGET || '1' }}
           SCAN1M_LEADER_CATCHUP: ${{ vars.SCAN1M_LEADER_CATCHUP || '1' }}
-          SCAN1M_LEADER_MAX_MINUTES: ${{ vars.SCAN1M_LEADER_MAX_MINUTES || '30' }}
+          SCAN1M_LEADER_MAX_MINUTES: ${{ vars.SCAN1M_LEADER_MAX_MINUTES || '40' }}
           SCAN1M_LEADER_MAX_R: ${{ vars.SCAN1M_LEADER_MAX_R || '2.0' }}
           SCAN1M_1M_PERIOD: ${{ vars.SCAN1M_1M_PERIOD || '1d' }}
           # The same rule inputs the 5m workflow passes — one engine, one config.
@@ -222,6 +222,9 @@ jobs:
           SECTOR_FOLLOW_MIN_PERSIST: ${{ vars.SECTOR_FOLLOW_MIN_PERSIST || '75' }}
           SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           SECTOR_EXTRA_MAX: ${{ vars.SECTOR_EXTRA_MAX || '1' }}
+          TRIPLE_PICK: ${{ vars.TRIPLE_PICK || '1' }}
+          TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
+          NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
           MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
           BAR_SETTLE_SECONDS: "45"                              # used by the shared hit tracker
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170
