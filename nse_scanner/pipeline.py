@@ -2034,9 +2034,16 @@ def late_plan(hit) -> TradePlan | None:
 
     Entry is the current price (the candle the scan is judging), the stop is the
     fire candle's untouched EMA9 stop, and the targets are the fire's pivots.
-    Refused when the price is already through that stop (the setup is dead) or at
-    and beyond T1 (the move has paid — taking it there is the chase the catch-up
-    window exists to avoid).
+    Refused when the price is already through that stop (the setup is dead) or
+    when the *nearest* target is no longer worth the risk being taken now: the
+    remaining distance to T1 must still be at least ``MIN_TARGET_R`` (0.5) of the
+    catch-up risk, the same rule a fresh entry obeys.
+
+    That second test is what keeps this honest. 19 Nov, M&M at 10:00 was +2.0R
+    from its fire — price 3461.00 with T1 R2 at 3462.77, 1.77 points of room
+    against a 44-point stop taken from here: 0.04R. "Price is still before T1"
+    would have entered that. "The target is still worth the risk" refuses it, and
+    the name stays the heads-up it should be.
     """
     sig, plan = hit.get("sig"), hit.get("plan")
     if sig is None or plan is None or plan.risk is None or plan.t1 is None:
@@ -2045,12 +2052,14 @@ def late_plan(hit) -> TradePlan | None:
     long = sig.side == "BUY"
     if price <= 0:
         return None
-    if (price - plan.sl if long else plan.sl - price) <= 0:
+    risk = (price - plan.sl) if long else (plan.sl - price)
+    if risk <= 0:
         return None
-    if (price >= plan.t1) if long else (price <= plan.t1):
+    room = (plan.t1 - price) if long else (price - plan.t1)
+    if room < trade.min_target_r() * risk:
         return None
     return TradePlan(entry=price, ema9=plan.ema9, sl=plan.sl,
-                     risk=abs(price - plan.sl), t1=plan.t1, t2=plan.t2, t3=plan.t3,
+                     risk=risk, t1=plan.t1, t2=plan.t2, t3=plan.t3,
                      pivot_names=plan.pivot_names, basis=plan.basis, skipped=plan.skipped)
 
 
