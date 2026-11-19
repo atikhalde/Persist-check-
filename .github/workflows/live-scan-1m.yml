@@ -189,7 +189,10 @@ jobs:
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
-          # 1 = also report a projection that did not survive the close.
+          # 1 = also scan the leading sector on the other side of the pick.
+          DUAL_PICK: ${{ vars.DUAL_PICK || '1' }}
+          # How many names of each picked sector are scanned, ranked by lead.
+          SECTOR_TOP_N: ${{ vars.SECTOR_TOP_N || '5' }}
           # 1 = report a projection that does not survive the close (default).
           SCAN1M_CANCEL_MESSAGE: ${{ vars.SCAN1M_CANCEL_MESSAGE || '1' }}
           SCAN1M_SUMMARY: ${{ vars.SCAN1M_SUMMARY || '1' }}

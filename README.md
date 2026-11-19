@@ -620,6 +620,47 @@ BULL/BEAR market is unaffected.
 | `SECTOR_FOLLOW_MIN_PERSIST` | `75` | persist score a sector needs. **Raised from 55 on 17 Nov:** the follow path's picks at persist 63 (CDUR) and 73 (FMCG) lost −2.8R between them, while 80 (REALTY) and 97 (PSUBK) paid +6.2R — and the 09:21 burst of eleven projections came from exactly those two weak picks. `55` restores the old rule |
 | `SECTOR_FOLLOW_MAX` | `2` | how many leading sectors are scanned |
 | `SF_ALIGNED_SECTORS` | empty | e.g. `PHA,ENE` — sectors your chart shows as SMART$/MARKET/SECTOR/FLOW aligned; scanned first. The scanner cannot read the chart, so this is manual. |
+| `DUAL_PICK` | `1` | while a pick runs one side, also scan the leading sector on the **other** side (see below). `0` = one-sided scanning |
+| `SECTOR_TOP_N` | `5` | how many names per scanned sector go to the close scan, ranked by how far each leads its sector index. `0` = the whole sector |
+
+**Dual pick.** A committed pick is one side of the market, and on 19 Nov that side
+was IT short from 09:25 while `PERSIST +` held AUTO at 98 with its live flow
+aligned. Nothing looked long AUTO until 10:15, after the IT short had spent eight
+candles in WAIT — and the long the bot eventually took (BAJAJ-AUTO, +5.7R at T2)
+came off exactly the numbers that were on the board at 09:45. So while a
+**committed** pick is live, the leading sector of the *opposite* side is added to
+the same scan when it passes the leadership test the NEUTRAL follow already uses,
+in its own direction
+(`SECTOR_FOLLOW_MIN_PERSIST` 75, up/down on the day, upper/lower part of the
+range, RS agreeing, flow agreeing, not rolling over). It is not a second opinion
+on the pick: the pick's own sector and side are unchanged, the market line still
+reads `IT SHORT`, and the stock alert carries one extra line —
+
+```
+Sector AUTO | Market IT SHORT
+<i>DUAL — AUTO long 98 against the IT SHORT pick</i>
+```
+
+That sector gets its own `MAX_ENTRIES_PER_PICK` budget (the cap is keyed
+sector+side, so the two books never eat into each other), and `DUAL_PICK=0`
+returns the day to exactly one side. Nothing happens on a WAIT bar, a NEUTRAL
+follow stays one long book, and the pick itself is never its own dual. Both bots
+use it: the 5m scan adds the sector to its entry, early and late-leader passes,
+and the 1m scan reads it off the 5m ledger so its projections and confirmations
+carry the same second side.
+
+**Leaders, not followers.** A picked sector is a dozen names and only the top few
+are the movers — the rest are the same move at a worse price, and they fill the
+alert stream with entries that never reach T1. The close scan therefore keeps the
+top `SECTOR_TOP_N` (5) names per scanned sector by *lead* — the name's move from
+the session open minus its sector index's move, in percentage points, the same
+measure the board prints as `+x.xpp` — and skips the rest with
+`follower NAME @HH:MM: outside AUTO's top 5`. Names with no 5-minute candle yet
+rank last, so a silent name cannot displace a mover. `SECTOR_TOP_N=0` scans the
+whole sector, `2`–`3` narrows it to the front of the move. Both loops trim — the
+5m entry, early and late-leader passes, and the 1m projections and confirmations
+(the 1m scan ranks on the last completed candle, so a 5m row Yahoo publishes late
+cannot drop a leader).
 
 **Open interest (optional).** Yahoo has no futures OI, so this only does something
 when you fill `data/oi_history.csv` (`symbol,timestamp,oi,close`; timestamp = the

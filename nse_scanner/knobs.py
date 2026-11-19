@@ -42,6 +42,8 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("OI_FILTER", "annotate"),
     ("MAX_ENTRIES_PER_PICK", "3"),
     ("SECTOR_FOLLOW_EXTRAS", "1"),
+    ("DUAL_PICK", "1"),
+    ("SECTOR_TOP_N", "5"),
     ("SCAN5M_REQUIRE_TARGET", "1"),
     ("SCAN5M_LEADER_CATCHUP", "1"),
     ("SCAN5M_LEADER_MAX_MINUTES", "30"),

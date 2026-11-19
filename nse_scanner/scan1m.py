@@ -285,6 +285,10 @@ def _own_market(decision_bar: datetime, force_sector: str | None = None):
 def _pick_dict(md, *, projected: bool = False) -> dict:
     """The pick fields both scans use, from a ``MarketDecision``."""
     scanning = md.pick_sector != "WAIT" and md.action != "WAIT" and md.pick_side in (1, -1)
+    alt = str(getattr(md, "alt_sector", "") or "") if scanning else ""
+    alt_side = int(getattr(md, "alt_side", 0) or 0) if alt else 0
+    if alt_side not in (1, -1) or alt in ("", md.pick_sector):
+        alt, alt_side = "", 0
     return {
         "bar": md.bar_time,
         "sector": md.pick_sector if scanning else "WAIT",
@@ -295,13 +299,18 @@ def _pick_dict(md, *, projected: bool = False) -> dict:
         "follow": bool(scanning and str(getattr(md, "pick_reason", "")).startswith("SECTOR FOLLOW")),
         # the picked sector index's move from its own open — the same number the
         # 5m scan ranks and labels its entries with
-        "intra": _pick_intra(md) if scanning else None,
+        "intra": _intra_of(md, md.pick_sector) if scanning else None,
+        # the other side of the tape: the dual pick, if the engine found one
+        "alt": alt,
+        "alt_side": alt_side,
+        "alt_intra": _intra_of(md, alt) if alt else None,
+        "alt_reason": (getattr(md, "alt_reason", "") or "") if alt else "",
         "projected": projected,
     }
 
 
-def _pick_intra(md) -> float | None:
-    snap = (getattr(md, "sectors", None) or {}).get(getattr(md, "pick_sector", "")) or {}
+def _intra_of(md, sector: str) -> float | None:
+    snap = (getattr(md, "sectors", None) or {}).get(sector or "") or {}
     try:
         intra = snap.get("intra_ret") if snap else None
         return round(float(intra), 3) if intra is not None else None
@@ -320,6 +329,8 @@ def _ledger_pick(allowed: list[str]) -> dict | None:
     scan = _five_minute_scan()
     if scan.get("bar") not in allowed or not scan.get("sector"):
         return None
+    alt = (scan.get("alt") or {}).get("sector") or ""
+    alt_side = (scan.get("alt") or {}).get("side") or 0
     return {
         "bar": scan.get("bar"),
         "sector": scan["sector"],
@@ -329,6 +340,10 @@ def _ledger_pick(allowed: list[str]) -> dict | None:
         "extra": list(scan.get("extra") or []),
         "follow": bool(scan.get("follow")),
         "intra": scan.get("intra"),
+        "alt": alt,
+        "alt_side": alt_side if alt_side in (1, -1) else 0,
+        "alt_intra": scan.get("alt_intra"),
+        "alt_reason": scan.get("alt_reason") or "",
         "projected": False,
     }
 
@@ -571,10 +586,77 @@ def market_alert(st: dict, pick: dict | None) -> bool:
 
 
 def _scan_list(uni: dict, pick: dict) -> dict[str, str]:
-    """``{stock: sector}`` — the 5m scan's own function (pick first, then follows)."""
+    """``{stock: sector}`` — the pick, its follows, and the dual pick's sector."""
     from .pipeline import _scan_list as scan_list
 
-    return scan_list(uni, pick["sector"], pick.get("extra"))
+    out = scan_list(uni, pick["sector"], pick.get("extra"))
+    alt = pick.get("alt") or ""
+    if alt and pick.get("alt_side") in (1, -1):
+        for raw in (uni["sectors"].get(alt) or {}).get("stocks", []):
+            out.setdefault(raw, alt)
+    return out
+
+
+def _scan_targets(uni: dict, pick: dict) -> tuple[dict[str, str], dict[str, int], str]:
+    """``({stock: sector}, {stock: side}, dual note)`` — the 5m scan's own split.
+
+    A dual pick is a second sector on the *other* side of the market, so one
+    ``want`` for the whole scan is no longer enough: an AUTO long judged with the
+    IT short's side is a rejected signal, and an AUTO entry charged to
+    ``IT short``'s cap is the wrong budget. A name both books hold keeps the
+    pick's side — one name, one entry, one risk.
+    """
+    sector_of = _scan_list(uni, pick)
+    side = int(pick.get("side") or 0)
+    alt = pick.get("alt") or ""
+    alt_side = int(pick.get("alt_side") or 0) if alt else 0
+    side_of = {raw: (alt_side if alt and name == alt and alt_side in (1, -1) else side)
+               for raw, name in sector_of.items()}
+    return sector_of, side_of, _dual_note(pick, alt, alt_side)
+
+
+def _dual_note(pick: dict, alt: str, alt_side: int) -> str:
+    """The line bot 1 prints under a dual entry — word for word, when it has it."""
+    if not alt:
+        return ""
+    text = pick.get("alt_reason") or ""
+    if text:
+        return text
+    return (f"DUAL — {alt} {'long' if alt_side == 1 else 'short'} "
+            f"against the {pick.get('label') or 'market'} pick")
+
+
+def _sector_intra(pick: dict, sector: str) -> float | None:
+    """A scanned sector's move from its own open — the number ``sector_lead`` needs."""
+    if sector == pick.get("sector"):
+        return pick.get("intra")
+    if sector and sector == (pick.get("alt") or ""):
+        return pick.get("alt_intra")
+    return None
+
+
+def _want(side_of: dict[str, int], raw: str, pick: dict) -> str:
+    """The side this name is judged on — its own sector's, not the pick's."""
+    side = side_of.get(raw, pick.get("side"))
+    return "BUY" if side == 1 else "SELL"
+
+
+def _leaders(stocks: list[str], symbols: dict[str, str], sector_of: dict[str, str],
+             side_of: dict[str, int], sm5: dict, pick: dict, last) -> set[str]:
+    """The top ``SECTOR_TOP_N`` names of each scanned sector (``pipeline``'s rule)."""
+    from .pipeline import sector_leaders
+
+    done = {sym: (df.loc[df.index <= last] if df is not None and not df.empty else df)
+            for sym, df in sm5.items()}
+    current = []
+    for raw in stocks:
+        sym = symbols.get(raw)
+        df5 = done.get(sym) if sym else None
+        if df5 is not None and not df5.empty and to_ist(df5.index[-1]) == last:
+            current.append(sym)
+    intra_of = {name: _sector_intra(pick, name) for name in set(sector_of.values())}
+    return sector_leaders(stocks, [symbols[raw] for raw in stocks], sector_of, side_of,
+                          done, current, intra_of, last)
 
 
 # ── frames ───────────────────────────────────────────────────────────────────
@@ -762,15 +844,19 @@ def _sector_text(own: str | None, picked: str | None) -> str:
 
 
 def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, minute: int,
-                     sector: str | None = None) -> str:
+                     sector: str | None = None, dual: str = "") -> str:
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     close = bar + timedelta(minutes=BAR_MINUTES)
     left = max(0, int((close - now).total_seconds()))
+    # A dual entry says which side of the market it is going against, on the
+    # same line bot 1 prints it.
+    note = f"<i>{telegram.esc(dual)}</i>\n" if dual else ""
     return (
         f"⚡ {arrow} <b>EARLY {sig.side}</b> (1m projection) | <b>{sig.name}</b>  {sig.symbol}\n"
         f"{_sector_text(sector, scan.get('sector'))}"
         f"  |  Market {scan.get('label')} ({scan.get('conf')}%)"
         f"  ·  {_pick_source(scan)}\n"
+        f"{note}"
         f"Price now <b>{plan.entry:.2f}</b>  ·  5m bar {bar:%H:%M}–{close:%H:%M} still forming\n"
         f"<b>{left // 60}m {left % 60:02d}s left</b> — projected from 1m prints up to {now:%H:%M}\n"
         f"SL ≈ {plan.sl:.2f} (EMA9 so far)  |  Risk ≈ {plan.risk:.2f}\n"
@@ -782,11 +868,11 @@ def format_projected(sig, scan: dict, plan, bar: datetime, now: datetime, *, min
 
 
 def format_confirmed(sig, scan: dict, plan, *, early: dict | None, sector: str,
-                     oi_line: str = "", lead: float | None = None) -> str:
+                     oi_line: str = "", lead: float | None = None, dual: str = "") -> str:
     from .pipeline import format_stock    # the exact 5m entry text
 
     text = format_stock(sig, _md(scan, scan.get("sector")), plan, sector=sector,
-                        oi_line=oi_line, lead=lead)
+                        oi_line=oi_line, lead=lead, dual=dual)
     if early:
         diff = (plan.entry - early["price"]) if early["side"] == "BUY" else (early["price"] - plan.entry)
         pct = diff / early["price"] * 100.0 if early["price"] else 0.0
@@ -996,11 +1082,13 @@ _CANCEL_WHY = {
     "pick_wait": "not checked — the pick dropped to WAIT",
     "sector_moved": "not checked — the close picked another sector",
     "no_free": "not checked — no free name in the scanned sector",
+    "follower": "not checked — the name is outside its sector's top names",
     "unchecked": "could not be checked in time",
 }
 
 _CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap",
-                     "late", "pick_wait", "no_free", "sector_moved", "unchecked")
+                     "late", "pick_wait", "no_free", "follower", "sector_moved",
+                     "unchecked")
 
 
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
@@ -1078,7 +1166,7 @@ _LATE_BY_BOT = {
 
 def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime, *,
                    sector: str | None = None, bot: str = "1m",
-                   closed: bool = False, more: int = 0) -> str:
+                   closed: bool = False, more: int = 0, dual: str = "") -> str:
     """One labelled message; unmistakably not an entry alert.
 
     ``closed`` is the 5m scan's case: it is judging a candle that has already
@@ -1097,7 +1185,8 @@ def format_catchup(raw: str, hit: dict, pick: dict, bar: datetime, now: datetime
            else "fired before its sector was picked\n")
         + f"<b>{raw}</b> · {_sector_text(sector, pick.get('sector'))}  |  "
         f"Market {pick.get('label')} ({pick.get('conf')}%)\n"
-        f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
+        + (f"<i>{telegram.esc(dual)}</i>\n" if dual else "")
+        + f"Fired <b>{sig.time}</b> as {sig.name} @ {plan.entry:.2f} · "
         f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
         f"Price now <b>{hit['price']:.2f}</b> "
         f"({hit['r']:+.1f}R from the fire) · SL {plan.sl:.2f} "
@@ -1238,7 +1327,6 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                      " (projected from the forming candle)" if (pick or {}).get("projected") else "")
         return []
     session = str(bar.date())
-    want = "BUY" if pick["side"] == 1 else "SELL"
     st = load_ledger()
     if not pick.get("projected"):
         # A MARKET / SECTOR message is a statement about a finished candle. A
@@ -1246,7 +1334,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         # the close pass sends it, exactly as bot 1 does.
         market_alert(st, pick)
     uni = data.load_universe()
-    sector_of = _scan_list(uni, pick)
+    sector_of, side_of, dual = _scan_targets(uni, pick)
     if not sector_of:
         return []
 
@@ -1271,8 +1359,20 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     if not wanted:
         return []
 
-    tickers = {raw: data.yahoo_stock(raw) for raw in wanted}
-    sm5 = five_minute_history(tickers, bar)
+    everything = {raw: data.yahoo_stock(raw) for raw in wanted}
+    sm5 = five_minute_history(everything, bar)
+    # Only a sector's leaders are projected: the tail is the sector moving, and
+    # its "signal" is the sector's, not the name's. Ranked before the 1m fetch,
+    # so a follower costs nothing — the same trim the 5m scan applies.
+    leaders = _leaders(wanted, everything, sector_of, side_of, sm5, pick,
+                       bar - timedelta(minutes=BAR_MINUTES))
+    names = [raw for raw in names if raw in leaders]
+    catching = [raw for raw in catching if raw in leaders]
+    wanted = list(dict.fromkeys(names + catching))
+    if not wanted:
+        return []                 # this candle's leaders were all handled already
+
+    tickers = {raw: everything[raw] for raw in wanted}
     sm1 = one_minute_frames(tickers, bar)
     sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
     oi_reader = _oi_reader(session)
@@ -1312,6 +1412,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         fires_book[raw] = fires
         if raw not in names:
             continue                  # a catch-up candidate, not a projection
+        want = _want(side_of, raw, pick)
         fresh = [s for s in fires if s.time == hhmm and s.side == want]
         if not fresh:
             if fires:                 # fired earlier / opposite: the shared reject book
@@ -1352,7 +1453,8 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
             _no_projection(raw, "at_close")
             continue
         best.price, best.sl = plan.entry, plan.sl
-        lead = (sector_lead(frame, bar, plan.entry, pick.get("intra"), pick["side"] == 1)
+        lead = (sector_lead(frame, bar, plan.entry, _sector_intra(pick, sector_of.get(raw)),
+                            side_of.get(raw, pick["side"]) == 1)
                 if rank_by_sector_lead() else None)
         ready.append({"raw": raw, "best": best, "plan": plan, "lead": lead, "stamp": stamp})
     if earlier:
@@ -1376,7 +1478,8 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     for item in ready:
         raw, best, plan, stamp = item["raw"], item["best"], item["plan"], item["stamp"]
         text = format_projected(best, pick, plan, bar, stamp, minute=minute,
-                                sector=sector_of.get(raw))
+                                sector=sector_of.get(raw),
+                                dual=dual if sector_of.get(raw) == (pick.get("alt") or "") else "")
         if not telegram.send_bot3(text, dry_run=_dry()):
             continue
         prev = book.get(raw) or {}
@@ -1398,7 +1501,7 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
         projected_now.add(raw)
 
     out.extend(_catch_up(st, pick, catching, frames, fires_book, sd1, bar, now,
-                         sector_of=sector_of))
+                         sector_of=sector_of, side_of=side_of))
     if skips or catching:
         save_ledger(st)              # the summary reports these counts
     return out
@@ -1406,7 +1509,8 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
 
 def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: dict,
               daily: dict, bar: datetime, now: datetime, *,
-              sector_of: dict | None = None) -> list[dict]:
+              sector_of: dict | None = None,
+              side_of: dict | None = None) -> list[dict]:
     """Send the labelled LATE LEADER messages for this minute (bot 3 only)."""
     if not catching:
         return []
@@ -1429,7 +1533,7 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
         if frame is None or not fires_list:
             continue
         why: dict = {}
-        hit = catchup_candidate(frame, fires_list, "BUY" if pick.get("side") == 1 else "SELL",
+        hit = catchup_candidate(frame, fires_list, _want(side_of or {}, raw, pick),
                                 bar, now, daily.get(data.yahoo_stock(raw)), report=why)
         if hit is None:
             if why.get("why"):
@@ -1456,7 +1560,10 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
     for item in found:
         raw, hit = item["raw"], item["hit"]
         if not digest and not telegram.send_bot3(
-                format_catchup(raw, hit, pick, bar, now, sector=item["sector"], more=more),
+                format_catchup(raw, hit, pick, bar, now, sector=item["sector"], more=more,
+                               dual=_dual_note(pick, pick.get("alt") or "",
+                                               int(pick.get("alt_side") or 0))
+                               if (sector_of or {}).get(raw) == (pick.get("alt") or "") else ""),
                 dry_run=_dry()):
             continue
         if not sent_all:
@@ -1540,9 +1647,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     _count_candle(stats, pick)
 
     session = str(bar.date())
-    want = "BUY" if pick["side"] == 1 else "SELL"
     uni = data.load_universe()
-    sector_of = _scan_list(uni, pick)
+    sector_of, side_of, dual = _scan_targets(uni, pick)
     book = st.setdefault("early", {})
     sent = st.setdefault("sent", {})
     positions = st.setdefault("positions", {})
@@ -1555,6 +1661,22 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
 
     tickers = {raw: data.yahoo_stock(raw) for raw in names}
     sm5 = data.fetch_many(tickers.values(), os.environ.get("YF_PERIOD_5M", "7d"), "5m")
+    # Only each sector's leaders are judged — the same trim, on the same numbers,
+    # as the 5m scan. Ranked on the previous completed candle (as the projection
+    # pass does) so a 5m row Yahoo publishes late cannot drop a leader here.
+    # Everything below works on the kept names only.
+    leaders = _leaders(names, tickers, sector_of, side_of, sm5, pick,
+                       bar - timedelta(minutes=BAR_MINUTES))
+    followers = [raw for raw in names if raw not in leaders]
+    names = [raw for raw in names if raw in leaders]
+    if not names:
+        # Only followers left: a projection on one of them is written off by name,
+        # not silently left open until the session ends.
+        _mark_judged(st, bar)
+        _settle(st, bar, set(), None, code="follower", scanned=set())
+        save_ledger(st)
+        return []
+    tickers = {raw: tickers[raw] for raw in names}
     sm1 = one_minute_frames(tickers, bar)
     sd1 = data.fetch_daily(tickers.values(), os.environ.get("YF_PERIOD_1D", "90d"))
     oi_reader = _oi_reader(session)
@@ -1565,7 +1687,11 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     hhmm = bar.strftime("%H:%M")
     from .pipeline import (entry_cap_room, new_position, pick_cap_key,
                            rank_by_sector_lead, rank_candidates, sector_lead,
-                           take_entry_slot)
+                           sector_top_n, take_entry_slot)
+    for raw in followers:             # the tail is the sector moving, not the name
+        log.info("follower %s @ %s: outside %s's top %d; not scanned",
+                 raw, hhmm, sector_of[raw], sector_top_n())
+        _note_reject(st, "follower", raw, f"{raw} {sector_of[raw]}")
     # The cap is keyed per candidate's own sector, exactly as bot 1 keys it: a
     # SECTOR FOLLOW scan that also scans an extra leader must not charge that
     # leader's names to the pick's budget. 17 Nov bot 3 refused BLUESTARCO (CDUR)
@@ -1597,6 +1723,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         except Exception:
             log.exception("1m confirm scan failed for %s", raw)
             continue
+        want = _want(side_of, raw, pick)       # this name's own side
         fresh = [s for s in fires if s.time == hhmm and s.side == want]
         if not fresh:
             if fires:                   # same reject book as the 5m scan
@@ -1632,7 +1759,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         best.price, best.sl = plan.entry, plan.sl
         # Same condition as bot 1: the lead is the ranking, and it is printed
         # only when the ranking is in force.
-        lead = (sector_lead(frame, bar, plan.entry, pick.get("intra"), pick["side"] == 1)
+        lead = (sector_lead(frame, bar, plan.entry, _sector_intra(pick, sector_of[raw]),
+                            side_of.get(raw, pick["side"]) == 1)
                 if rank_by_sector_lead() else None)
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
                            "early": early, "lead": lead, "close": closes.get(raw)})
@@ -1640,14 +1768,17 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     rank_candidates(candidates)
     for cand in candidates:
         raw, best, plan = cand["raw"], cand["best"], cand["plan"]
-        own_key = pick_cap_key(sector_of[raw], int(pick["side"]))
+        # Charged to the name's own sector *and* its own side: a dual long has a
+        # budget of its own, exactly as on bot 1.
+        own_key = pick_cap_key(sector_of[raw], side_of.get(raw, pick["side"]))
         if not entry_cap_room(st, own_key):
             _note_reject(st, "cap", raw, f"{raw} {best.time}", per_bar=best.time)
             reasons[raw] = "cap"
             log.info("1m cap: %s not taken — %s already has its entries", raw, own_key)
             continue
         text = format_confirmed(best, pick, plan, early=cand["early"], sector=sector_of[raw],
-                                oi_line=_oi_line(cand["reading"]), lead=cand["lead"])
+                                oi_line=_oi_line(cand["reading"]), lead=cand["lead"],
+                                dual=dual if sector_of[raw] == (pick.get("alt") or "") else "")
         if not telegram.send_bot3(text, dry_run=_dry()):
             _note_undelivered(st, raw, bar, now_ist())
             continue
@@ -1748,6 +1879,10 @@ def _count_candle(stats: dict, pick: dict | None) -> None:
         followed = stats.setdefault("extra", {})
         for name in (pick.get("extra") or []):
             followed[name] = followed.get(name, 0) + 1
+        alt = pick.get("alt") or ""
+        if alt and pick.get("alt_side") in (1, -1):
+            dual_key = f"{alt} {'long' if pick['alt_side'] == 1 else 'short'}, dual"
+            book[dual_key] = book.get(dual_key, 0) + 1
 
 
 def _note_feed_behind(st: dict, frames1m: dict, bar: datetime, now: datetime) -> None:
