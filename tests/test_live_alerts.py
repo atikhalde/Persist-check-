@@ -62,7 +62,8 @@ class EntryCapTests(TestCase):
         self.ctx = patch.object(state, "STATE_PATH", Path(self.tmp.name) / "state.json")
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
-        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0"})
+        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0",
+                                             "MAX_ENTRIES_PER_PICK": "3"})
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
         self.now = BAR + timedelta(minutes=6)
@@ -218,22 +219,61 @@ class SectorLeadRankingTests(TestCase):
     def stock_texts(self):
         return [c.args[0] for c in self.send.call_args_list if c.args[0].startswith("stock")]
 
-    def test_the_leader_is_alerted_first_even_with_the_lowest_score(self):
-        pipeline.run_once()
-        # BBB scored 62 (joint lowest) but is +2.0pp ahead of its sector; AAA (82) lags it.
-        self.assertEqual(self.stock_texts(), ["stock BBB", "stock CCC", "stock AAA"])
-        self.assertIn("DDD@10:00", state.load()["stats"]["rejected"]["cap"])
+    def test_only_the_sector_s_runners_are_entered(self):
+        """The count is open now; the momentum band is what keeps a name out.
 
-    def test_the_leader_takes_the_only_slot_when_one_is_allowed(self):
-        with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
-            pipeline.run_once()
+        BBB is +2.0pp ahead of its sector, CCC +(-0.4), AAA +(-0.6), DDD +(-0.8):
+        the other three are the same move at a worse price, so they are not
+        entered however good their absolute score is (AAA 82 is the top score).
+        """
+        pipeline.run_once()
         self.assertEqual(self.stock_texts(), ["stock BBB"])
-        self.assertIn("AAA@10:00", state.load()["stats"]["rejected"]["cap"])
+        self.assertIn("AAA@10:00", state.load()["stats"]["rejected"]["weak"])
+
+    def test_the_band_can_be_opened(self):
+        with patch.dict("os.environ", {"ENTRY_RANK_BAND": "0"}):
+            pipeline.run_once()
+        self.assertEqual(self.stock_texts(),
+                         ["stock BBB", "stock CCC", "stock AAA", "stock DDD"])
 
     def test_the_old_score_order_can_be_restored(self):
-        with patch.dict("os.environ", {"RANK_BY_SECTOR_LEAD": "0"}):
+        with patch.dict("os.environ", {"RANK_BY_SECTOR_LEAD": "0", "ENTRY_RANK_BAND": "0"}):
             pipeline.run_once()
-        self.assertEqual(self.stock_texts(), ["stock AAA", "stock CCC", "stock BBB"])
+        self.assertEqual(self.stock_texts(),
+                         ["stock AAA", "stock CCC", "stock BBB", "stock DDD"])
+
+    def test_the_gate_calls_a_name_that_fell_over_reversing(self):
+        """A name rolling over is not entered, however good its day has been.
+
+        The frame ran to 103.3 and faded to 101.5: under its EMA9, low in its
+        range, the last candles against it — the structure leg sees it even
+        before the day's move does.
+        """
+        n = 20
+        closes = ([100.4] * 5 + [101.0, 101.6, 102.2, 102.8, 103.3, 102.6, 102.2, 101.9,
+                                 101.8, 101.75, 101.7, 101.65, 101.6, 101.55, 101.5])
+        idx = [BAR - timedelta(minutes=5 * i) for i in range(n, 0, -1)]
+        frame = pd.DataFrame({"Open": closes, "High": [c + 0.02 for c in closes],
+                              "Low": [c - 0.02 for c in closes], "Close": closes,
+                              "Volume": [1000] * n}, index=pd.DatetimeIndex(idx))
+        early = frame.index[7]
+        ok, why, rank = pipeline.momentum_verdict(frame, early, 102.2, True, 0.0)
+        self.assertTrue(ok, why)                      # running: up on heavy trend
+        ok, why, rank = pipeline.momentum_verdict(frame, frame.index[-1], 101.5, True, 0.0)
+        self.assertFalse(ok)
+        self.assertIn("reversing", why)
+
+    def test_the_floor_refuses_a_name_with_no_strength_left(self):
+        with patch.dict("os.environ", {"ENTRY_MIN_RANK": "95"}):
+            ok, why, _ = pipeline.momentum_verdict(
+                pd.DataFrame({"Open": [100.0], "High": [100.1], "Low": [99.9],
+                              "Close": [100.0], "Volume": [1000]},
+                             index=pd.DatetimeIndex([BAR])), BAR, 100.0, True, 0.0)
+        self.assertFalse(ok)
+        self.assertIn("weak momentum", why)
+
+    def test_no_cap_by_default(self):
+        self.assertEqual(pipeline.max_entries_per_pick(), 0)
 
     def test_the_alert_shows_how_far_ahead_of_its_sector_it_is(self):
         text = ORIGINAL_FORMAT_STOCK(

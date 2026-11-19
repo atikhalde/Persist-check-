@@ -671,6 +671,11 @@ class BotThreeFollowerTrimTests(BotThreeWorld):
 
     def setUp(self):
         super().setUp()
+        # The trim is what this class tests, so the momentum band is opened.
+        self.patches.append(patch.dict("os.environ", {"ENTRY_RANK_BAND": "0",
+                                                      "ENTRY_MIN_RANK": "0"}))
+        self.patches[-1].start()
+        self.addCleanup(self.patches[-1].stop)
         # AAA is the IT pick; AUTO's three movers at 104 / 101 / 100 close.
         self.universe["sectors"]["AUTO"]["stocks"] = ["BBB", "CCC", "EEE"]
         self.closes = {"AAA": 99.2, "BBB": 101.0, "CCC": 100.0, "EEE": 104.0}

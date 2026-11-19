@@ -122,19 +122,24 @@ class Scan1mFixture(TestCase):
         return state.load(self.dir / "scan1m.json")
 
 # ── the entry rules bot 3 shares with bot 1 ─────────────────────────────────
-class Bot3EntryRuleTests(Scan1mFixture):
-    """One pick is one risk factor on both bots, and the leader goes first.
+class FourNameWorld(Scan1mFixture):
+    """Four names of one sector firing on the same 10:00 candle, one runner.
 
-    Bot 3 used to confirm every name that fired on the close — on 16 Nov that
-    was six pharma entries where bot 1 announced three — and it wrote its own
-    trade record, which had silently lost the pivot names.
+    AAA +0.4%, BBB +3.0%, CCC +0.6%, DDD +0.2% against a sector index +1.0%: BBB
+    is the only name ahead of its sector.
     """
 
     LAST = {"AAA": 100.4, "BBB": 103.0, "CCC": 100.6, "DDD": 100.2}
     SECTOR_INTRA = 1.0
+    #: The ceiling and the ordering are what ``Bot3EntryRuleTests`` tests, so the
+    #: momentum band is opened there; ``Bot3MomentumTests`` tests the band.
+    ENV = {"ENTRY_RANK_BAND": "0", "MAX_ENTRIES_PER_PICK": "3"}
 
     def setUp(self):
         super().setUp()
+        self.patches.append(patch.dict("os.environ", self.ENV))
+        self.patches[-1].start()
+        self.addCleanup(self.patches[-1].stop)
         self.universe["sectors"]["IT"]["stocks"] = ["AAA", "BBB", "CCC", "DDD"]
         self.pick = {**self.pick, "intra": self.SECTOR_INTRA}
         self.minutes = one_minute(0, 1, 2, 3, 4, 5)     # the whole 10:00 candle
@@ -168,6 +173,14 @@ class Bot3EntryRuleTests(Scan1mFixture):
         return [base.StockSignal(raw, 101, "BUY-EX", "BUY", BAR.strftime("%H:%M"),
                                  self.LAST[raw], 70, "Strong", 20, 1, "test",
                                  self.LAST[raw] - 1.0)]
+
+class Bot3EntryRuleTests(FourNameWorld):
+    """One pick is one risk factor on both bots, and the leader goes first.
+
+    Bot 3 used to confirm every name that fired on the close — on 16 Nov that
+    was six pharma entries where bot 1 announced three — and it wrote its own
+    trade record, which had silently lost the pivot names.
+    """
 
     def test_bot3_confirms_three_of_four_on_the_same_ceiling(self):
         out = scan1m.confirm_pass(BAR, now=CLOSE)
@@ -479,6 +492,49 @@ class FiveMinuteParityTests(Scan1mFixture):
         self.assertIn("1 on the opposite side to the pick", text)
         self.assertIn("1 without a valid EMA9 stop", text)
         self.assertIn("feed lagged past the close on 1 candle", text)
+
+
+class Bot3MomentumTests(FourNameWorld):
+    """The count is open; what keeps a name out is its own tape.
+
+    Same four names, same candle, the band back at its default: BBB is +2.0pp
+    ahead of its sector and the other three are behind it, so one entry is taken
+    and three names are filed as ``weak`` — not three entries in arrival order.
+    """
+
+    ENV = {"ENTRY_RANK_BAND": "0.75", "MAX_ENTRIES_PER_PICK": "0"}
+
+    def test_only_the_runner_is_confirmed(self):
+        out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual([m.get("symbol") for m in out], ["BBB"])
+        self.assertEqual(self.ledger()["pick_entries"], {"IT long": 1})
+        rejected = self.ledger()["stats"]["rejected"]["weak"]
+        self.assertTrue(any("AAA" in k for k in rejected), rejected)
+
+    def test_the_band_can_be_opened(self):
+        with patch.dict("os.environ", {"ENTRY_RANK_BAND": "0"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual(len(out), 4)
+
+    def test_a_reversing_name_is_refused_even_on_its_own(self):
+        with patch.dict("os.environ", {"ENTRY_RANK_BAND": "0.75"}):
+            fell = pd.DataFrame({"Open": [103.0] * len(self.five.index),
+                                 "High": [103.0] * len(self.five.index),
+                                 "Low": [100.0] * len(self.five.index),
+                                 "Close": [100.0] * len(self.five.index),
+                                 "Volume": [100000.0] * len(self.five.index)},
+                                index=self.five.index)
+            orig = self.fetch
+
+            def fetch(tickers, period, interval):
+                out = orig(tickers, period, interval)
+                if interval == "5m" and "BBB.NS" in out:
+                    out["BBB.NS"] = fell
+                return out
+
+            with patch.object(scan1m.data, "fetch_many", side_effect=fetch):
+                scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertNotIn("BBB", self.ledger().get("sent", {}))
 
 
 class AlertCapTests(Bot3EntryRuleTests):

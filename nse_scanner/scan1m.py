@@ -1719,7 +1719,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
     _note_feed_behind(st, sm1, bar, now)
 
     hhmm = bar.strftime("%H:%M")
-    from .pipeline import (entry_cap_room, new_position, pick_cap_key,
+    from .pipeline import (entry_cap_room, momentum_verdict, new_position, pick_cap_key,
+                           rank_band_drop,
                            rank_by_sector_lead, rank_candidates, sector_lead,
                            sector_top_n, take_entry_slot)
     for raw in followers:             # the tail is the sector moving, not the name
@@ -1796,8 +1797,28 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         lead = (sector_lead(frame, bar, plan.entry, _sector_intra(pick, sector_of[raw]),
                             side_of.get(raw, pick["side"]) == 1)
                 if rank_by_sector_lead() else None)
+        # The same quality gate as the 5m close pass: the count is open, so what
+        # keeps a sideways or reversing name out is its own tape.
+        runs, why_not, cand_rank = momentum_verdict(
+            frame, bar, closes.get(raw), side_of.get(raw, pick["side"]) == 1,
+            _sector_intra(pick, sector_of[raw]))
+        if not runs:
+            _note_reject(st, "weak", raw, f"{raw} {best.time} — {why_not}", per_bar=best.time)
+            reasons[raw] = "weak"
+            log.info("1m not running: %s @%s — %s (rank %.0f)", raw, best.time, why_not,
+                     cand_rank)
+            continue
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
-                           "early": early, "lead": lead, "close": closes.get(raw)})
+                           "early": early, "lead": lead, "rank": cand_rank,
+                           "sector": sector_of[raw], "close": closes.get(raw)})
+
+    for cand in rank_band_drop(candidates):
+        _note_reject(st, "weak", cand["raw"], f"{cand['raw']} {cand['best'].time} — "
+                     f"rank {cand['rank']:.0f} is behind its sector's runners",
+                     per_bar=cand["best"].time)
+        reasons[cand["raw"]] = "weak"
+        log.info("1m not taken: %s @%s — rank %.0f is behind its sector's runners",
+                 cand["raw"], cand["best"].time, cand["rank"])
 
     rank_candidates(candidates)
     for cand in candidates:
