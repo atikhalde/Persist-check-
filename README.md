@@ -349,9 +349,12 @@ Confirmed entry follows at the 10:35 close if the candle holds
   best-first (17 of them in 35 minutes on 17 Nov was the false-alert problem,
   not the rule; `SCAN1M_CATCHUP_DIGEST=0` sends one per name): the fire's own stop untouched since, no
   older than `SCAN1M_LEADER_MAX_MINUTES` (30), move within
-  `SCAN1M_LEADER_MAX_R` (2.0R). It is **not** an entry — `sent`/`positions` are
-  untouched, and the message says so. `SCAN1M_LEADER_CATCHUP=0` turns it off;
-  bot 1 never sends it.
+  `SCAN1M_LEADER_MAX_R` (2.0R). With `LATE_LEADER_ENTRY` on it is an **entry**
+  when the trade is still there — price still before T1, stop untouched — taken
+  at the price now with the fire candle's stop, and labelled
+  `⏰ LATE LEADER ENTRY`; otherwise the message stays the heads-up that says
+  `Not an entry alert`. `SCAN1M_LEADER_CATCHUP=0` turns it off;
+  `LATE_LEADER_ENTRY=0` restores the heads-up-only behaviour of 19 Nov.
 * **Own bot, own ledger.** `TELEGRAM_BOT_TOKEN_3` / `TELEGRAM_CHAT_ID_3` and
   `state/scan1m_state.json`. It never calls the bots 1/2 sender and never reads
   or writes `state/scan_state.json` (the 5m pick is only read when
@@ -495,6 +498,7 @@ sector bot 1 would have refused — so they are shared, not forked.
 | `SECTOR_MAX_LAG_BARS` | `2` | how many 5m bars a sector index may trail the decision bar and still be picked (`-1` = no check). A sector further behind is taken out of PERSIST + / PERSIST − and out of the pick, and shown as `⚠ stale index` |
 | `SCAN5M_REQUIRE_TARGET` | `1` | refuse a 5m entry that has **no pivot target at all** — the rule bot 3 has had since 17 Nov (`SCAN1M_REQUIRE_TARGET`). `MIN_TARGET_R` refuses a target that is too close; this refuses the absence of one. 17 Nov entered HINDUNILVR with `T2 N/A · T3 N/A` (−0.6R) and DABUR with `T1 N/A · T2 N/A · T3 N/A` (−0.8R): two of ten entries, neither with an exit level (`0` = old rule) |
 | `SCAN5M_LEADER_CATCHUP` | `1` | report a stock whose 5m signal fired **before its sector was the pick**, as a labelled `⏰ LATE LEADER` instead of dropping it. The entry loop only accepts a fire on the decision candle; every earlier fire was filed as `fired before their sector was picked` and revisited never — 18 Nov CDUR was the pick from 09:45 with PERSIST − 93→99 and a qualified live flow, and **no CDUR stock was alerted all morning** although the sector short had fired at 09:20–09:40. Sends no position and takes no entry slot; bot 3 has had the same alert since the 1m round. `0` = the old silence |
+| `LATE_LEADER_ENTRY` | `1` | take that late leader as an **entry** instead of only announcing it, while the trade is still there: price before T1, the fire candle's EMA9 stop untouched since, inside the age/R gates above, and room under `MAX_ENTRIES_PER_PICK` for its sector+side. Entry = the price now, stop = the fire candle's. 19 Nov: bot 3's 10:01 list named HAVELLS +1.8R, WHIRLPOOL +1.8R, KALYANKJIL +1.4R, LGEINDIA +1.3R, DIXON +0.4R and VOLTAS +0.3R as "not an entry", and the day's five entries were TECHM, TATAELXSI, HCLTECH, BAJAJ-AUTO, EXIDEIND — AMBER and VOLTAS never became a trade. The four that had already run past T1 stay heads-ups, so the list cannot turn into a chase. Bot 1 and bot 3 both honour it. `0` = heads-up only |
 | `SCAN5M_LEADER_MAX_MINUTES` / `SCAN5M_LEADER_MAX_R` | `30` / `2.0` | the catch-up's two gates (bot 3's `SCAN1M_LEADER_*`): older than this many minutes since the fire's close, or a move already beyond this many R from the fire, and the name is not reported — it goes into the summary's `not sent:` count with the reason. The fire candle's EMA9 stop must also be untouched since |
 | `SECTOR_FOLLOW_EXTRAS` | `1` | whether a follow scan also scans the *other* leaders' sectors. Each extra sector brings its own `MAX_ENTRIES_PER_PICK` budget (the cap is keyed sector+side), so 17 Nov's `MARKET NEUTRAL 49%` follow fired six entries on one candle from FMCG 73 and CDUR 65. `0` scans the picked sector only — measured **−0.4R** on that session (it removes −2.0R of losses *and* +2.8R of BLUESTARCO), so the default stays as it was until a replay says otherwise |
 | `PICK_STICKY_LOG` | `0` | where the incumbent for `PICK_STICKY_MARGIN` comes from. `0` = the last candle in the ledger, which the early pass overwrites with *this* candle, so the close pass loses the incumbent and decides on raw score (17 Nov 09:45: REALTY 96 held at 09:44, PSUBK 97 took the pick at 09:50, two blocks five seconds apart). `1` = a per-bar log, so the margin always applies — measured **−4.1R** on 17 Nov (it holds REALTY and never sees BANKINDIA, the day's best trade), hence off until a replay |
@@ -619,6 +623,7 @@ BULL/BEAR market is unaffected.
 | `SECTOR_FOLLOW` | `1` | `0` = old behaviour (NEUTRAL → WAIT) |
 | `SECTOR_FOLLOW_MIN_PERSIST` | `75` | persist score a sector needs. **Raised from 55 on 17 Nov:** the follow path's picks at persist 63 (CDUR) and 73 (FMCG) lost −2.8R between them, while 80 (REALTY) and 97 (PSUBK) paid +6.2R — and the 09:21 burst of eleven projections came from exactly those two weak picks. `55` restores the old rule |
 | `SECTOR_FOLLOW_MAX` | `2` | how many leading sectors are scanned |
+| `SECTOR_EXTRA_MAX` | `1` | how many **other** sectors on the pick's own side are scanned beside a committed pick, when they are leading in their own right (same test as the follow: persist ≥ `SECTOR_FOLLOW_MIN_PERSIST`, up on the day, upper part of the range, positive RS, flow aligned). 19 Nov: AUTO was the pick from 10:00 at 99 while CDUR ran 92–99 all afternoon and was never scanned on a committed bar, so the whole CDUR book (HAVELLS, WHIRLPOOL, KALYANKJIL, LGEINDIA, DIXON, VOLTAS, AMBER) fired at 09:30–09:40 into nothing; the market message now reads `PERSIST + AUTO qualified (score 97); also scanning CDUR`. Each extra sector carries its own `MAX_ENTRIES_PER_PICK` budget. `0` = the pick alone |
 | `SF_ALIGNED_SECTORS` | empty | e.g. `PHA,ENE` — sectors your chart shows as SMART$/MARKET/SECTOR/FLOW aligned; scanned first. The scanner cannot read the chart, so this is manual. |
 | `DUAL_PICK` | `1` | while a pick runs one side, also scan the leading sector on the **other** side (see below). `0` = one-sided scanning |
 | `SECTOR_TOP_N` | `5` | how many names per scanned sector go to the close scan, ranked by how far each leads its sector index. `0` = the whole sector |

@@ -937,6 +937,9 @@ def _entries_line(stats: dict) -> str:
         text += f" · with an early alert {with_lead}"
         if entries > with_lead:
             text += f" · close-only {entries - with_lead}"
+        late = int(stats.get("late_entries") or 0)
+        if late:
+            text += f" · {late} from late leaders (fired before the pick, still before T1)"
     return text
 
 
@@ -946,9 +949,16 @@ def format_summary(st: dict) -> str:
     stats = dict(st.get("stats") or {})
     lost = st.get("undelivered") or {}
     stats["undelivered"] = len(lost)          # read by _projected_line
+    # ``candles`` counts close passes that *started*, the ``judged`` book those
+    # that finished, so 19 Nov read "Candles confirmed 72 of 75" next to "4
+    # candle(s) never judged: 15:10, 15:15, 15:20, 15:25" — 76 candles in a
+    # 75-candle session. The honest line states both when they differ.
+    judged = len(stats.get("judged") or {})
+    candles = int(stats.get("candles", 0))
     lines = [f"📊 <b>1m projected scan {st.get('session', '')}</b>",
-             f"Candles confirmed {stats.get('candles', 0)} of 75"
-             f" · with a sector pick {stats.get('picks', 0)}",
+             f"Candles confirmed {candles} of 75"
+             f" · with a sector pick {stats.get('picks', 0)}"
+             + (f" · {judged} judged" if judged != candles else ""),
              _summary_sectors(stats),
              _projected_line(stats)]
     leads = stats.get("lead_n") or 0
@@ -1544,6 +1554,30 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
             continue
         found.append({"raw": raw, "hit": hit, "sector": (sector_of or {}).get(raw)})
     if not found:
+        return out
+
+    # A late leader that is still a live trade becomes an entry, exactly as on
+    # bot 1 (``LATE_LEADER_ENTRY``); what has already run past T1 or through its
+    # stop stays the labelled heads-up. 19 Nov bot 3 announced nine CDUR names as
+    # "not an entry" while CDUR was the day's pick for 30 candles.
+    from .pipeline import take_late_entry
+
+    kept: list[dict] = []
+    for item in found:
+        if take_late_entry(st, pick, bar, item, now, bot="1m",
+                           send=telegram.send_bot3, save=save_ledger, dry=_dry,
+                           side_of=side_of,
+                           dual=_dual_note(pick, pick.get("alt") or "",
+                                           int(pick.get("alt_side") or 0))
+                           if (sector_of or {}).get(item["raw"])
+                           == (pick.get("alt") or "") else ""):
+            out.append({"symbol": item["raw"], "side": item["hit"]["sig"].side,
+                        "fired": item["hit"]["sig"].time, "late_entry": True})
+        else:
+            kept.append(item)
+    found = kept
+    if not found:
+        save_ledger(st)
         return out
 
     # A burst becomes one message; a single late leader keeps its detail. One

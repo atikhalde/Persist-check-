@@ -775,6 +775,30 @@ class SummaryReconciliationTests(TestCase):
         for name in self.CAUGHT:
             self.assertNotIn(f"{name} 09:25", text.split("Signals not alerted:")[1])
 
+    def test_the_candle_books_reconcile(self):
+        """19 Nov: "Candles confirmed 72 of 75" beside "4 candle(s) never judged".
+
+        72 passes + 4 never judged is 76 in a 75-candle session: the pass book
+        and the judged book are different books, so the line names both.
+        """
+        st = self.st()
+        st["stats"].update({"candles": 72, "picks": 69,
+                            "judged": {f"{h:02d}:{m:02d}": 1
+                                       for h in range(9, 15)
+                                       for m in range(0, 60, 5)}})
+        st["stats"]["judged"] = dict(list(st["stats"]["judged"].items())[:71])
+        st["stats"]["unjudged"] = ["15:10", "15:15", "15:20", "15:25"]
+        text = scan1m.format_summary(st)
+        self.assertIn("Candles confirmed 72 of 75 · with a sector pick 69 · 71 judged", text)
+        self.assertIn("candle(s) never judged: 4", text)
+
+    def test_late_leader_entries_are_named_on_the_entries_line(self):
+        st = self.st()
+        st["stats"].update({"entries": 5, "confirmed": 4, "late_entries": 2})
+        text = scan1m.format_summary(st)
+        self.assertIn("Entries (close-confirmed, sent to this bot) 5", text)
+        self.assertIn("· 2 from late leaders", text)
+
     def test_the_day_s_own_numbers_still_add_up(self):
         text = scan1m.format_summary(self.st())
         self.assertIn("Candles confirmed 73 of 75 · with a sector pick 57", text)
@@ -1097,7 +1121,15 @@ class CancelReasonTests(TestCase):
 
 
 class CatchupTextTests(TestCase):
-    """The LATE LEADER text of 18 Nov, line by line."""
+    """The LATE LEADER text of 18 Nov, line by line.
+
+    The catch-up *entry* is off here: these are the wording of the heads-up.
+    """
+
+    def setUp(self):
+        self.ctx = patch.dict("os.environ", {"LATE_LEADER_ENTRY": "0"}, clear=False)
+        self.ctx.start()
+        self.addCleanup(self.ctx.stop)
 
     def _hit(self, price=671.75):
         from nse_scanner.stock import StockSignal

@@ -563,6 +563,14 @@ def run_market(
                 pick, pick_side, action = diverge["pick"], diverge["side"], diverge["action"]
                 reason = diverge["reason"]
 
+    # The pick is one sector; a trend day rarely has only one leader on that side.
+    if pick and commit_side in (1, -1):
+        runner_up = _runner_up_sectors(pick, pick_side, persist_plus, persist_minus,
+                                       sector_extra_max())
+        if runner_up:
+            extra_sectors = list(dict.fromkeys([*extra_sectors, *runner_up]))
+            reason = f"{reason}; also scanning {', '.join(runner_up)}"
+
     # The other side of the same tape, when it has a leader of its own. Only on a
     # committed market: the NEUTRAL follow is one long book by design, and it has
     # been measured as it stands.
@@ -963,6 +971,44 @@ def _dual_leader(pick, pick_side, plus, minus):
         if s.name != pick and test(s, need):
             return {"sector": s.name, "side": side}
     return None
+
+
+def sector_extra_max() -> int:
+    """Same-side leading sectors scanned beside a committed pick (``SECTOR_EXTRA_MAX``).
+
+    A committed pick is one sector, and a trend day usually has two or three
+    moving on that side. 19 Nov the pick was AUTO (99) from 10:00 while CDUR sat
+    at 92-99 all afternoon and was never scanned on a committed bar: every CDUR
+    leader that fired at 09:30-09:40 — HAVELLS and WHIRLPOOL at +1.8R, KALYANKJIL
+    +1.4R, LGEINDIA +1.3R, DIXON, VOLTAS, AMBER — was already "earlier" when CDUR
+    finally became the pick at 11:45. Each extra sector carries its own
+    ``MAX_ENTRIES_PER_PICK`` budget (the cap is keyed sector+side). ``0`` scans
+    the pick alone.
+    """
+    try:
+        return max(0, int(os.environ.get("SECTOR_EXTRA_MAX", "1")))
+    except ValueError:
+        return 1
+
+
+def _runner_up_sectors(pick, pick_side, plus, minus, most: int) -> list[str]:
+    """The strongest other sectors on the pick's own side that are leading too.
+
+    Same test as the NEUTRAL follow, in the pick's direction, so a quiet or
+    counter-trend sector can never widen the scan. The pick itself is skipped.
+    """
+    if most <= 0 or not pick or pick_side not in (1, -1):
+        return []
+    pool, test = ((plus, _is_leading) if pick_side == 1 else (minus, _is_leading_short))
+    need = follow_min_persist()
+    out: list[str] = []
+    for s in pool[:3]:
+        if len(out) >= most:
+            break
+        if s.name == pick or not test(s, need):
+            continue
+        out.append(s.name)
+    return out
 
 
 def _follow_leaders(plus, need: float | None = None) -> list:
