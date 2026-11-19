@@ -111,6 +111,16 @@ class TargetQualityTests(TestCase):
         text = pipeline._target_text(plan)
         self.assertIn("skipped as too close to entry: R1 102.00 (0.0R, +0.01%)", text)
 
+    def test_the_skipped_line_carries_no_raw_angle_bracket(self):
+        # 19 Nov: "(< 0.5R)" made Telegram answer "can't parse entities:
+        # Unsupported start tag" and every alert with a skipped pivot fell back
+        # to plain text. The message is HTML, so the text must not contain "<".
+        plan = self._plan(env={"MIN_TARGET_R": "0.5", "MIN_TARGET_PCT": "0.10"})
+        text = pipeline._target_text(plan)
+        self.assertIn("(under 0.5R)", text)
+        self.assertNotIn("< 0.5R", text)
+        self.assertNotIn("<", text.replace("<b>", "").replace("</b>", ""))
+
     def test_every_announced_target_is_at_least_the_floor_away(self):
         plan = self._plan(env={"MIN_TARGET_R": "0.5", "MIN_TARGET_PCT": "0.10"})
         for level in (plan.t1, plan.t2, plan.t3):

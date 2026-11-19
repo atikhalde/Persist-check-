@@ -342,8 +342,12 @@ def _target_text(plan: TradePlan) -> str:
         parts.append(f"T{i} {name + ' ' if name else ''}{value:.2f} ({', '.join(bits)}{' ⚠' if far else ''})")
     text = " · ".join(parts)
     if getattr(plan, "skipped", ()):
+        # Never a bare "<": the message is parsed as HTML, so "(< 0.5R)" made
+        # Telegram answer "can't parse entities: Unsupported start tag" and every
+        # alert carrying a skipped pivot fell back to plain text (19 Nov: HCLTECH,
+        # MPHASIS, PSB, BAJAJ-AUTO all took the retry). "under" says the same.
         text += (" · skipped as too close to entry: "
-                 + ", ".join(plan.skipped) + f" (< {trade.min_target_r():.1f}R)")
+                 + ", ".join(plan.skipped) + f" (under {trade.min_target_r():.1f}R)")
     return text
 
 
@@ -645,13 +649,34 @@ def _summary_mirror() -> str:
 
 
 def _summary_pending(st: dict) -> str:
-    """Open trades whose candles never arrived — nothing was checked, and why."""
-    names = list((st.get("stats") or {}).get("pending") or ())
+    """Open trades whose candles did not arrive — what was not checked, and why.
+
+    "were never evaluated" was printed for every name left in the book at the
+    close, including names that had been checked all day: 19 Nov's summary said
+    BAJAJ-AUTO's stops, targets and EMA9 exit "were never evaluated" on the same
+    page as its T1 and T2 hits. A name that has been checked before is owed the
+    smaller, true sentence: its last candle was not evaluated.
+    """
+    stats = st.get("stats") or {}
+    names = list(stats.get("pending") or ())
     if not names:
         return ""
-    shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
-    return (f"⚠ not checked this session (no 5m candle): {shown} — their stops, "
-            f"targets and EMA9 exit were never evaluated")
+    checked = set(stats.get("checked") or ())
+
+    def show(items):
+        return ", ".join(items[:6]) + (" …" if len(items) > 6 else "")
+
+    never = [n for n in names if n not in checked]
+    at_close = [n for n in names if n in checked]
+    lines = []
+    if never:
+        lines.append(f"⚠ not checked this session (no 5m candle): {show(never)} — their "
+                     f"stops, targets and EMA9 exit were never evaluated")
+    if at_close:
+        lines.append(f"⚠ not checked on the last candle (no 5m candle): {show(at_close)} — "
+                     f"the stop, target and EMA9 check could not run there, so the exit "
+                     f"is unconfirmed; check it yourself")
+    return "\n".join(lines)
 
 
 def _summary_open(st: dict) -> str:
@@ -1219,6 +1244,13 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
         if grid is None or grid.empty:
             pending.append(raw)
             continue
+        # The candles are here, so this trade IS being checked. The book lets the
+        # close-of-day line tell "never checked" from "checked all day, last
+        # candle missing from the feed" — 19 Nov printed the first about a trade
+        # that had hit T1 and T2.
+        book = st.setdefault("stats", {}).setdefault("checked", [])
+        if raw not in book:
+            book.append(raw)
         ema_at = dict(zip(grid.index, grid["EMA9"].to_numpy(float)))
         side = pos["side"]
         sl = float(pos.get("sl") or 0)          # the live stop (breakeven after T1)
@@ -1335,6 +1367,15 @@ def _store_pending(st: dict, pending) -> None:
         stats["pending"] = names
     else:
         stats.pop("pending", None)
+    # The "was it checked at all" book describes the open book: a trade that has
+    # closed is not in it any more, and neither is a name the next session
+    # inherits from this one.
+    live = set((st.get("positions") or {}).keys())
+    checked = [n for n in (stats.get("checked") or ()) if n in live]
+    if checked:
+        stats["checked"] = checked
+    else:
+        stats.pop("checked", None)
 
 
 def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, backfill: bool = False) -> dict:
