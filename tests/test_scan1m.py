@@ -106,6 +106,11 @@ class Scan1mFixture(TestCase):
         self.bot3 = self.mocks[11]
         self.bot1 = self.mocks[12]
         self.engine = self.mocks[8]
+        # the end-of-day audit upload; patched outside ``self.patches`` so the
+        # indices above stay exactly where the tests expect them
+        upload = patch.object(scan1m.telegram, "send_document", return_value=True)
+        upload.start()
+        self.addCleanup(upload.stop)
 
     # ── fixtures ────────────────────────────────────────────────────────────
     def fetch(self, tickers, period, interval):

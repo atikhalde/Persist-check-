@@ -1,33 +1,42 @@
-"""The end-of-day report: everything the session did, and why it did not do more.
+"""The end-of-day report: everything the session did, and what it cost.
 
-The daily summary that already existed answers "what was sent". This answers the
-next question — *what did the day look like, and what should change* — from the
-books the scanners already keep: every candle's pick, every sector's persistence
-through the day, every signal that was blocked and the rule that blocked it,
-every trade and what it returned, and the data that was missing.
+The daily summary that already existed answered "what was sent". This answers the
+next questions — *what did the day look like, what was refused and why, what did
+it pay* — from the books the scanners keep while they run: every candle's tilt and
+every sector's numbers, every signal that was blocked with the rule that blocked
+it, every name each sector put forward with the three ranking legs, and the trader
+ledger with size, costs and rupees.
 
-It is written for Telegram, so it is long: the text is split into numbered
-messages of at most ``EOD_MAX_CHARS`` characters, cut on section and line
-boundaries, and the session is only marked ``reported`` when every part has been
-delivered — a half-sent report is worse than none, because it reads as complete.
+Telegram is a reading surface, so the text goes out as numbered messages of at
+most ``EOD_MAX_CHARS`` characters, cut on section and line boundaries. The same
+day also ships as data — a JSON audit and an XLSX workbook (``audit.py``) — and
+the session is only marked ``reported`` when every message *and* every attachment
+arrived: a half-delivered report reads as complete, which is worse than none.
 """
 from __future__ import annotations
 
 import logging
 import os
 
-from . import telegram
+from . import audit, costs, ledger, telegram
 
 log = logging.getLogger(__name__)
 
 #: Telegram refuses a message longer than 4096 characters; leave room for the
 #: part marker and an HTML entity or two.
 DEFAULT_LIMIT = 3800
+#: How many candles between timeline rows in the message (3 = every 15 minutes).
+TIMELINE_EVERY = 3
 
 
 def report_enabled() -> bool:
     """Send the full end-of-day report instead of the short summary (``EOD_REPORT``, 1)."""
     return os.environ.get("EOD_REPORT", "1").strip() != "0"
+
+
+def audit_enabled() -> bool:
+    """Attach the JSON audit and the workbook (``EOD_AUDIT``, 1)."""
+    return os.environ.get("EOD_AUDIT", "1").strip() != "0"
 
 
 def max_chars() -> int:
@@ -54,6 +63,11 @@ def _pct(v) -> str:
     return f"{float(v):+.2f}%"
 
 
+def _rs(v) -> str:
+    """Rupees, signed, no decimals — a ledger reads at a glance."""
+    return f"{float(v):+,.0f}"
+
+
 def _n(count: int, word: str, plural: str | None = None) -> str:
     """``1 entry`` / ``4 entries`` — the report is read at a glance."""
     return f"{count} {word if abs(count) == 1 else (plural or word + 's')}"
@@ -67,21 +81,23 @@ def _head(st: dict, bot: str) -> list[str]:
     pick = scan.get("sector") or "WAIT"
     side = int(scan.get("side") or 0)
     scanned = int(x.get("candles") or 0)
-    judged = len(x["judged"]) if isinstance(x.get("judged"), dict) else scanned
-    takeover = [f"🗂 <b>END OF DAY — {st.get('session', '')} · bot {bot}</b>"]
+    judged = (len(x["judged"]) if isinstance(x.get("judged"), dict) and x["judged"]
+              else scanned)
+    out = [f"🗂 <b>END OF DAY — {st.get('session', '')} · bot {bot}</b>"]
     if m.get("label"):
-        takeover.append(f"Market closed {m.get('label')} ({m.get('conf', '?')}%) · regime "
-                        f"{m.get('regime', '?')} · last pick <b>{pick}</b> "
-                        f"{'long' if side == 1 else 'short' if side == -1 else ''}".rstrip())
+        out.append(f"Market closed {m.get('label')} ({m.get('conf', '?')}%) · regime "
+                   f"{m.get('regime', '?')} · last pick <b>{pick}</b> "
+                   f"{'long' if side == 1 else 'short' if side == -1 else ''}".rstrip())
     else:
-        takeover.append(f"Last pick <b>{pick}</b> "
-                        f"{'long' if side == 1 else 'short' if side == -1 else ''}".rstrip())
-    takeover.append(f"Candles scanned {scanned}"
-                    + (f" · judged {judged}" if judged != scanned else "")
-                    + f" · with a pick {x.get('picks', 0)}"
-                    f" · entries {x.get('entries', 0)}")
-    takeover.append(_sent(st))
-    return takeover
+        out.append(f"Last pick <b>{pick}</b> "
+                   f"{'long' if side == 1 else 'short' if side == -1 else ''}".rstrip())
+    out.append(f"Candles scanned {scanned}"
+               + (f" · judged {judged}" if judged != scanned else "")
+               + f" · with a pick {x.get('picks', 0)} · entries {x.get('entries', 0)}")
+    out.append(_sent(st))
+    out.append(f"Blocked in all: {_n(len(audit.blocked_rows(st)), 'signal')} — "
+               f"each one listed below with its rule")
+    return out
 
 
 def _sent(st: dict) -> str:
@@ -113,8 +129,8 @@ def _day_shape(st: dict) -> list[str]:
         return []
     picked = {name: h for name, h in hist.items() if int(h.get("picks") or 0)}
     lines = ["<b>How the day was picked</b>"]
-    if not picked and not hist:
-        lines.append("No sector-pick history on record for this session.")
+    if not hist:
+        pass                       # only the pick trail: say nothing about sectors
     elif not picked:
         lines.append("No sector was picked all session — the market said WAIT on every candle.")
     else:
@@ -158,45 +174,141 @@ def _pick_trail(st: dict) -> str:
     return f"{span} · changed {_n(changes, 'time')}"
 
 
-def _sector_table(st: dict) -> list[str]:
-    """Each sector's persistence through the day, and what it produced."""
-    x = st.get("stats") or {}
-    hist = x.get("sector_hist") or {}
-    if not hist:
+def _timeline(st: dict) -> list[str]:
+    """The day's tape: market tilt, the pick and its flow, and when the pick moved."""
+    rows = (st.get("stats") or {}).get("timeline") or []
+    if not rows:
         return []
-    entries = {}
-    for rec in x.get("closed") or []:
-        entries[rec.get("sector")] = entries.get(rec.get("sector"), 0) + 1
-    for raw, pos in (st.get("positions") or {}).items():
-        entries[pos.get("sector") or ""] = entries.get(pos.get("sector") or "", 0) + 1
-    rows = []
-    for name, h in hist.items():
-        series = h.get("series") or []
-        first = series[0][1] if series else h.get("max")
-        last = h.get("persist")
-        arrow = "↑" if (last or 0) > (first or 0) + 3 else "↓" if (last or 0) < (first or 0) - 3 else "→"
-        rows.append((float(last or 0), name, h, arrow, first, last))
-    rows.sort(key=lambda r: (-r[0], r[1]))
-    lines = ["<b>Sector persistence (the day)</b>"]
-    for _, name, h, arrow, first, last in rows[:10]:
-        spark = " ".join(str(v) for _, v in (h.get("series") or [])[-6:])
-        bits = [f"{name} {int(h.get('max') or 0)}max/{int(last or 0)}now {arrow}"]
-        if spark:
-            bits.append(f"[{spark}]")
-        if h.get("day_ret") is not None:
-            bits.append(f"day {_pct(h['day_ret'])}")
-        bits.append(f"{int(h.get('picks') or 0)} candles as pick")
-        n = entries.get(name)
-        if n:
-            bits.append(_n(n, "entry", "entries"))
+    # A fixed number of rows whatever the day did: ~every 15 minutes, stretched
+    # when the session was long, and always including the last candle.
+    step = max(TIMELINE_EVERY, -(-len(rows) // 24))
+    chosen = rows[::step]
+    if chosen[-1] is not rows[-1]:
+        chosen = chosen + [rows[-1]]
+    lines = ["<b>Sector momentum timeline</b>"
+             f" (every {step * 5} min; the full matrix is in the audit)"]
+    for row in chosen:
+        sec = row.get("sec") or {}
+        pick = row.get("pick") or "WAIT"
+        label = f"{row.get('label') or '?'} {row.get('conf') or 0}"
+        cell = sec.get(pick) if pick != "WAIT" else None
+        if cell is None and sec:                       # no pick: show the leader
+            side = 1 if row.get("tilt", 0) >= 0 else -1
+            name = max(sec, key=lambda n: float(sec[n][0] if side == 1 else sec[n][1]))
+            cell, pick = sec[name], f"{name} (leader)"
+        bits = [f"{row.get('b')} {label}"]
+        if cell:
+            bits.append(f"{pick} · flow {cell[0]:.0f}▲/{cell[1]:.0f}▼ · "
+                        f"day {_pct(cell[2])} · intra {_pct(cell[3])}")
+        else:
+            bits.append(pick)
+        if row.get("regime"):
+            bits.append(str(row["regime"]))
         lines.append(" · ".join(bits))
-    if len(rows) > 10:
-        lines.append(f"… {len(rows) - 10} more sectors tracked")
+    changes = []
+    previous = None
+    for row in rows:
+        pick = row.get("pick") or "WAIT"
+        if previous is not None and pick != previous:
+            changes.append(f"{row.get('b')} {previous}→{pick}")
+        previous = pick
+    if changes:
+        lines.append(f"Pick moved {len(changes)} time(s): "
+                     + ", ".join(changes[:8]) + (" …" if len(changes) > 8 else ""))
+    return lines
+
+
+def _persistence(st: dict) -> list[str]:
+    """Score range, candles above the gate, when the gate was open, transitions."""
+    stats = audit.sector_stats(st)
+    if not stats:
+        return []
+    order = sorted(stats.items(), key=lambda kv: (-(kv[1].get("max") or 0), kv[0]))
+    lines = ["<b>Persistent-sector performance</b>"]
+    for name, s in order[:6]:
+        flow = "P+" if s.get("side") == 1 else "P−"
+        spells = s.get("gate_periods") or []
+        span = ""
+        if spells:
+            span = " · gate open " + _n(len(spells), "spell") + " " + ", ".join(
+                f"{p['from']}–{p['to']} ({p['candles']})" for p in spells[:3])
+            if len(spells) > 3:
+                span += f" +{len(spells) - 3}"
+        cross = [t for t in (s.get("transitions") or []) if t.get("level") in (70, 85)]
+        cross_txt = ""
+        if cross:
+            cross_txt = " · crossed " + ", ".join(
+                f"{t['level']}{'↑' if t['dir'] == 'up' else '↓'}@{t['bar']}"
+                for t in cross[:4])
+            if len(cross) > 4:
+                cross_txt += " …"
+        runs = f" ({_n(len(s['pick_periods']), 'run')})" if s.get("pick_candles") else ""
+        lines.append(f"{name} {flow} {int(s['min'])}–{int(s['max'])}→{int(s['now'])} · "
+                     f"{s['above_70']}/{s['candles']} candles ≥70 · "
+                     f"{s['gate_candles']} gate-open{span}"
+                     f" · {s['pick_candles']} candles as pick{runs}"
+                     f"{cross_txt} · {_n(s.get('entries', 0), 'entry', 'entries')}")
+    if len(order) > 6:
+        lines.append(f"… {len(order) - 6} more sector(s) in the audit")
+    return lines
+
+
+def _leadership(st: dict) -> list[str]:
+    """Which names each scanned sector kept putting forward, and what became of them."""
+    rows = audit.leadership_rows(st)
+    if not rows:
+        return []
+    entered = {r.get("raw") or r.get("name")
+               for r in (st.get("stats") or {}).get("closed") or []}
+    entered |= set((st.get("positions") or {}).keys())
+    blocked: dict[str, str] = {}
+    for kind, items in ((st.get("stats") or {}).get("rejected") or {}).items():
+        for key, detail in (items or {}).items():
+            # the key is "NAME@10:35" (or plain NAME) and the detail starts with
+            # the name too — either way the first token is the stock
+            name = str(key).split("@")[0].split()[0]
+            blocked.setdefault(name, kind)
+            if detail:
+                blocked.setdefault(str(detail).split()[0], kind)
+    per: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row.get("sector"), row.get("name"))
+        slot = per.setdefault(key, {"n": 0, "first": 0, "sum_r": 0.0, "sum_s": 0.0,
+                                    "sum_v": 0.0, "sum_t": 0.0, "top": 0})
+        slot["n"] += 1
+        slot["first"] = slot["first"] or row.get("rank_in_sector") == 1
+        slot["top"] += 1 if row.get("rank_in_sector") == 1 else 0
+        for src, dst in (("rank", "sum_r"), ("strength", "sum_s"), ("volume", "sum_v"),
+                         ("structure", "sum_t")):
+            try:
+                slot[dst] += float(row.get(src) or 0)
+            except (TypeError, ValueError):
+                pass
+    lines = ["<b>Top-5 leadership activity</b>"]
+    by_sector: dict[str, list] = {}
+    for (sector, name), slot in per.items():
+        by_sector.setdefault(sector, []).append((slot, name))
+    for sector, items in sorted(by_sector.items(),
+                                key=lambda kv: -max(i[0]["n"] for i in kv[1]))[:4]:
+        items.sort(key=lambda t: (-t[0]["n"], -(t[0]["sum_r"] / max(t[0]["n"], 1))))
+        bits = []
+        for slot, name in items[:5]:
+            n = max(slot["n"], 1)
+            tag = ("✚ entered" if name in entered
+                   else f"⊘ {blocked[name]}" if name in blocked else "")
+            bits.append(f"{name} {slot['sum_r'] / n:.0f} "
+                        f"(s{slot['sum_s'] / n:.0f}/v{slot['sum_v'] / n:.0f}/"
+                        f"t{slot['sum_t'] / n:.0f}) ×{slot['n']}"
+                        + (f" 1st×{slot['top']}" if slot["top"] else "")
+                        + (f" <i>{tag}</i>" if tag else ""))
+        lines.append(f"{sector}: " + " · ".join(bits))
+    lines.append("rank (s strength / v volume / t structure) · ×N = times in the top 5 · "
+                 "1st×N = times ranked first · every candle's table is in the audit")
     return lines
 
 
 def _blocked(st: dict) -> list[str]:
-    """Every signal that was *not* taken, by the rule that stopped it."""
+    """Every signal that did not become an entry — with the rule and its reason."""
     x = st.get("stats") or {}
     rejected = x.get("rejected") or {}
     weak = x.get("weak") or {}
@@ -207,32 +319,29 @@ def _blocked(st: dict) -> list[str]:
         return []
     from .pipeline import _REJECT_TEXT
 
-    lines = ["<b>Blocked signals — by rule</b>"]
+    lines = ["<b>Every blocked signal</b>"]
     known = {kind for kind, _ in _REJECT_TEXT}
-    total = 0
+    total = sum(len(v or {}) for v in rejected.values())
+    if total:
+        lines.append(f"{_n(total, 'signal')} blocked — listed one by one below")
     for kind, text in _REJECT_TEXT:
         items = rejected.get(kind) or {}
         if not items:
             continue
-        total += len(items)
-        shown = ", ".join(_clip(v) for v in list(items.values())[:6])
-        shown += " …" if len(items) > 6 else ""
-        lines.append(f"• {len(items)} — {text}: {shown}")
+        lines.append(f"<b>{len(items)} — {text}</b>")
+        lines.extend(f"• {_clip(detail, 90)}" for detail in items.values())
     for kind, items in rejected.items():
         if kind in known or not items:
             continue
-        total += len(items)
-        lines.append(f"• {len(items)} — {kind}: "
-                     + ", ".join(_clip(v) for v in list(items.values())[:4]))
-    if total:
-        lines.insert(1, f"{_n(total, 'signal')} blocked in all")
+        lines.append(f"<b>{len(items)} — {kind}</b>")
+        lines.extend(f"• {_clip(detail, 90)}" for detail in items.values())
     if weak:
         lines.append("Momentum gate: " + " · ".join(
             f"{k} {v}" for k, v in sorted(weak.items(), key=lambda kv: -kv[1])))
     if why:
         lines.append("Early alerts cancelled: "
                      + " · ".join(f"{_clip(k, 48)} {v}" for k, v in
-                                  sorted(why.items(), key=lambda kv: -kv[1])[:4]))
+                                  sorted(why.items(), key=lambda kv: -kv[1])[:6]))
     if isinstance(cap, dict) and cap:
         lines.append("Held back by the per-candle alert cap: "
                      + " · ".join(f"{k} {v}" for k, v in
@@ -244,52 +353,54 @@ def _blocked(st: dict) -> list[str]:
         dropped = sum(int(v.get("dropped") or 0) for v in trim.values())
         lines.append(f"Sector trim (SECTOR_TOP_N): kept {kept} name-checks, dropped {dropped}")
         for sector, v in sorted(trim.items(),
-                                key=lambda kv: -int(kv[1].get("dropped") or 0))[:5]:
+                                key=lambda kv: -int(kv[1].get("dropped") or 0))[:6]:
             lines.append(f"  · {sector}: kept {v.get('kept', 0)} · dropped {v.get('dropped', 0)}")
     return lines
 
 
 def _trades(st: dict) -> list[str]:
-    """Every entry: what it was, and what it did."""
-    x = st.get("stats") or {}
-    closed = list(x.get("closed") or [])
-    open_pos = st.get("positions") or {}
-    if not closed and not open_pos:
-        return ["<b>Trades</b>", "None opened."]
-    lines = ["<b>Trades</b>"]
-    for rec in closed[-12:]:
-        lines.append(f"• {rec.get('raw')} {rec.get('side')} {rec.get('time')} "
-                     f"{(rec.get('entry'))} → {(rec.get('exit'))} "
-                     f"<b>{float(rec.get('r') or 0):+.1f}R</b> ({rec.get('why')}"
-                     + (f", T{rec.get('t_hit')} hit" if rec.get("t_hit") else "") + ")")
-    for raw, pos in open_pos.items():
-        r = None
-        try:
-            risk = float(pos.get("risk") or 0)
-            if risk and pos.get("last_close") is not None:
-                long = pos.get("side") == "BUY"
-                r = ((float(pos["last_close"]) - float(pos["entry"])) if long
-                     else (float(pos["entry"]) - float(pos["last_close"]))) / risk
-        except (TypeError, ValueError):
-            r = None
-        lines.append(f"• {raw} {pos.get('side')} open from "
-                     f"{_hhmm(pos.get('entry_bar'))} @ {pos.get('entry')}"
-                     f" · stop {pos.get('sl')}"
-                     + (f" · <b>{r:+.1f}R</b> at the close" if r is not None else " · unmarked")
-                     + (f" · T{'T'.join(str(t) for t in pos.get('hit_targets') or ())} hit"
-                        if pos.get("hit_targets") else ""))
-    by_why: dict[str, int] = {}
-    for rec in closed:
-        by_why[str(rec.get("why") or "?")] = by_why.get(str(rec.get("why") or "?"), 0) + 1
-    if by_why:
-        lines.append("Closed by: " + " · ".join(f"{k} {v}" for k, v in
-                                               sorted(by_why.items(), key=lambda kv: -kv[1])))
-    scored = [float(r.get("r") or 0) for r in closed]
-    if scored:
-        wins = sum(1 for r in scored if r > 0)
-        lines.append(f"Closed {len(scored)}: {wins} up / {len(scored) - wins} down · "
-                     f"{sum(scored):+.1f}R in all · best {max(scored):+.1f}R · "
-                     f"worst {min(scored):+.1f}R")
+    """The trader's ledger: size, both prices, costs, rupees and R."""
+    rows = ledger.closed_rows(st)
+    opened = ledger.open_rows(st)
+    books = ledger.totals(rows, opened)
+    lines = ["<b>Trader ledger</b>"]
+    if not rows and not opened:
+        lines.append("No position was opened.")
+        lines.append(f"Cost model: {costs.cost_bps():g} bps/side (min ₹{costs.cost_min():g} "
+                     f"per order) on ₹{costs.trade_capital():,.0f} a trade")
+        return lines
+    for i, t in enumerate(rows, start=1):
+        lines.append(
+            f"{i}. {t['name']} {t['side']} {t['qty']}q @ {t['entry']:.2f}"
+            f" ({_hhmm(t['entry_at'])}) → {t['exit']:.2f} ({t['exit_at']}) · "
+            f"{t['why']}{', T' + str(t['targets_hit']) if t['targets_hit'] else ''}"
+            f" · gross ₹{t['gross_rs']:,.0f} · costs ₹{t['costs_rs']:,.0f} · "
+            f"<b>net {_rs(t['net_rs'])} ₹</b> · {t['gross_r']:+.1f}R gross / "
+            f"{t['net_r']:+.1f}R net"
+            + (f" · {t['hold_min']:.0f} min" if t.get("hold_min") is not None else ""))
+    for t in opened:
+        if t.get("mark") is None:
+            lines.append(f"• {t['name']} {t['side']} {t['qty']}q @ {t['entry']:.2f} — "
+                         f"still open, unmarked ({t['why']})")
+            continue
+        lines.append(
+            f"• {t['name']} {t['side']} {t['qty']}q @ {t['entry']:.2f} → {t['mark']:.2f} "
+            f"marked · gross ₹{t['gross_rs']:,.0f} · costs ₹{t['costs_rs']:,.0f} · "
+            f"<b>net {_rs(t['net_rs'])} ₹</b> · {t['gross_r']:+.1f}R gross / "
+            f"{t['net_r']:+.1f}R net · still open")
+    lines.append(ledger.summary_line(books))
+    if books.get("trades"):
+        detail = (f"avg win ₹{books['avg_win_rs']:,.0f} · avg loss ₹{books['avg_loss_rs']:,.0f} · "
+                  f"best {_rs(books['best_rs'])} · worst {_rs(books['worst_rs'])}")
+        lines.append(detail)
+        if books.get("risk_rs"):
+            lines.append(f"risk deployed ₹{books['risk_rs']:,.0f} · return on risk "
+                         f"{books['return_on_risk_pct']:+.1f}%"
+                         + (f" · avg hold {books['avg_hold_min']:.0f} min"
+                            if books.get("avg_hold_min") is not None else ""))
+    lines.append(f"Cost model: {costs.cost_bps():g} bps/side (min ₹{costs.cost_min():g} per "
+                 f"order) on ₹{costs.trade_capital():,.0f} a trade — COST_BPS / COST_MIN / "
+                 f"TRADE_CAPITAL")
     return lines
 
 
@@ -299,17 +410,26 @@ def _health(st: dict) -> list[str]:
     from .pipeline import (_summary_catchup, _summary_early_skip, _summary_mirror,
                            _summary_no_index, _summary_pending, _summary_scan_lag)
 
-    lines = ["<b>Health</b>"]
+    lines = ["<b>Data diagnostics</b>"]
     for text in (_summary_no_index(x), _summary_scan_lag(x), _summary_pending(st),
                  _summary_catchup(st), _summary_early_skip(x), _summary_mirror()):
         if text:
             lines.append("• " + text)
+    lag_n = int(x.get("lag_n") or 0)
+    if lag_n:
+        avg = float(x.get("lag_sum") or 0.0) / lag_n
+        lines.append(f"• alerts went out {avg:.0f}s after the close on average "
+                     f"(slowest {float(x.get('lag_max') or 0):.0f}s, {lag_n} candle(s))")
     if x.get("feed_behind"):
         lines.append(f"• the 1m feed lagged past the close on {x['feed_behind']} candle(s)")
     if x.get("unjudged"):
         names = list(x["unjudged"])
         lines.append(f"• candles never judged: {len(names)} — "
-                     + ", ".join(names[:6]) + (" …" if len(names) > 6 else ""))
+                     + ", ".join(names[:8]) + (" …" if len(names) > 8 else ""))
+    if x.get("checked"):
+        lines.append(f"• open trades checked against the feed: {len(x['checked'])}")
+    if x.get("alert_capped_total"):
+        lines.append(f"• alerts held back by the per-candle cap: {x['alert_capped_total']}")
     if len(lines) == 1:
         lines.append("No feed, scan or delivery problems recorded.")
     return lines
@@ -322,7 +442,10 @@ def _rules() -> list[str]:
                            max_entries_per_pick, sector_top_n)
     from .trade import min_target_r
 
-    diff = list(knob_mod.differing().items())
+    # The attachment and message knobs belong in the audit, not in the rules a
+    # reader is asked to judge the day against.
+    infra = {"AUDIT_DIR", "EOD_MAX_CHARS", "EOD_AUDIT", "EOD_REPORT"}
+    diff = [(k, v) for k, v in knob_mod.differing().items() if k not in infra]
     lines = ["<b>Rules in force</b>",
              f"entries: cap {max_entries_per_pick() or 'none'} per pick · runners within "
              f"{entry_rank_band() * 100:.0f}% of the sector's best · rank floor "
@@ -368,6 +491,18 @@ def _observations(st: dict) -> list[str]:
         out.append(f"⚠ {_n(earlier, 'signal')} fired before their sector was picked and "
                    f"only {caught} were taken or announced — the pick is late, not the "
                    f"signal")
+    books = ledger.totals(ledger.closed_rows(st), ledger.open_rows(st))
+    if books.get("trades") and books.get("costs_rs") and books.get("gross_rs"):
+        if books["costs_rs"] > 0.35 * abs(books["gross_rs"]):
+            out.append(f"⚠ costs ate ₹{books['costs_rs']:,.0f} of ₹{books['gross_rs']:,.0f} "
+                       f"gross — fewer, bigger trades (or a tighter COST_BPS) would have "
+                       f"kept more")
+        if books.get("profit_factor") is not None and books["profit_factor"] < 1:
+            out.append(f"⚠ profit factor {books['profit_factor']} — the losses outweighed "
+                       f"the wins; the entries that worked are named above")
+    if books.get("max_dd_rs"):
+        out.append(f"⚠ the book fell ₹{books['max_dd_rs']:,.0f} from its peak — "
+                   f"the exits that caused it are in the ledger")
     if not out:
         out.append("Nothing stands out: the refused names were refused by the rules "
                    "above, at the counts shown.")
@@ -377,8 +512,9 @@ def _observations(st: dict) -> list[str]:
 # ── the report ──────────────────────────────────────────────────────────────
 def format_eod(st: dict, *, bot: str = "5m") -> str:
     """The whole day, in one (long) text. Split it with :func:`chunks` to send."""
-    blocks = [_head(st, bot), _day_shape(st), _sector_table(st), _blocked(st),
-              _trades(st), _health(st), _rules(), _observations(st)]
+    blocks = [_head(st, bot), _day_shape(st), _timeline(st), _persistence(st),
+              _leadership(st), _blocked(st), _trades(st), _health(st), _rules(),
+              _observations(st)]
     return "\n\n".join("\n".join(b for b in block if b) for block in blocks if block)
 
 
@@ -410,15 +546,37 @@ def chunks(text: str, limit: int | None = None) -> list[str]:
             for i, part in enumerate(parts, 1)]
 
 
-def send_eod(st: dict, *, bot: str = "5m", send=None, dry_run: bool = False) -> bool:
-    """Send every part of the report. ``True`` only when all of them arrived."""
+def send_eod(st: dict, *, bot: str = "5m", send=None, send_doc=None,
+             dry_run: bool = False) -> bool:
+    """Send every numbered message and both attachments. ``True`` only if all arrived.
+
+    ``send_doc`` defaults to :func:`telegram.send_document` with the right bot;
+    a caller that only wants the text (a test, a dry run) can pass a stub.
+    """
     send = send or telegram.send
+    if send_doc is None:
+        target = 3 if bot == "1m" else 1
+        send_doc = lambda path, caption="": telegram.send_document(       # noqa: E731
+            path, caption, bot=target, dry_run=dry_run)
     parts = chunks(format_eod(st, bot=bot))
     ok = True
     for i, part in enumerate(parts, 1):
         if not send(part, dry_run=dry_run):
             log.error("end-of-day report part %d/%d was not delivered", i, len(parts))
             ok = False
+    if audit_enabled():
+        try:
+            json_path, xlsx_path, payload = audit.write(st, bot=bot)
+        except Exception:
+            log.exception("could not write the audit files — the text report above stands")
+        else:
+            books = payload.get("books") or {}
+            caption = (f"Audit {st.get('session')} · {books.get('trades', 0)} trade(s) · "
+                       f"net ₹{books.get('net_rs', 0):,.0f}")
+            for path in (json_path, xlsx_path):
+                if not send_doc(str(path), caption):
+                    log.error("audit attachment %s was not delivered", path)
+                    ok = False
     if ok:
-        log.info("end-of-day report sent: %d part(s)", len(parts))
+        log.info("end-of-day report sent: %d part(s) + attachments", len(parts))
     return ok

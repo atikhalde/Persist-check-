@@ -69,85 +69,95 @@ Entry is the **signal candle's close** (two-decimal price precision). EMA9 inclu
 
 ### End-of-day report (15:33)
 
-The session ends with **one report, not a one-liner**. It is built from the books
-the scanners keep through the day, so every number in it can be traced back to the
-candle that produced it:
+The session ends with a **report of the day**, in numbered Telegram messages, plus
+the same day as data — a **JSON audit** and an **XLSX workbook** uploaded beside
+them. Every number comes from a book the scanner writes while it runs, so it can
+be traced back to the candle that produced it (and checked against the JSON).
 
-* **the day's shape** — how many candles were scanned and judged, how many had a
-  pick, how many entries were opened, what the alert ledger holds by kind, the
-  first and last pick of the day and how often the incumbent changed;
-* **sector persistence through the day** — for the ten strongest sectors: the
-  peak score, the score at the close, whether it rose or fell, a 15-minute
-  sample series, the sector's day move and how many candles it was the pick;
-* **every blocked signal, by the rule that blocked it** — count per rule plus the
-  names and their own reason (`N4 10:35 — rank 4 is behind its sector's runners`),
-  the momentum gate by test (sideways / reversing / weak / behind runners), and
-  what `SECTOR_TOP_N` trimmed;
-* **every trade** — closed trades with entry, exit, R and why (T-hit / SL / EMA9
-  exit), open trades marked at the close, and the day's totals (`1 up / 1 down ·
-  +0.2R in all`);
-* **health** — the feed bars that were late, names whose bars never arrived, the
-  1m feed behind the close, candles never judged, undelivered alerts, the LATE
-  LEADER catch-ups and the early-pass skips by reason;
-* **the rules in force** and any knob that differs from its default;
-* **what to look at tomorrow** — computed from the day, not guessed: a sector that
-  was the pick all day and produced nothing, a gate that refused far more names
-  than it let through, early alerts that died before their close and why, signals
-  that fired before their sector was picked.
+| section | what it answers |
+|---|---|
+| Head | session, market close, last pick, candles scanned/judged, entries, what the alert ledger holds by kind, how many signals were blocked |
+| How the day was picked | candles per picked sector, longest run, first/last pick, how often the incumbent changed, what was scanned beside the pick |
+| **Sector momentum timeline** | every ~15 min: market tilt (label + confidence), the pick, its **bull▲/bear▼ flow**, the sector's day and from-open move, the regime — with the moments the pick moved |
+| **Persistent-sector performance** | per sector: score range (min–max–now), candles ≥70, candles and **spells with the gate open** (times), crossings of 70/85, candles as pick and how many runs, entries |
+| **Top-5 leadership activity** | per scanned sector, the names that kept coming up: average combined rank and its three legs (`s` strength / `v` volume / `t` structure), times in the top 5, times first, and `✚ entered` / `⊘ rule` for what became of them |
+| **Every blocked signal** | one line per signal, under the rule that blocked it, with its own reason (`N4 10:35 — rank 4 is behind its sector's runners`) — no sampling, no "6 of 31" |
+| **Trader ledger** | every trade: quantity, entry/exit price and time, why it closed, targets hit, hold time, **gross ₹, costs ₹, net ₹**, gross R and net R; open trades marked at the close; then the day's book — wins/losses, profit factor, expectancy, best/worst, max drawdown, risk deployed and return on risk |
+| Data diagnostics | pending names, bars the feed never published, candles never judged, alert latency (average/slowest), 1m feed behind the close, LATE LEADER catch-ups and refusals, early-pass skips, undelivered alerts, mirror failures |
+| Rules in force | cap / band / floor / top-N / targets / catch-up window, plus every trading knob that differs from its default |
+| What to look at tomorrow | computed from the day: a pick that produced nothing, a gate that refused 40 names to admit one, early alerts that died (with the dominant reason), signals fired before their sector was picked, costs that ate the gross, a profit factor under 1, the drawdown |
 
 ```
-🗂 <b>END OF DAY — 2026-11-20 · bot 5m</b>
-Market closed BULL (74%) · regime TREND · last pick <b>AUTO</b> long
+🗂 END OF DAY — 2026-11-20 · bot 5m
+Market closed BULL (74%) · regime TREND · last pick AUTO long
 Candles scanned 75 · with a pick 41 · entries 5
-Alerts on record 5 (last code per name): ENTRY 3 · EXIT 1 · T1 1 · <b>1 undelivered</b>
+Alerts on record 12 (last code per name): ENTRY 5 · T1 3 · SL 1 · EXIT 1
+Blocked in all: 44 signals — each one listed below with its rule
 
-<b>How the day was picked</b>
-Pick (candles): AUTO 41 · BANK 20
-Longest run AUTO 41 candles (205 min) · 2 sector(s) picked in all
-first pick 09:20 · last 15:25 · 3 candles on record · changed 1 time
-Scanned beside the pick: IT 30 · PHARMA 12
+Sector momentum timeline (every 15 min; the full matrix is in the audit)
+09:15 BULL 74 · AUTO · flow 92▲/10▼ · day +1.24% · intra +0.30% · TREND
+10:10 BULL 74 · AUTO · flow 99▲/12▼ · day +1.86% · intra +0.60% · TREND
+13:05 BULL 74 · CDUR · flow 99▲/10▼ · day +2.45% · intra +0.30% · TREND
+15:25 NEUTRAL 60 · AUTO · flow 96▲/12▼ · day +2.10% · intra +0.20% · CHOP
+Pick moved 3 time(s): 10:05 AUTO→CDUR, 10:10 CDUR→AUTO, 13:00 AUTO→CDUR
 
-<b>Sector persistence (the day)</b>
-AUTO 98max/91now ↑ · [55 66 76 80 88 91] · day +1.84% · 41 candles as pick · 3 entries
-BANK 90max/88now ↑ · [30 88] · day +1.10% · 20 candles as pick
-IT 71max/44now ↓ · [71 50 44] · day -0.90% · 0 candles as pick
+Persistent-sector performance
+AUTO P+ 88–99→96 · 71/75 candles ≥70 · 63 gate-open · gate open 2 spells 09:15–11:05 (23), 11:30–15:25 (47) · 58 candles as pick (3 runs) · crossed 70↑@09:20, 85↑@09:45 · 3 entries
+CDUR P+ 76–99→97 · 62/75 candles ≥70 · 55 gate-open · gate open 1 spell 09:45–15:25 (55) · 14 candles as pick (2 runs) · crossed 70↑@09:45, 85↑@10:40 · 2 entries
 
-<b>Blocked signals — by rule</b>
-6 signals blocked in all
-• 1 — fired before their sector was picked: BOSCHLTD fired at 09:35, AUTO picked at 10:10
-• 3 — not running — sideways, reversing or weak momentum: N0 10:35 — rank 0 is behind its sector's runners, N4 10:35 — rank 4 is behind its sector's runners, N7 11:05 — reversing — under its EMA9 with the last candles aga…
-• 2 — followers not scanned — outside the sector's top: XYZ AUTO, PQR AUTO
-Momentum gate: behind its sector's runners 9 · reversing 2
-Early alerts cancelled: the close did not confirm the early signal 3 · the sector changed 1
-Sector trim (SECTOR_TOP_N): kept 25 name-checks, dropped 39
-  · AUTO: kept 15 · dropped 24
-  · IT: kept 10 · dropped 15
+Top-5 leadership activity
+AUTO: MARUTI 80 (s70/v60/t75) ×75 1st×75 ✚ entered · M&M 77 (s69/v61/t75) ×75 ✚ entered · TATAMOTORS 74 (s68/v62/t75) ×52 · BAJAJ-AUTO 71 (s67/v63/t75) ×44 ⊘ weak
+rank (s strength / v volume / t structure) · ×N = times in the top 5 · every candle's table is in the audit
 
-<b>Trades</b>
-• TATAMOTORS BUY 10:15 700.0 → 712.0 <b>+1.2R</b> (EMA9 EXIT, T1 hit)
-• M&M BUY 11:05 3400.0 → 3370.0 <b>-1.0R</b> (SL HIT)
-• MARUTI BUY open from 12:40 @ 12000.0 · stop 12000.0 · <b>+1.5R</b> at the close · T1 hit
-Closed by: EMA9 EXIT 1 · SL HIT 1
-Closed 2: 1 up / 1 down · +0.2R in all · best +1.2R · worst -1.0R
+Every blocked signal
+44 signals blocked — listed one by one below
+1 — fired before their sector was picked
+• BOSCHLTD fired at 09:35, AUTO picked at 10:10
+31 — not running — sideways, reversing or weak momentum
+• N0 10:00 — rank 0 is behind its sector's runners
+• N1 10:01 — rank 1 is behind its sector's runners
+   … one line per name, all 31 of them
+12 — followers not scanned — outside the sector's top
+• F0 AUTO · F1 AUTO · … (one per name)
 
-<b>Health</b>
-• LATE LEADER catch-ups 3 (signal fired before its sector was picked) · not sent (per name-check): older than the window 2
+Trader ledger
+1. TATAMOTORS BUY 142q @ 700.00 (09:20) → 712.00 (10:15) · EMA9 EXIT, T1 · gross ₹1,704 · costs ₹100 · net +1,604 ₹ · +1.2R gross / +1.9R net · 55 min
+2. M&M BUY 29q @ 3400.00 (10:05) → 3370.00 (11:05) · SL HIT · gross ₹-870 · costs ₹98 · net -968 ₹ · -1.0R gross / -1.1R net · 60 min
+3. HAVELLS BUY 66q @ 1500.00 (10:20) → 1522.00 (12:10) · EMA9 EXIT, T2 · gross ₹1,452 · costs ₹100 · net +1,352 ₹ · +1.4R gross / +1.4R net · 110 min
+• MARUTI BUY 8q @ 12000.00 → 12150.00 marked · gross ₹1,200 · costs ₹97 · net +1,103 ₹ · +1.5R gross · still open
+3 closed · 2W/1L (67%) · gross ₹2,286 − costs ₹298 = net ₹1,988 · +2.1R · avg +0.71R · PF 3.05 · worst drawdown ₹968
+risk deployed ₹2,712 · return on risk +73.3% · avg hold 75 min
+Cost model: 5 bps/side (min ₹20 per order) on ₹100,000 a trade — COST_BPS / COST_MIN / TRADE_CAPITAL
 
-<b>Rules in force</b>
-entries: cap none per pick · runners within 75% of the sector's best · rank floor 40 · top 5 names per sector · targets ≥ 0.5R · catch-up window 40 min
-no knob changed from its default
+Data diagnostics
+• alerts went out 15s after the close on average (slowest 47s, 60 candle(s))
 
-<b>What to look at tomorrow</b>
-• ⚠ 4 of 6 early alerts died before their close (most often: the close did not confirm the early signal)
+What to look at tomorrow
+• ⚠ 41 names refused by the momentum gate against 5 entries — ENTRY_RANK_BAND may be too tight for this tape
+• ⚠ the book fell ₹968 from its peak — the exits that caused it are in the ledger
 ```
+
+**The attachments carry what a message cannot.** `reports/audit-<session>.json` is
+the day in full: every candle with the market's tilt and every sector's
+persistence, day/intra move and gate state; every blocked signal with its rule and
+detail; every leadership row per candle with its components; the trader ledger;
+diagnostics; and every knob's effective value. `reports/audit-<session>.xlsx` is
+the same day as sheets — `Summary`, `Trades`, `Blocked`, `Timeline`, `Sectors`,
+`SectorSeries`, `Leadership`, `Diagnostics` — written by a small built-in writer
+(`xlsx.py`), so the workflow installs nothing new.
+
+**Costs.** R tells you whether the rule worked; the ledger tells you what the day
+paid. `COST_BPS` (5) is the all-in cost per side as a percentage of turnover —
+brokerage, STT on the sell, exchange and SEBI fees, stamp duty, GST and the spread
+— and `COST_MIN` (₹20) is the floor per order so a small position is not costed as
+free. `TRADE_CAPITAL` (₹1,00,000) sets the size one entry buys, so every trade has
+a quantity, a rupee risk and a net figure beside its R.
 
 Telegram refuses a message over 4096 characters, so a long day goes out as
-numbered parts (`(1/3)`, `(2/3)`, …) cut on section boundaries; the session is
-marked `reported` **only when every part arrived**. `EOD_REPORT=0` restores the
-short summary for both bots. The report reuses every line the short summary had
-(`SCAN1M_SUMMARY` still gates *whether* the 1m bot reports at all). The extra
-books it reads are cheap: one sector sample per three candles, one row per
-refused signal, one row per closed trade.
+numbered parts (`(1/4)`, `(2/4)`, …) cut on section boundaries (`EOD_MAX_CHARS`,
+3800, clamped 1000–4000); the session is marked `reported` **only when every part
+and both attachments arrived**. `EOD_REPORT=0` restores the short one-message
+summary, `EOD_AUDIT=0` sends the messages without the files.
 
 ### Why a pivot target can look wrong (verified case: PNB, 11 Nov 2026)
 
@@ -714,6 +724,11 @@ BULL/BEAR market is unaffected.
 | `TRIPLE_MIN_PERSIST` | `85` | the score all three must beat for the third book |
 | `EOD_REPORT` | `1` | send the full **end-of-day report** at 15:33 instead of the short summary (both bots). `0` = the old one-message summary. The report lists the day's picks, every sector's persistence through the session, every blocked signal with the rule that blocked it, every trade with its R, feed and delivery problems, the rules in force and what to look at tomorrow |
 | `EOD_MAX_CHARS` | `3800` | characters per message of that report (clamped to 1000–4000). A longer report is split into numbered parts, and the session counts as reported only when every part is delivered |
+| `EOD_AUDIT` | `1` | upload the day's JSON audit and XLSX workbook with the report (`0` = messages only). The session is only counted as reported when they arrived too |
+| `AUDIT_DIR` | `reports` | where the two audit files are written before the upload |
+| `COST_BPS` | `5` | all-in trading cost **per side**, in basis points of turnover: brokerage, STT, exchange + SEBI fees, stamp duty, GST and the spread. Used by the ledger for gross → net |
+| `COST_MIN` | `20` | floor cost per order (₹) — a ₹9,000 position is not costed as if it were free |
+| `TRADE_CAPITAL` | `100000` | notional one entry is sized at (₹), so every trade gets a quantity, a rupee risk and a net P&L beside its R |
 
 **Triple pick (before the dual).** When the pick's *own* side has three sectors
 above `TRIPLE_MIN_PERSIST` (85) at the same time, the scan takes those three and

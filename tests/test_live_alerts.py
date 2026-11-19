@@ -426,6 +426,12 @@ class LiveAlertTests(TestCase):
         self.scan = self.mocks[8]
         self.send = self.mocks[9]
         self.settled = self.contexts[10]
+        # The end-of-day report also uploads its audit; a test must not post.
+        # Patched here rather than in ``contexts``: the indices above are part of
+        # this fixture's contract.
+        upload = patch.object(pipeline.telegram, "send_document", return_value=True)
+        upload.start()
+        self.addCleanup(upload.stop)
 
     def market_at_bar(self, df, *args, **kwargs):
         self.md.bar_time = df.index[-1].strftime("%Y-%m-%d %H:%M")

@@ -11,7 +11,7 @@ from math import isfinite
 
 import pandas as pd
 
-from . import data, state, telegram
+from . import costs, data, state, telegram
 from .market import (lapsed_stickiness, pick_sticky_log, previous_pick,
                      record_pick, run_market, SECTOR_ORDER)
 from .oi_data import CSV_OIReader, StubOIReader
@@ -424,6 +424,8 @@ def new_position(side: str, plan: TradePlan, bar_iso: str, session: str,
         # Which book the trade belongs to: the end-of-day report scores entries
         # per sector, and at the close the state's ``scan`` names a later pick.
         "sector": sector,
+        # The ledger's size: the report turns R into rupees at ``TRADE_CAPITAL``.
+        "qty": costs.quantity(plan.entry),
     }
 
 
@@ -611,17 +613,17 @@ def _scan_sides(uni: dict, sector: str, side: int, extra=(), alt: str = "",
 
 def _sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, str],
                     side_of: dict[str, int], sm5: dict, current: list[str], md,
-                    last) -> set[str]:
+                    last, record: dict | None = None) -> set[str]:
     """``sector_leaders`` with each sector's intraday % looked up on the decision."""
     intra_of = {sector: ((getattr(md, "sectors", None) or {}).get(sector) or {}).get("intra_ret")
                 for sector in set(sector_of.values())}
     return sector_leaders(stocks, tickers, sector_of, side_of, sm5, current,
-                          intra_of, last)
+                          intra_of, last, record=record)
 
 
 def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, str],
                    side_of: dict[str, int], sm5: dict, current: list[str],
-                   intra_of: dict, last) -> set[str]:
+                   intra_of: dict, last, record: dict | None = None) -> set[str]:
     """The names of each scanned sector worth judging: its top ``SECTOR_TOP_N``.
 
     Ranked by ``sector_lead`` — the stock's move from its own open minus its
@@ -632,6 +634,10 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
     ``intra_of`` is ``{sector: move from its own open, %}``, so the 1m scan —
     which holds the pick rather than the whole decision — trims on the same
     numbers as the 5m scan.
+
+    ``record``, when given, is filled with each sector's kept names and the three
+    ranking legs behind them — the audit's leadership table, and the only place
+    the components survive the log.
     """
     n = sector_top_n()
     if not n:
@@ -660,6 +666,14 @@ def sector_leaders(stocks: list[str], tickers: list[str], sector_of: dict[str, s
     for sector, items in groups.items():
         items.sort(key=lambda t: (-t[0], t[1]))
         keep.update(raw for _, raw, _ in items[:n])
+        if record is not None:
+            record[sector] = [
+                {"name": raw,
+                 "rank": None if score == float("-inf") else round(float(score), 1),
+                 "strength": parts.get("strength"), "volume": parts.get("volume"),
+                 "structure": parts.get("structure"), "lead": parts.get("lead"),
+                 "kept": i < n}
+                for i, (score, raw, parts) in enumerate(items[:n])]
         if len(items) > n:
             def _fmt(item) -> str:
                 score, raw, parts = item
@@ -806,6 +820,55 @@ def _note_sector_day(st: dict, md, bar: str) -> None:
             series.append([bar[-5:], round(persist)])
 
 
+def _note_timeline(st: dict, md, bar: str, pick: str, side: int) -> None:
+    """One row per candle: the market's tilt and every sector's numbers.
+
+    This is the day's tape as the scanner saw it — what the report's timeline is
+    drawn from and what the audit attachment ships in full. Short keys on
+    purpose: it is written on every candle of a five-hour session and lives in
+    the same JSON as the alert ledger.
+    """
+    snaps = getattr(md, "sectors", None) or {}
+    if not snaps:
+        return
+    row = {"b": bar[-5:], "tilt": int(getattr(md, "dir_state", 0) or 0),
+           "conf": int(getattr(md, "dir_conf", 0) or 0),
+           "label": getattr(md, "dir_label", ""), "regime": getattr(md, "regime", ""),
+           "pick": pick, "side": int(side or 0), "sec": {}}
+    for name, snap in snaps.items():
+        def num(key, nd=0):
+            try:
+                return round(float(snap.get(key) or 0.0), nd)
+            except (TypeError, ValueError):
+                return 0
+        row["sec"][name] = [num("persist_bull"), num("persist_bear"), num("day_ret", 2),
+                            num("intra_ret", 2), 1 if snap.get("qualified") else 0]
+    book = st.setdefault("stats", {}).setdefault("timeline", [])
+    if book and book[-1].get("b") == row["b"]:
+        book[-1] = row                      # the same candle, polled again
+    else:
+        book.append(row)
+    del book[:-120]                          # a session is 75 candles; keep a day
+
+
+def _note_leadership(st: dict, bar: str, record: dict) -> None:
+    """The five names each scanned sector put forward on this candle.
+
+    ``sector_leaders`` already ranks them (strength · volume · structure) and
+    logs the three legs; the report needs the same numbers *after* the fact, to
+    say which names kept leading and what happened to them.
+    """
+    if not record:
+        return
+    book = st.setdefault("stats", {}).setdefault("leadership", [])
+    row = {"b": bar[-5:], "sec": record}
+    if book and book[-1].get("b") == bar[-5:]:
+        book[-1] = row
+    else:
+        book.append(row)
+    del book[:-120]
+
+
 def _note_weak(st: dict, why: str) -> None:
     """Count a momentum-gate refusal by *why*, not just as "weak"."""
     key = ("reversing" if "reversing" in why else
@@ -838,11 +901,19 @@ def _close_trade(st: dict, raw: str, pos: dict, price: float, why: str, hhmm: st
         risk = float(pos.get("risk") or 0.0)
         long = pos.get("side") == "BUY"
         r = ((price - entry) if long else (entry - price)) / risk if risk else 0.0
+        qty = int(pos.get("qty") or costs.quantity(entry))
+        money = costs.round_trip(pos.get("side") or "BUY", entry, price, qty)
         book = st.setdefault("stats", {}).setdefault("closed", [])
         book.append({"raw": raw, "side": pos.get("side"), "time": hhmm, "why": why,
                      "entry": round(entry, 2), "exit": round(float(price), 2),
                      "r": round(r, 2),
+                     "qty": qty, "gross": money["gross"], "costs": money["costs"],
+                     "net": money["net"],
+                     "net_r": round(money["net"] / (risk * qty), 2) if risk and qty else 0.0,
                      "t_hit": len(pos.get("hit_targets") or ()),
+                     "stop0": pos.get("sl0"),
+                     "t1": pos.get("t1"), "t2": pos.get("t2"), "t3": pos.get("t3"),
+                     "entry_bar": pos.get("entry_bar"),
                      "sector": pos.get("sector") or (st.get("scan") or {}).get("sector") or ""})
     except Exception:                      # bookkeeping must never break an alert
         log.exception("could not file the closed trade for %s", raw)
@@ -1938,6 +2009,9 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     if not allow_stale and (st.get("stats") or {}).get("bar") != md.bar_time:
         st.setdefault("stats", {})["bar"] = md.bar_time      # count each candle once
         _note_sector_day(st, md, md.bar_time)                # the day's sector shape
+        _note_timeline(st, md, md.bar_time,
+                       md.pick_sector if scanning else "WAIT",
+                       md.pick_side if scanning else 0)      # the day's tape
         _bump(st, "candles")
         _bump(st, "picks", 1 if scanning else 0)
         if scanning:
@@ -2041,7 +2115,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 raw for raw in unsettled if raw not in result.get("pending", []))
     sd1 = data.fetch_daily(current, period_1d)
 
-    leaders = _sector_leaders(stocks, tickers, sector_of, side_of, sm5, current, md, last)
+    lead_rank: dict = {}
+    leaders = _sector_leaders(stocks, tickers, sector_of, side_of, sm5, current, md, last,
+                              record=lead_rank)
+    if not allow_stale and sector_top_n():
+        _note_leadership(st, last.strftime("%Y-%m-%d %H:%M"), lead_rank)
     if not allow_stale and sector_top_n():
         per_sector: dict[str, list[int]] = {}
         for raw in stocks:
