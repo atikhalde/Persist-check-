@@ -764,10 +764,9 @@ Nifty 50 / VIX: `^NSEI`, `^INDIAVIX`.
 - True options OPEX (the Pine “OPEX” block is a volume-CVD proxy, not F&O)  
 - Earnings highlight, TV dashboard cosmetics  
 
-Direction uses Nifty EMA/VWAP/ADX/MTF + opening range — **30 minutes on the buy side
-(09:15–09:45), 15 on the sell side (09:15–09:30)**, so a short can be committed from 09:30
-while a long still waits for 09:45 (`OR_MINUTES` / `OR_MINUTES_SHORT`; see
-`docs/audit-2026-11-18-12.md`). Institutional vote is **VIX-only**. That is enough for the complementary-sector lock you asked for.
+Direction uses Nifty EMA/VWAP/ADX/MTF + opening range — **one range, 25 minutes
+(09:15–09:35), for both sides**, so the first bar a pick can be committed on is **09:40**
+(`OR_MINUTES`; see `docs/audit-2026-11-18-13.md`). Institutional vote is **VIX-only**. That is enough for the complementary-sector lock you asked for.
 
 ---
 
