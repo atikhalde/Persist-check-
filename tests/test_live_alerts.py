@@ -1312,14 +1312,27 @@ class LateLeaderEntryTests(LiveAlertTests):
         self.assertEqual(st["pick_entries"], {"IT long": 1})
 
     def test_a_trade_that_has_already_paid_is_refused_by_the_plan(self):
-        plan = TradePlan(100.0, 99.0, 99.0, 1.0, 101.0, 102.0, 103.0)
+        plan = TradePlan(100.0, 99.0, 99.0, 1.0, 103.0, 104.0, 105.0)
         hit = {"sig": signal(), "plan": plan, "price": 100.5, "r": 0.5, "age": 5.0}
         got = pipeline.late_plan(hit)
         self.assertIsNotNone(got)
         self.assertEqual((got.entry, got.sl, got.risk), (100.5, 99.0, 1.5))
-        self.assertEqual((got.t1, got.pivot_names), (101.0, (None, None, None)))
-        self.assertIsNone(pipeline.late_plan({**hit, "price": 101.0}))   # at T1: paid
+        self.assertEqual((got.t1, got.pivot_names), (103.0, (None, None, None)))
+        self.assertIsNone(pipeline.late_plan({**hit, "price": 103.0}))   # at T1: paid
         self.assertIsNone(pipeline.late_plan({**hit, "price": 98.5}))    # through the stop
+
+    def test_the_nearest_target_must_still_be_worth_the_risk_taken_now(self):
+        """19 Nov M&M: +2.0R from its fire, T1 1.77 points away, 44-point stop.
+
+        "Price is still before T1" would have entered it at 0.04R of room. The
+        catch-up obeys the same ``MIN_TARGET_R`` as a fresh entry instead.
+        """
+        plan = TradePlan(100.0, 99.0, 99.0, 1.0, 100.6, 106.0, 108.0)   # M&M's shape
+        hit = {"sig": signal(), "plan": plan, "price": 102.0, "r": 2.0, "age": 25.0}
+        self.assertIsNone(pipeline.late_plan(hit))          # 1.4 of room, 3.0 of risk
+        self.assertIsNone(pipeline.late_plan({**hit, "price": 100.3}))   # 0.23R of room
+        far = TradePlan(100.0, 99.0, 99.0, 1.0, 105.0, 106.0, 108.0)    # target worth it
+        self.assertIsNotNone(pipeline.late_plan({**hit, "plan": far, "price": 100.5}))
 
     def test_the_knob_restores_the_plain_heads_up(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
