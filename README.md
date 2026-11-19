@@ -67,6 +67,88 @@ were built from, so every number in the alert can be re-derived by hand.
 
 Entry is the **signal candle's close** (two-decimal price precision). EMA9 includes that completed candle. For BUY, initial SL = EMA9 × (1 − 0.0002); for SELL, SL = EMA9 × (1 + 0.0002). Stops are rounded outward to 0.01, targets are the next three classic daily pivot levels strictly above entry for BUY or below entry for SELL (nearest first), using the previous trading session’s high/low/close. The levels are S3, S2, S1, PP, R1, R2, R3, where PP = (H + L + C) / 3; R1 = 2PP − L, S1 = 2PP − H; R2/S2 = PP ± (H − L); R3 = H + 2(PP − L), S3 = L − 2(H − PP). Current/future daily candles are excluded.
 
+### End-of-day report (15:33)
+
+The session ends with **one report, not a one-liner**. It is built from the books
+the scanners keep through the day, so every number in it can be traced back to the
+candle that produced it:
+
+* **the day's shape** — how many candles were scanned and judged, how many had a
+  pick, how many entries were opened, what the alert ledger holds by kind, the
+  first and last pick of the day and how often the incumbent changed;
+* **sector persistence through the day** — for the ten strongest sectors: the
+  peak score, the score at the close, whether it rose or fell, a 15-minute
+  sample series, the sector's day move and how many candles it was the pick;
+* **every blocked signal, by the rule that blocked it** — count per rule plus the
+  names and their own reason (`N4 10:35 — rank 4 is behind its sector's runners`),
+  the momentum gate by test (sideways / reversing / weak / behind runners), and
+  what `SECTOR_TOP_N` trimmed;
+* **every trade** — closed trades with entry, exit, R and why (T-hit / SL / EMA9
+  exit), open trades marked at the close, and the day's totals (`1 up / 1 down ·
+  +0.2R in all`);
+* **health** — the feed bars that were late, names whose bars never arrived, the
+  1m feed behind the close, candles never judged, undelivered alerts, the LATE
+  LEADER catch-ups and the early-pass skips by reason;
+* **the rules in force** and any knob that differs from its default;
+* **what to look at tomorrow** — computed from the day, not guessed: a sector that
+  was the pick all day and produced nothing, a gate that refused far more names
+  than it let through, early alerts that died before their close and why, signals
+  that fired before their sector was picked.
+
+```
+🗂 <b>END OF DAY — 2026-11-20 · bot 5m</b>
+Market closed BULL (74%) · regime TREND · last pick <b>AUTO</b> long
+Candles scanned 75 · with a pick 41 · entries 5
+Alerts on record 5 (last code per name): ENTRY 3 · EXIT 1 · T1 1 · <b>1 undelivered</b>
+
+<b>How the day was picked</b>
+Pick (candles): AUTO 41 · BANK 20
+Longest run AUTO 41 candles (205 min) · 2 sector(s) picked in all
+first pick 09:20 · last 15:25 · 3 candles on record · changed 1 time
+Scanned beside the pick: IT 30 · PHARMA 12
+
+<b>Sector persistence (the day)</b>
+AUTO 98max/91now ↑ · [55 66 76 80 88 91] · day +1.84% · 41 candles as pick · 3 entries
+BANK 90max/88now ↑ · [30 88] · day +1.10% · 20 candles as pick
+IT 71max/44now ↓ · [71 50 44] · day -0.90% · 0 candles as pick
+
+<b>Blocked signals — by rule</b>
+6 signals blocked in all
+• 1 — fired before their sector was picked: BOSCHLTD fired at 09:35, AUTO picked at 10:10
+• 3 — not running — sideways, reversing or weak momentum: N0 10:35 — rank 0 is behind its sector's runners, N4 10:35 — rank 4 is behind its sector's runners, N7 11:05 — reversing — under its EMA9 with the last candles aga…
+• 2 — followers not scanned — outside the sector's top: XYZ AUTO, PQR AUTO
+Momentum gate: behind its sector's runners 9 · reversing 2
+Early alerts cancelled: the close did not confirm the early signal 3 · the sector changed 1
+Sector trim (SECTOR_TOP_N): kept 25 name-checks, dropped 39
+  · AUTO: kept 15 · dropped 24
+  · IT: kept 10 · dropped 15
+
+<b>Trades</b>
+• TATAMOTORS BUY 10:15 700.0 → 712.0 <b>+1.2R</b> (EMA9 EXIT, T1 hit)
+• M&M BUY 11:05 3400.0 → 3370.0 <b>-1.0R</b> (SL HIT)
+• MARUTI BUY open from 12:40 @ 12000.0 · stop 12000.0 · <b>+1.5R</b> at the close · T1 hit
+Closed by: EMA9 EXIT 1 · SL HIT 1
+Closed 2: 1 up / 1 down · +0.2R in all · best +1.2R · worst -1.0R
+
+<b>Health</b>
+• LATE LEADER catch-ups 3 (signal fired before its sector was picked) · not sent (per name-check): older than the window 2
+
+<b>Rules in force</b>
+entries: cap none per pick · runners within 75% of the sector's best · rank floor 40 · top 5 names per sector · targets ≥ 0.5R · catch-up window 40 min
+no knob changed from its default
+
+<b>What to look at tomorrow</b>
+• ⚠ 4 of 6 early alerts died before their close (most often: the close did not confirm the early signal)
+```
+
+Telegram refuses a message over 4096 characters, so a long day goes out as
+numbered parts (`(1/3)`, `(2/3)`, …) cut on section boundaries; the session is
+marked `reported` **only when every part arrived**. `EOD_REPORT=0` restores the
+short summary for both bots. The report reuses every line the short summary had
+(`SCAN1M_SUMMARY` still gates *whether* the 1m bot reports at all). The extra
+books it reads are cheap: one sector sample per three candles, one row per
+refused signal, one row per closed trade.
+
 ### Why a pivot target can look wrong (verified case: PNB, 11 Nov 2026)
 
 The levels above are real. NSE was shut on **Tue 10 Nov 2026** (Diwali-Balipratipada),
@@ -480,7 +562,7 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_EARLY_RETRIES` | `2` | how many of those re-projections a name gets after a cancellation. `0` restores the old one-shot rule (one bad candle silenced the name for the day, and its later alerts were same-second duplicates of bot 1) |
 | `SCAN1M_MAX_STALE_SECONDS` | `100` | skip a stock whose newest 1m print is older than this |
 | `SCAN1M_GRACE_SECONDS` | `6` | seconds after a minute boundary before asking Yahoo |
-| `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 summary |
+| `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 report entirely; with `EOD_REPORT=0` that report is the short one-message summary |
 | `SCAN1M_ALERT_CAP` | `3` | projections allowed per 5m candle, ranked by sector lead exactly as the entries are ranked (`0` = one message per firing name). 17 Nov put **11 of the 24 names it scanned** into one candle (six FMCG, five PSU banks) and no name could be taken that the cap would not have ranked first; the held-back names are counted in the summary (`· 8 held back by the per-candle cap`) |
 | `SCAN1M_CATCHUP_DIGEST` | `1` | one `LATE LEADER` message per pick window, best-first, instead of one per name (`0` = per name) |
 | `SCAN1M_REQUIRE_TARGET` | `1` | refuse an entry that has **no pivot target at all** — no exit level, no trade. `MIN_TARGET_R` refuses a target that is too close; this refuses the absence of one. DABUR on 17 Nov was entered with `T1 N/A · T2 N/A · T3 N/A` and lost −0.8R (`0` = old rule) |
@@ -630,6 +712,8 @@ BULL/BEAR market is unaffected.
 | `NAME_RANK` | `combined` | how the names *inside* a sector are ranked: **strength** (lead vs the sector, pp, weight 0.5), **volume** (decision candle against the session's median 5m candle, 2× = full marks, weight 0.25) and **structure** (close's position in the day's range, the right side of EMA9, and how many of the last three candles closed the trade's way, weight 0.25). "Not day-% alone": on 19 Nov the name with the biggest lead was also the one that had already faded. `lead` = the old day-lead ranking |
 | `TRIPLE_PICK` | `1` | when the top **three** sectors of the pick's own side are all above `TRIPLE_MIN_PERSIST`, scan three sectors (the pick plus the two strongest others) and **drop the dual pick** — three books, not a pick and a hedge. 19 Nov, 09:45–11:45: AUTO 99, CDUR 92–99 and PSUBK 91–99 were leading at once and the scanner could see one of them; the names in the other two fired into nothing. `0` = the pick plus one runner-up (`SECTOR_EXTRA_MAX`) |
 | `TRIPLE_MIN_PERSIST` | `85` | the score all three must beat for the third book |
+| `EOD_REPORT` | `1` | send the full **end-of-day report** at 15:33 instead of the short summary (both bots). `0` = the old one-message summary. The report lists the day's picks, every sector's persistence through the session, every blocked signal with the rule that blocked it, every trade with its R, feed and delivery problems, the rules in force and what to look at tomorrow |
+| `EOD_MAX_CHARS` | `3800` | characters per message of that report (clamped to 1000–4000). A longer report is split into numbered parts, and the session counts as reported only when every part is delivered |
 
 **Triple pick (before the dual).** When the pick's *own* side has three sectors
 above `TRIPLE_MIN_PERSIST` (85) at the same time, the scan takes those three and

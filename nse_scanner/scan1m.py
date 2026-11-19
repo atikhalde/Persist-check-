@@ -1846,7 +1846,8 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
         # Open the trade exactly as the 5m scan does — one builder — so the same
         # T1–T3 / SL / EMA9-exit alerts follow it on bot 3, with the same pivot
         # names and the original stop on record.
-        positions[raw] = new_position(best.side, plan, bar.isoformat(), str(bar.date()))
+        positions[raw] = new_position(best.side, plan, bar.isoformat(), str(bar.date()),
+                                      sector=sector_of.get(raw, ""))
         early = cand["early"]
         if early:
             early["result"] = "confirmed"
@@ -2174,6 +2175,17 @@ def _end_of_session(now: datetime) -> None:
                         "alert deadline, so their entries were not considered",
                         ", ".join(late))
         if want_summary() and not stats.get("reported") and stats.get("candles"):
+            from . import eod
+
+            if eod.report_enabled():
+                if eod.send_eod(st, bot="1m", send=telegram.send_bot3, dry_run=_dry()):
+                    stats["reported"] = True
+                    save_ledger(st)
+                    log.info("1m end-of-day report sent: %d candles", int(stats["candles"]))
+                    return
+                log.error("1m end-of-day report was NOT delivered — Telegram refused a part; "
+                          "the session is over, so no later run will send it")
+                return
             text = format_summary(st)
             if telegram.send_bot3(text, dry_run=_dry()):
                 stats["reported"] = True

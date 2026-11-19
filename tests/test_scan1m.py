@@ -59,6 +59,7 @@ class Scan1mFixture(TestCase):
             "SCAN1M_ALERT_CAP": "0",
             "SCAN1M_EARLY_PER_DAY": "1", "SCAN1M_CANCEL_MESSAGE": "0",
             "SCAN1M_MARKET_SOURCE": "ledger", "TELEGRAM_BOT_TOKEN_3": "",
+            "EOD_REPORT": "0",          # the report itself: tests/test_eod.py
             "TELEGRAM_CHAT_ID_3": "",
         }, clear=False)
         self.env.start()
@@ -1454,7 +1455,8 @@ class LoopTests(TestCase):
         scan1m._md_cache.clear()
         scan1m._last_nifty_bar = None
         self.env = patch.dict("os.environ", {"DRY_RUN": "0", "SCAN1M_SUMMARY": "1",
-                                             "SCAN1M_FIRST_MINUTE": "1"}, clear=False)
+                                             "SCAN1M_FIRST_MINUTE": "1",
+                                             "EOD_REPORT": "0"}, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.patches = [

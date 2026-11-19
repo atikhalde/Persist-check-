@@ -227,6 +227,8 @@ jobs:
           ENTRY_RANK_BAND: ${{ vars.ENTRY_RANK_BAND || '0.75' }}
           TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
           NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
+          EOD_REPORT: ${{ vars.EOD_REPORT || '1' }}
+          EOD_MAX_CHARS: ${{ vars.EOD_MAX_CHARS || '3800' }}
           MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
           BAR_SETTLE_SECONDS: "45"                              # used by the shared hit tracker
         run: python -m nse_scanner live-1m --exit-at-close --max-minutes 170

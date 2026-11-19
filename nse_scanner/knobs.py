@@ -43,6 +43,8 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("ENTRY_RANK_BAND", "0.75"),
     ("TRIPLE_MIN_PERSIST", "85"),
     ("NAME_RANK", "combined"),
+    ("EOD_REPORT", "1"),
+    ("EOD_MAX_CHARS", "3800"),
     ("DIVERGENCE_SHORT", "0"),
     ("DIVERGE_MIN_PERSIST", "65"),
     ("OI_FILTER", "annotate"),

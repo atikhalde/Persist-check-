@@ -379,7 +379,10 @@ class LiveAlertTests(TestCase):
         self.ctx = patch.object(state, "STATE_PATH", Path(self.tmp.name) / "state.json")
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
-        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0"})
+        # The end-of-day *report* has its own tests (tests/test_eod.py); this
+        # class asserts the short summary's lines, so ask for that one.
+        self.ctx = patch.dict("os.environ", {"MAX_ALERT_LAG_SECONDS": "180", "DRY_RUN": "0",
+                                             "EOD_REPORT": "0"})
         self.ctx.start()
         self.addCleanup(self.ctx.stop)
         self.now = BAR + timedelta(minutes=6)
