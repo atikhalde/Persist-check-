@@ -42,18 +42,107 @@ def _conf_delta() -> int:
 
 
 def max_entries_per_pick() -> int:
-    """Entries allowed per pick (sector + side) per session, 0 = no cap (3).
+    """Entries allowed per pick (sector + side) per session, 0 = no cap (**0**).
 
-    16 Nov: six PHA names fired on one candle and all six were alerted in 35
-    seconds, in universe order — 82, 62, 77, 62, 82 — and the whole cluster was
-    out within 45 minutes for -1.6R. One pick is one risk factor, so it gets a
-    ceiling, and the names that clear it are alerted best-score first.
+    It used to be 3, because 16 Nov put six PHA names into the book on one candle
+    in universe order and the cluster was out within 45 minutes for -1.6R. A
+    ceiling is the wrong instrument for that: it keeps whichever three names
+    happen to arrive first and throws away the fourth runner. The quality gate
+    below is what keeps the sideways and reversing names out, so the count is
+    left open. A positive value restores the ceiling.
     """
     try:
-        value = int(os.environ.get("MAX_ENTRIES_PER_PICK", "3"))
+        value = int(os.environ.get("MAX_ENTRIES_PER_PICK", "0"))
     except ValueError:
-        return 3
-    return value if value >= 0 else 3
+        return 0
+    return value if value >= 0 else 0
+
+
+def entry_min_rank() -> float:
+    """The absolute floor of the combined rank to be entered (``ENTRY_MIN_RANK``, 40)."""
+    try:
+        return float(os.environ.get("ENTRY_MIN_RANK", "40"))
+    except ValueError:
+        return 40.0
+
+
+def entry_rank_band() -> float:
+    """How close to its sector's best a name must rank (``ENTRY_RANK_BAND``, 0.75).
+
+    The "real running stocks" rule, in place of a count: on each candle, within
+    each sector, the names that fired are ranked and only those within this
+    fraction of the sector's best are entered. 0.75 keeps the runners and drops
+    the laggards of the same move; ``0`` enters every name that clears the
+    absolute floor, ``1`` restores "best only".
+    """
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("ENTRY_RANK_BAND", "0.75"))))
+    except ValueError:
+        return 0.75
+
+
+def momentum_verdict(df5: pd.DataFrame, last, close: float | None, long_side: bool,
+                     sector_intra: float | None) -> tuple[bool, str, float]:
+    """Is this name *running*, or has it reversed? ``(ok, why-not, rank)``.
+
+    Two absolute tests, both about the name's own tape — the relative half (the
+    sector's runners against its laggards) needs the whole sector and is applied
+    by the caller with :func:`entry_rank_band`.
+
+    * **reversing** — the close is on the wrong side of its EMA9 by more than a
+      tenth of a percent, with the last three candles mostly against: a name
+      rolling over is not entered, however good its day has been.
+    * **weak momentum** — the combined rank under ``ENTRY_MIN_RANK`` (40): no
+      strength, no volume and poor structure is a name that is not moving.
+
+    No candle to judge (a feed that has not published) is not this gate's
+    business: it says ok and the caller's own checks stand.
+    """
+    score, parts = name_rank(df5, last, close, long_side, sector_intra)
+    if not parts:
+        return True, "", score
+    side = 1.0 if long_side else -1.0
+    try:
+        ema9 = trade.ema9_on_bar(df5, last)
+    except Exception:
+        ema9 = None
+    if close is not None and ema9 is not None and float(close) > 0:
+        off = (float(close) - ema9) * side / float(close)
+        if off < -0.001 and parts.get("structure", 100) < 50:
+            return False, ("reversing — under its EMA9 with the last candles against it"
+                           if long_side else
+                           "reversing — over its EMA9 with the last candles against it"), score
+    if score < entry_min_rank():
+        return False, f"weak momentum rank {score:.0f}", score
+    return True, "", score
+
+
+def rank_band_drop(candidates: list[dict]) -> list[dict]:
+    """Drop the laggards of each sector's own move: keep the runners.
+
+    Per sector and candle, the best combined rank sets the bar; a name below
+    ``ENTRY_RANK_BAND`` (0.75) of it is the same move at a worse price — the
+    "sideways or low quality" name that a count of three used to let through.
+    """
+    band = entry_rank_band()
+    best: dict[str, float] = {}
+    for cand in candidates:
+        sector = cand.get("sector") or ""
+        if cand.get("rank") is not None:
+            best[sector] = max(best.get(sector, 0.0), float(cand["rank"]))
+    if not best or band <= 0:
+        return []
+    keep, dropped = [], []
+    for cand in candidates:
+        sector = cand.get("sector") or ""
+        rank = cand.get("rank")
+        top = best.get(sector)
+        if rank is None or top is None or float(rank) >= band * top:
+            keep.append(cand)
+        else:
+            dropped.append(cand)
+    candidates[:] = keep
+    return dropped
 
 
 def scan5m_leader_catchup() -> bool:
@@ -195,10 +284,18 @@ def name_rank(df5: pd.DataFrame, last, close: float | None, long_side: bool,
         hi, lo = float(day["High"].max()), float(day["Low"].min())
         pos = (float(close) - lo) / (hi - lo) if hi > lo else 0.5
         ema9 = trade.ema9_on_bar(df5, last)
-        above = 0.5 if ema9 is None else (1.0 if (float(close) - ema9) * side > 0 else 0.0)
+        if ema9 is None:
+            above = 0.5
+        elif abs(float(close) - ema9) / float(close) <= 0.0005:   # sitting on it
+            above = 0.5
+        else:
+            above = 1.0 if (float(close) - ema9) * side > 0 else 0.0
         tail = day.tail(3)
-        bars_way = (sum(1 for o, c in zip(tail["Open"], tail["Close"])
-                        if (float(c) - float(o)) * side > 0) / max(1, len(tail)))
+        # A doji is neither with the trade nor against it, so it cannot by itself
+        # mark a name as reversed (a flat tape would then look like a reversal).
+        way = [((float(c) - float(o)) * side) for o, c in zip(tail["Open"], tail["Close"])]
+        bars_way = (sum(1 for d in way if d > 0) + 0.5 * sum(1 for d in way if d == 0)) \
+            / max(1, len(way))
         structure = (pos if long_side else 1.0 - pos) * 0.5 + above * 0.25 + bars_way * 0.25
     except Exception:
         structure = 0.5
@@ -688,6 +785,7 @@ _REJECT_TEXT = (
     ("scan_error", "could not be scanned"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
+    ("weak", "not running — sideways, reversing or weak momentum"),
     ("follower", "followers not scanned — outside the sector's top"),
     ("no_target", "without a pivot target"),
     ("alert_cap", "held back — more than the per-candle alert cap"),
@@ -1910,8 +2008,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                     if before:
                         _note_reject(st, "earlier", raw, f"{raw} {min(before)}")
                         if late_open:
-                            _consider_late(st, late, raw, df5, fires, want, last,
-                                           sd1.get(ysym), sector_of[raw])
+                            _consider_late(
+                                st, late, raw, df5, fires, want, last, sd1.get(ysym),
+                                sector_of[raw],
+                                intra=(getattr(md, "sectors", None) or {}).get(
+                                    sector_of[raw], {}).get("intra_ret"))
             if early:
                 # Two different deaths, one line before: the candle closed on the
                 # other side (the signal flipped) or no crossover was left at all.
@@ -1967,14 +2068,32 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         if rank_by_sector_lead():
             lead = _lead_vs_sector(df5, last, float(df5["Close"].iloc[-1]), md,
                                    sector_of[raw], want_buy)
-        cand_rank = None
-        if name_rank_mode() == "combined":
-            cand_rank, _ = name_rank(df5, last, float(df5["Close"].iloc[-1]), want_buy,
-                                     (getattr(md, "sectors", None) or {}).get(
-                                         sector_of[raw], {}).get("intra_ret"))
+        close_now = float(df5["Close"].iloc[-1])
+        intra = (getattr(md, "sectors", None) or {}).get(sector_of[raw], {}).get("intra_ret")
+        runs, why_not, cand_rank = momentum_verdict(df5, last, close_now, want_buy, intra)
+        if not runs:
+            # The count is open by default; this is what keeps a name out.
+            log.info("not running: %s @%s — %s (rank %.0f)", raw, best.time, why_not, cand_rank)
+            _note_reject(st, "weak", raw, f"{raw} {best.time} — {why_not}", per_bar=best.time)
+            if early and not allow_stale:
+                _cancel_early(st, raw, early, why_not, code="weak", close=close_now)
+            continue
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
-                           "early": early, "lead": lead, "rank": cand_rank,
-                           "close": float(df5["Close"].iloc[-1])})
+                           "early": early, "lead": lead,
+                           "rank": cand_rank if name_rank_mode() == "combined" else None,
+                           "sector": sector_of[raw], "close": close_now})
+
+    # The runners of each sector, not the first three names to arrive: the band
+    # drops the laggards of the same move (`ENTRY_RANK_BAND`, 0.75 of the sector's
+    # best rank on this candle).
+    for cand in rank_band_drop(candidates):
+        _note_reject(st, "weak", cand["raw"], f"{cand['raw']} {cand['best'].time} — "
+                     f"rank {cand['rank']:.0f} is behind its sector's runners",
+                     per_bar=cand["best"].time)
+        if cand.get("early") and not allow_stale:
+            _cancel_early(st, cand["raw"], cand["early"],
+                          "behind its sector's runners on momentum", code="weak",
+                          close=cand.get("close"))
 
     cap = max_entries_per_pick()
     st.setdefault("pick_entries", {})
@@ -2080,7 +2199,8 @@ _LATE_NOTE = ("the crossover candle is over — this is the fire's own entry and
 
 
 def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
-                   bar: datetime, daily, sector: str) -> None:
+                   bar: datetime, daily, sector: str,
+                   intra: float | None = None) -> None:
     """Queue a labelled LATE LEADER, or count why it is not worth one.
 
     The 5m entry loop only takes a fire on the decision candle: a name whose
@@ -2109,7 +2229,14 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
             skips[why["why"]] = skips.get(why["why"], 0) + 1
             _note_old_age(stats, why)
         return
-    late.append({"raw": raw, "hit": hit, "sector": sector})
+    # The catch-up is held to the same quality gate as a fresh entry: a leader
+    # that is now sideways or reversing is a name to watch, not to enter.
+    try:
+        runs, why_not, _ = momentum_verdict(df5, bar, hit["price"], want == "BUY", intra)
+    except Exception:
+        runs, why_not = True, ""
+    late.append({"raw": raw, "hit": hit, "sector": sector,
+                 "runs": runs, "why_not": why_not})
 
 
 # ── the late leader as an entry, not only a heads-up ─────────────────────────
@@ -2209,6 +2336,9 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
     if plan is None:
         return False
     if scan_require_target() and not _plan_has_target(plan):
+        return False
+    if item.get("runs") is False:          # the name is sideways or reversing
+        log.info("late leader %s not entered — %s", raw, item.get("why_not") or "not running")
         return False
     side = 1 if hit["sig"].side == "BUY" else -1
     key = pick_cap_key(item.get("sector") or md.pick_sector,

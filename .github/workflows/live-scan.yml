@@ -170,6 +170,8 @@ jobs:
           SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           SECTOR_EXTRA_MAX: ${{ vars.SECTOR_EXTRA_MAX || '1' }}
           TRIPLE_PICK: ${{ vars.TRIPLE_PICK || '1' }}
+          ENTRY_MIN_RANK: ${{ vars.ENTRY_MIN_RANK || '40' }}
+          ENTRY_RANK_BAND: ${{ vars.ENTRY_RANK_BAND || '0.75' }}
           TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
           NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
           # An early print older than this is never shown as live (README: 100).
@@ -185,7 +187,7 @@ jobs:
           MARKET_CONF_DELTA: ${{ vars.MARKET_CONF_DELTA || '10' }}
           # Entries allowed per pick (sector+side) per session, 0 = no cap; the
           # names that clear it are alerted most-ahead-of-sector first.
-          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
+          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '0' }}
           # 1 = rank those names by how far they lead their own sector today
           # (stock move minus sector move from each session open), 0 = by score.
           RANK_BY_SECTOR_LEAD: ${{ vars.RANK_BY_SECTOR_LEAD || '1' }}

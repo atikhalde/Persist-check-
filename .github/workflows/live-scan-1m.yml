@@ -179,7 +179,7 @@ jobs:
           PICK_LOWCONF_MIN_PERSIST: ${{ vars.PICK_LOWCONF_MIN_PERSIST || '65' }}
           # Entries per pick: bot 3 confirms on the same ceiling as bot 1 (it used
           # to announce six names where bot 1 announced three).
-          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '3' }}
+          MAX_ENTRIES_PER_PICK: ${{ vars.MAX_ENTRIES_PER_PICK || '0' }}
           RANK_BY_SECTOR_LEAD: ${{ vars.RANK_BY_SECTOR_LEAD || '1' }}
           # Bot 3 reads the 5m pick, so the 5m entry rules are forwarded too: the
           # two loops must agree on the sector, the stock and the ceiling.
@@ -223,6 +223,8 @@ jobs:
           SECTOR_FOLLOW_MAX: ${{ vars.SECTOR_FOLLOW_MAX || '2' }}
           SECTOR_EXTRA_MAX: ${{ vars.SECTOR_EXTRA_MAX || '1' }}
           TRIPLE_PICK: ${{ vars.TRIPLE_PICK || '1' }}
+          ENTRY_MIN_RANK: ${{ vars.ENTRY_MIN_RANK || '40' }}
+          ENTRY_RANK_BAND: ${{ vars.ENTRY_RANK_BAND || '0.75' }}
           TRIPLE_MIN_PERSIST: ${{ vars.TRIPLE_MIN_PERSIST || '85' }}
           NAME_RANK: ${{ vars.NAME_RANK || 'combined' }}
           MAX_ALERT_LAG_SECONDS: "180"                          # same deadline as the 5m scan
