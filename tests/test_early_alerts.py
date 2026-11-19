@@ -642,3 +642,64 @@ class EarlyCheckReplayTests(TestCase):
         text = self.ec.render(rows, BAR.date(), 60)
         self.assertIn("cancelled at close   : 1 (100%)", text)
         self.assertIn("close signals          : 1, of which 0 (0%) had an early alert", text)
+
+
+class DualEarlyAlertTests(TestCase):
+    """The pre-close pass sees both books, and each side's own leaders.
+
+    19 Nov, 09:45: the pick was IT short with ``PERSIST + AUTO 98`` and its live
+    flow aligned (``AUTO▲ Q (88)``). The early pass looked at IT alone, so the
+    only long of the morning reached the feed at 10:15 — off the pick, not off
+    the board that had been saying AUTO since the open.
+    """
+
+    market_at_bar = base.LiveAlertTests.market_at_bar
+    frames = EarlyAlertTests.frames
+
+    def setUp(self):
+        EarlyAlertTests.setUp(self)              # the whole patched world
+        self.uni["sectors"]["AUTO"] = {"index": "AUTO-I", "stocks": ["EEE", "FFF", "GGG"]}
+        self.scan.side_effect = self.dual_scan
+        st = state.load()
+        st["scan"].update({"side": -1, "label": "BEAR", "conf": 62, "intra": -0.8,
+                           "alt": {"sector": "AUTO", "side": 1}, "alt_intra": 1.2,
+                           "alt_reason": "DUAL — AUTO long 98 against the IT SHORT pick"})
+        state.save(st)
+
+    def dual_scan(self, raw, frame, daily, keep_all=False):
+        side = "SELL" if raw == "ABC" else "BUY"          # IT falls, AUTO rises
+        return [base.StockSignal(raw, 101, side + "-EX", side, "10:00", 100.0, 65,
+                                 "Strong", 20, 1, "test", 99.0)]
+
+    def texts(self):
+        return [c.args[0] for c in self.send.call_args_list]
+
+    def test_the_dual_name_is_projected_as_a_buy_and_says_why(self):
+        out = pipeline.run_early(BAR)
+        # the default top 5 keeps every name of this small world
+        self.assertEqual(sorted(o["symbol"] for o in out), ["ABC", "EEE", "FFF", "GGG"])
+        buy = [t for t in self.texts() if "EARLY BUY" in t]
+        self.assertTrue(buy, self.texts())
+        self.assertIn("Sector <b>AUTO</b>", buy[0])
+        self.assertIn("DUAL — AUTO long 98 against the IT SHORT pick", buy[0])
+
+    def test_the_pick_side_is_still_a_sell_and_carries_no_dual_note(self):
+        pipeline.run_early(BAR)
+        sell = [t for t in self.texts() if "EARLY SELL" in t]
+        self.assertEqual(len(sell), 1)
+        self.assertIn("ABC", sell[0])
+        self.assertNotIn("DUAL", sell[0])
+
+    def test_only_the_sectors_own_leaders_are_looked_at(self):
+        with patch.dict("os.environ", {"SECTOR_TOP_N": "2"}):
+            pipeline.run_early(BAR)
+        scanned = [c.args[0] for c in self.scan.call_args_list]
+        self.assertEqual(scanned[:1], ["ABC"])
+        self.assertNotIn("GGG", scanned)                 # the tail of AUTO
+        self.assertEqual(sorted(state.load()["stats"]["rejected"]["follower"]), ["GGG"])
+
+    def test_the_whole_sector_when_the_knob_is_zero(self):
+        with patch.dict("os.environ", {"SECTOR_TOP_N": "0"}):
+            pipeline.run_early(BAR)
+        scanned = [c.args[0] for c in self.scan.call_args_list]
+        self.assertIn("GGG", scanned)

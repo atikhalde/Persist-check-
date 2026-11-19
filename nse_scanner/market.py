@@ -234,6 +234,14 @@ class MarketDecision:
     # and which of the scanned sectors have live flow agreeing with persistence.
     extra_sectors: list = field(default_factory=list)
     flow_aligned: list = field(default_factory=list)
+    # Dual pick: the leading sector on the *other* side of the committed market,
+    # scanned alongside the pick. 19 Nov the pick was IT short for eight candles
+    # while PERSIST + held AUTO at 98-99 with its live flow aligned, and not one
+    # AUTO stock was scanned; BAJAJ-AUTO paid +5.7R an hour later on the same
+    # numbers. Empty when there is no opposite-side leader worth a second book.
+    alt_sector: str = ""
+    alt_side: int = 0
+    alt_reason: str = ""
     # Sectors left out of the pick because their index stopped updating:
     # [(name, lag_bars)]. Shown on the market block, never silently dropped.
     stale_sectors: list = field(default_factory=list)
@@ -555,6 +563,20 @@ def run_market(
                 pick, pick_side, action = diverge["pick"], diverge["side"], diverge["action"]
                 reason = diverge["reason"]
 
+    # The other side of the same tape, when it has a leader of its own. Only on a
+    # committed market: the NEUTRAL follow is one long book by design, and it has
+    # been measured as it stands.
+    alt = (_dual_leader(pick, pick_side, persist_plus, persist_minus)
+           if pick and commit_side in (1, -1) else None)
+    alt_sector = alt["sector"] if alt else ""
+    alt_side = int(alt["side"]) if alt else 0
+    alt_reason = ""
+    if alt:
+        snap = snaps.get(alt_sector)
+        persist = (snap.persist_bull if alt_side == 1 else snap.persist_bear) if snap else 0.0
+        alt_reason = (f"DUAL — {alt_sector} {'long' if alt_side == 1 else 'short'} "
+                      f"{persist:.0f} against the {dir_label} pick")
+
     return MarketDecision(
         session=str(sid),
         bar_time=last.strftime("%Y-%m-%d %H:%M"),
@@ -586,6 +608,9 @@ def run_market(
         sectors={k: vars(v) for k, v in snaps.items()},
         extra_sectors=extra_sectors,
         flow_aligned=flow_aligned,
+        alt_sector=alt_sector,
+        alt_side=alt_side,
+        alt_reason=alt_reason,
         stale_sectors=stale_sectors,
         sector_lag={name: int(snap.lag_bars) for name, snap in snaps.items()},
     )
@@ -886,6 +911,58 @@ def _is_leading(s, need: float) -> bool:
         and s.day_ret >= BULL_MIN_DAY and s.pos >= BULL_MIN_POS and s.rs > 0
         and s.bull >= FLOW_MIN and s.recent > -RECENT_MOVE_MIN
     )
+
+
+def dual_pick() -> bool:
+    """Scan the leading sector on the other side of the market too (``DUAL_PICK``).
+
+    One pick per bar means one side per bar, and a committed market hid the
+    strongest sector on the board whenever it sat on the other side: 19 Nov
+    09:45-09:55 was IT short with ``PERSIST + AUTO 98`` and ``AUTO▲ Q (88)`` on
+    the same screen. ``0`` restores the single pick.
+    """
+    return os.environ.get("DUAL_PICK", "1").strip() != "0"
+
+
+def follow_min_persist() -> float:
+    """Persistence a follow (or a dual pick) needs: ``SECTOR_FOLLOW_MIN_PERSIST`` 75."""
+    try:
+        return float(os.environ.get("SECTOR_FOLLOW_MIN_PERSIST") or 75)
+    except ValueError:
+        return 75.0
+
+
+def _is_leading_short(s, need: float) -> bool:
+    """The mirror of ``_is_leading`` for the sell side.
+
+    Same test, other direction: the sector must be falling on the day, in the
+    lower part of its range, weaker than the index, with bearish live flow and
+    not rolling back up. Without a mirror, a dual pick could only ever be a long.
+    """
+    return bool(
+        s.side == -1 and s.persist_bear >= need
+        and not getattr(s, "stale", False)
+        and s.day_ret <= -BEAR_MIN_DAY and s.pos <= BEAR_MAX_POS and s.rs < 0
+        and s.bear >= FLOW_MIN and s.recent < RECENT_MOVE_MIN
+    )
+
+
+def _dual_leader(pick, pick_side, plus, minus):
+    """The leading sector on the other side of the pick, or ``None``.
+
+    Taken only when it is a leader in its own right — the test the NEUTRAL follow
+    already uses — so a quiet or counter-trend sector can never open a second
+    book. Returns ``{sector, side}``.
+    """
+    if not dual_pick() or not pick or pick_side not in (1, -1):
+        return None
+    need = follow_min_persist()
+    pool, side, test = ((minus, -1, _is_leading_short) if pick_side == 1
+                        else (plus, 1, _is_leading))
+    for s in pool[:3]:
+        if s.name != pick and test(s, need):
+            return {"sector": s.name, "side": side}
+    return None
 
 
 def _follow_leaders(plus, need: float | None = None) -> list:

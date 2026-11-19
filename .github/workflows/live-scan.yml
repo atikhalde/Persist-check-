@@ -225,6 +225,12 @@ jobs:
           # 0 = a NEUTRAL follow scans only the sector it picked, not every
           # leader after it (each extra sector brings its own 3-entry budget).
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
+          # 1 = also scan the leading sector on the other side of the pick
+          # (each sector keeps its own 3-entry budget). 0 = one side only.
+          DUAL_PICK: ${{ vars.DUAL_PICK || '1' }}
+          # How many names of each picked sector are scanned, ranked by how
+          # far they lead it. 0 = every name in the sector.
+          SECTOR_TOP_N: ${{ vars.SECTOR_TOP_N || '5' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
           # EMA9 exit needs a close beyond the smaller of these (0 = old rule).
           EXIT_EMA9_BUFFER_PCT: ${{ vars.EXIT_EMA9_BUFFER_PCT || '0.10' }}
