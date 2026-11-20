@@ -272,6 +272,12 @@ def _persistence(st: dict) -> list[str]:
     return lines
 
 
+#: The order a leadership mark is chosen in: what stopped the name beats why it
+#: was not looked at. ``follower`` is last because a name on this list was, by
+#: construction, inside its sector's top five — it was trimmed on *other* candles.
+_MARK_ORDER = ("earlier", "no_target", "cap", "oi", "late", "weak", "opposite", "follower")
+
+
 def _leadership(st: dict) -> list[str]:
     """Which names each scanned sector kept putting forward, and what became of them."""
     rows = [r for r in audit.leadership_rows(st) if r.get("scanned")]
@@ -280,15 +286,31 @@ def _leadership(st: dict) -> list[str]:
     entered = {r.get("raw") or r.get("name")
                for r in (st.get("stats") or {}).get("closed") or []}
     entered |= set((st.get("positions") or {}).keys())
-    blocked: dict[str, str] = {}
+    blocked: dict[str, set[str]] = {}
     for kind, items in ((st.get("stats") or {}).get("rejected") or {}).items():
         for key, detail in (items or {}).items():
             # the key is "NAME@10:35" (or plain NAME) and the detail starts with
             # the name too — either way the first token is the stock
             name = str(key).split("@")[0].split()[0]
-            blocked.setdefault(name, kind)
+            blocked.setdefault(name, set()).add(kind)
             if detail:
-                blocked.setdefault(str(detail).split()[0], kind)
+                blocked.setdefault(str(detail).split()[0], set()).add(kind)
+
+    def _mark(name: str) -> str:
+        """The reason worth printing — not merely the first one recorded.
+
+        A name can be trimmed as a follower on one candle and refused as
+        ``earlier`` on another; the follower note is then the least informative
+        thing about it. 20 Nov: RBLBANK made BANK's top five on 32 candles and
+        was labelled "follower" (it had been trimmed on one of the others) while
+        AXISBANK and INDUSINDBK — the two names the day was actually missed on —
+        are the ones that should have carried the mark.
+        """
+        kinds = blocked.get(name) or set()
+        for kind in _MARK_ORDER:
+            if kind in kinds:
+                return kind
+        return ""
     per: dict[tuple[str, str], dict] = {}
     for row in rows:
         key = (row.get("sector"), row.get("name"))
@@ -313,8 +335,8 @@ def _leadership(st: dict) -> list[str]:
         bits = []
         for slot, name in items[:5]:
             n = max(slot["n"], 1)
-            tag = ("✚ entered" if name in entered
-                   else f"⊘ {blocked[name]}" if name in blocked else "")
+            mark = _mark(name)
+            tag = ("✚ entered" if name in entered else f"⊘ {mark}" if mark else "")
             bits.append(f"{name} {slot['sum_r'] / n:.0f} "
                         f"(s{slot['sum_s'] / n:.0f}/v{slot['sum_v'] / n:.0f}/"
                         f"t{slot['sum_t'] / n:.0f}) ×{slot['n']}"
@@ -323,6 +345,81 @@ def _leadership(st: dict) -> list[str]:
         lines.append(f"{sector}: " + " · ".join(bits))
     lines.append("rank (s strength / v volume / t structure) · ×N = times in the top 5 · "
                  "1st×N = times ranked first · every candle's table is in the audit")
+    return lines
+
+
+def _minus_5(stamp: str, candles: int) -> str:
+    """``stamp`` shifted back ``candles`` 5-minute slots (an ISO entry timestamp)."""
+    if not candles:
+        return stamp
+    try:
+        from datetime import datetime, timedelta
+        from .session import IST
+
+        when = datetime.fromisoformat(str(stamp))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=IST)
+        return (when - timedelta(minutes=5 * candles)).isoformat()
+    except (TypeError, ValueError):
+        return stamp
+
+
+def _entry_ranks(st: dict) -> list[str]:
+    """Where each entry's name sat in its sector's board on the candle it was taken.
+
+    The question this answers is the one that matters most about a day's book —
+    did the entries go to the leaders, or to whatever was left after the leaders
+    were refused? 20 Nov: IT's four entries were ranked 5th and 8th+ (three were
+    not even in the listed top eight) while the four names above them were all
+    refused. One line per trade, then the count, because a single ratio every day
+    is how the entry filter gets judged over weeks rather than per tape.
+    """
+    rows = audit.leadership_rows(st)
+    if not rows:
+        return []
+    board: dict[tuple, dict[str, int]] = {}
+    sizes: dict[tuple, int] = {}
+    for row in rows:
+        key = (row.get("bar"), row.get("sector"))
+        board.setdefault(key, {}).setdefault(str(row.get("name")), len(board.get(key, {})) + 1)
+        sizes[key] = max(sizes.get(key, 0), len(board[key]))
+    trades: list[tuple[str, str, str]] = []
+    for rec in (st.get("stats") or {}).get("closed") or []:
+        trades.append((rec.get("raw") or "", rec.get("sector") or "", rec.get("entry_bar") or ""))
+    for raw, pos in (st.get("positions") or {}).items():
+        trades.append((raw, pos.get("sector") or "", pos.get("entry_bar") or ""))
+    bits, inside, outside = [], 0, 0
+    for name, sector, entry_bar in trades:
+        if not name or not sector or not entry_bar:
+            continue
+        # The board the entry was judged on is the one ranked on the *previous*
+        # completed candle, so look there when the entry candle itself has none.
+        listed: dict[str, int] = {}
+        size = 0
+        for back in range(0, 3):
+            bar = _hhmm(_minus_5(entry_bar, back))
+            listed = board.get((bar, sector)) or {}
+            size = sizes.get((bar, sector)) or 0
+            if listed:
+                break
+        if name in listed:
+            rank = listed[name]
+            bits.append(f"{name} {rank} of {size}")
+            inside += 1 if rank <= 5 else 0
+            outside += 1 if rank > 5 else 0
+        elif size:
+            bits.append(f"{name} outside the {size} listed")
+            outside += 1
+        else:
+            continue
+    total = inside + outside
+    if not total:
+        return []
+    lines = ["<b>Were the entries leaders?</b>", " · ".join(bits)]
+    lines.append(f"{inside} of {_n(total, 'entry', 'entries')} went to a name ranked in its "
+                 f"sector's top five when it was taken"
+                 + (f" · {outside} were what was left after the leaders were refused"
+                    if outside else ""))
     return lines
 
 
@@ -519,7 +616,7 @@ def _observations(st: dict) -> list[str]:
     books = ledger.totals(ledger.closed_rows(st), ledger.open_rows(st))
     if books.get("trades") and books.get("costs_rs") and books.get("gross_rs"):
         if books["costs_rs"] > 0.35 * abs(books["gross_rs"]):
-            out.append(f"⚠ costs ate ₹{books['costs_rs']:,.0f} of ₹{books['gross_rs']:,.0f} "
+            out.append(f"⚠ costs ate ₹{books['costs_rs']:,.0f} of ₹{abs(books['gross_rs']):,.0f} "
                        f"gross — fewer, bigger trades (or a tighter COST_BPS) would have "
                        f"kept more")
         if books.get("profit_factor") is not None and books["profit_factor"] < 1:
@@ -538,7 +635,8 @@ def _observations(st: dict) -> list[str]:
 def format_eod(st: dict, *, bot: str = "5m") -> str:
     """The whole day, in one (long) text. Split it with :func:`chunks` to send."""
     blocks = [_head(st, bot), _day_shape(st), _timeline(st), _persistence(st),
-              _leadership(st), _blocked(st), _trades(st), _health(st), _rules(),
+              _leadership(st), _entry_ranks(st), _blocked(st), _trades(st), _health(st),
+              _rules(),
               _observations(st)]
     return "\n\n".join("\n".join(b for b in block if b) for block in blocks if block)
 

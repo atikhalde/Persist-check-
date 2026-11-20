@@ -228,6 +228,35 @@ class ContentTests(base.TestCase):
             trade(raw="B", entry=100.0, exit=100.04, r=0.02, qty=1000)]))
         self.assertIn("costs ate ₹", text)
 
+    def test_the_report_says_whether_the_entries_went_to_leaders(self):
+        """20 Nov: 4 of IT's 4 entries were ranked 8th or worse; the leaders were refused."""
+        st = day()
+        st["stats"]["closed"] = [
+            {"raw": "LEAD", "sector": "AUTO", "side": "BUY", "entry": 100.0, "exit": 101.0,
+             "qty": 10, "time": "10:05", "entry_bar": "2026-11-20T10:00:00+05:30", "risk": 1.0},
+            {"raw": "TAIL", "sector": "AUTO", "side": "BUY", "entry": 100.0, "exit": 99.0,
+             "qty": 10, "time": "10:05", "entry_bar": "2026-11-20T10:00:00+05:30", "risk": 1.0}]
+        st["positions"] = {}
+        st["stats"]["leadership"] = [{"b": "09:55", "sec": {"AUTO": [
+            {"name": "LEAD", "rank": 90, "kept": True},
+            {"name": "B", "rank": 80, "kept": True},
+            {"name": "C", "rank": 70, "kept": True},
+            {"name": "D", "rank": 60, "kept": True},
+            {"name": "E", "rank": 50, "kept": True},
+            {"name": "F", "rank": 40, "kept": False},
+            {"name": "G", "rank": 30, "kept": False},
+            {"name": "H", "rank": 20, "kept": False}]}}]
+        text = eod.format_eod(st)
+        self.assertIn("<b>Were the entries leaders?</b>", text)
+        self.assertIn("LEAD 1 of 8", text)
+        self.assertIn("TAIL outside the 8 listed", text)
+        self.assertIn("1 of 2 entries went to a name ranked in its sector's top five", text)
+
+    def test_no_leadership_book_means_no_entry_rank_line(self):
+        st = day()
+        st["stats"].pop("leadership", None)
+        self.assertNotIn("Were the entries leaders?", eod.format_eod(st))
+
     def test_the_report_names_the_catch_ups_the_window_refused(self):
         st = day()
         st["stats"]["catchup_skip"] = {"old": 81, "none": 44}

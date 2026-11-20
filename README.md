@@ -81,6 +81,7 @@ be traced back to the candle that produced it (and checked against the JSON).
 | **Sector momentum timeline** | every ~15 min: market tilt (label + confidence), the pick, its **bull▲/bear▼ flow**, the sector's day and from-open move, the regime — with the moments the pick moved |
 | **Persistent-sector performance** | per sector: score range (min–max–now), candles ≥70, candles and **spells with the gate open** (times), crossings of 70/85, candles as pick and how many runs, entries |
 | **Top-5 leadership activity** | per scanned sector, the names that kept coming up: average combined rank and its three legs (`s` strength / `v` volume / `t` structure), times in the top 5, times first, and `✚ entered` / `⊘ rule` for what became of them |
+| **Were the entries leaders?** | every entry's rank inside its own sector on the board it was judged against, then the count — "2 of 6 went to a name ranked in its sector's top five" is the fastest read on whether the entry filter is buying leaders or whatever was left after the leaders were refused |
 | **Every blocked signal** | one line per signal, under the rule that blocked it, with its own reason (`N4 10:35 — rank 4 is behind its sector's runners`) — no sampling, no "6 of 31" |
 | **Trader ledger** | every trade: quantity, entry/exit price and time, why it closed, targets hit, hold time, **gross ₹, costs ₹, net ₹**, gross R and net R; open trades marked at the close; then the day's book — wins/losses, profit factor, expectancy, best/worst, max drawdown, risk deployed and return on risk |
 | Data diagnostics | pending names, bars the feed never published, candles never judged, alert latency (average/slowest), 1m feed behind the close, LATE LEADER catch-ups and refusals, early-pass skips, undelivered alerts, mirror failures |
@@ -108,6 +109,10 @@ CDUR P+ 76–99→97 · 62/75 candles ≥70 · 55 gate-open · gate open 1 spell
 Top-5 leadership activity
 AUTO: MARUTI 80 (s70/v60/t75) ×75 1st×75 ✚ entered · M&M 77 (s69/v61/t75) ×75 ✚ entered · TATAMOTORS 74 (s68/v62/t75) ×52 · BAJAJ-AUTO 71 (s67/v63/t75) ×44 ⊘ weak
 rank (s strength / v volume / t structure) · ×N = times in the top 5 · every candle's table is in the audit
+
+Were the entries leaders?
+TATAMOTORS 1 of 5 · M&M outside the 5 listed · HAVELLS 3 of 5
+2 of 3 entries went to a name ranked in its sector's top five when it was taken · 1 was what was left after the leaders were refused
 
 Every blocked signal
 44 signals blocked — listed one by one below
