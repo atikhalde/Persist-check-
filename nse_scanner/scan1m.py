@@ -1062,6 +1062,13 @@ def format_summary(st: dict) -> str:
         shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
         lines.append(f"⚠ candle(s) never judged: {len(names)} — {shown} — no market bar for them"
                      f" inside the alert deadline, so their entries were not considered")
+    if stats.get("no_bar"):
+        # The feed's own gap, not the loop's: candles past the last bar it
+        # published. Named so "never judged" can keep meaning "the loop missed it".
+        names = list(stats["no_bar"])
+        shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
+        lines.append(f"candle(s) with no published bar: {len(names)} — {shown} — the feed stopped,"
+                     f" so no entry was possible (not a missed candle)")
     if lost:
         shown = " · ".join(f"{e.get('raw')} {e.get('time')} ({_tries(e)})"
                            for e in list(lost.values())[:6])

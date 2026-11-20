@@ -2191,6 +2191,13 @@ class EndOfSessionTests(Scan1mFixture):
         self.assertTrue(any("1m summary sent" in line for line in logs.output), logs.output)
         self.assertTrue(self.ledger()["stats"]["reported"])
 
+    def test_the_summary_tells_a_feed_gap_from_a_missed_candle(self):
+        st = self.ledger_with(no_bar=["15:20", "15:25"])
+        text = scan1m.format_summary(st)
+        self.assertIn("candle(s) with no published bar: 2 — 15:20, 15:25", text)
+        self.assertIn("not a missed candle", text)
+        self.assertNotIn("never judged", text)
+
     def test_a_summary_telegram_refuses_says_so_instead_of_vanishing(self):
         self.ledger_with()
         self.bot3.return_value = False
