@@ -372,24 +372,44 @@ def build_plan(sig: StockSignal, df5: pd.DataFrame, bar,
     close = float(df5["Close"].iloc[-1])
     if not isfinite(close) or round(close, 2) != sig.price:
         return None
+    return plan_at(sig.side, df5, bar, df1)
+
+
+def plan_at(side: str, df5: pd.DataFrame, bar,
+            df1: pd.DataFrame | None = None) -> TradePlan | None:
+    """The same levels for a trade that has **no signal** on ``bar``.
+
+    20 Nov, BANK: every bank fired at 09:20, the sector was picked at 12:05 after
+    38 candles of persistence, and all five kept names were refused on every one
+    of those candles — 148 of them counted "older than the window". The fire's
+    own levels are three hours of trend out of date, so the trade that is still
+    there cannot be the 09:20 trade: it is a new one, entered at this candle's
+    close with this candle's stop. This builds that plan, and nothing else — the
+    rules for *when* to take it live in the caller (``pipeline.late_plan``).
+    """
+    if side not in ("BUY", "SELL") or df5 is None or df5.empty:
+        return None
+    if df5.index[-1] != bar:
+        return None
+    close = float(df5["Close"].iloc[-1])
+    if not isfinite(close) or close <= 0:
+        return None
     ema = ema9_on_bar(df5, bar)
     if ema is None:
         return None
-    entry = Decimal(str(sig.price)).quantize(TICK)
+    entry = Decimal(str(round(close, 2))).quantize(TICK)
     level = Decimal(str(ema))
-    if sig.side == "BUY":
+    if side == "BUY":
         stop = (level * (1 - BUFFER)).quantize(TICK, rounding=ROUND_FLOOR)
         risk = entry - stop
-    elif sig.side == "SELL":
+    else:
         stop = (level * (1 + BUFFER)).quantize(TICK, rounding=ROUND_CEILING)
         risk = stop - entry
-    else:
-        return None
     if risk <= 0:
         return None
     basis = pivot_basis(df5, bar, df1)
-    levels = _all_levels(sig.side, float(entry), basis)
-    kept, skipped = _keep_targets(sig.side, float(entry), float(risk), levels)
+    levels = _all_levels(side, float(entry), basis)
+    kept, skipped = _keep_targets(side, float(entry), float(risk), levels)
     # ``not levels`` — not "every level was too close". A name whose pivots are
     # all *behind* the entry has broken out and has nothing left to aim at; a
     # name whose pivots are ahead but too close was entered into its resistance
@@ -399,7 +419,7 @@ def build_plan(sig: StockSignal, df5: pd.DataFrame, bar,
         # floor every pivot is held to, so the trade still has a defined exit.
         floor = max(min_target_r() * float(risk),
                     float(entry) * min_target_pct() / 100.0)
-        level = (Decimal(str(float(entry) + floor)).quantize(TICK) if sig.side == "BUY"
+        level = (Decimal(str(float(entry) + floor)).quantize(TICK) if side == "BUY"
                  else Decimal(str(float(entry) - floor)).quantize(TICK, rounding=ROUND_CEILING))
         kept = [(f"{min_target_r():.1f}R", float(level))]
         skipped = tuple(skipped) + ("no pivot ahead — measured target",)

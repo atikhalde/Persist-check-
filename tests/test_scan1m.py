@@ -761,6 +761,33 @@ class SummaryCounterTests(TestCase):
                                                        None, report=report))
             self.assertEqual(report["why"], want)
 
+    def test_a_stale_fire_is_handed_back_for_re_basing(self):
+        """``LATE_LEADER_REBASE``: past the window the fire's levels are not this trade's.
+
+        20 Nov, BANK: 148 refusals, all five kept names, all 37 candles, because
+        the only entry the catch-up could offer was the 09:20 one. Past the
+        window the fire is still the evidence of the turn — it comes back with no
+        levels and the caller re-bases them on the candle the sector qualified on.
+        """
+        frame = five_minute_history()
+        hit = scan1m.catchup_candidate(frame, [base.signal(time="09:30")], "BUY", BAR,
+                                       BAR + timedelta(hours=2), None, max_minutes=40,
+                                       rebase=True)
+        self.assertIsNotNone(hit)
+        self.assertTrue(hit["rebase"])
+        self.assertIsNone(hit["plan"])                 # no fire levels at all
+        self.assertIsNone(hit["r"])                    # and no distance from the fire
+        self.assertEqual(hit["price"], float(frame["Close"].iloc[-1]))
+        self.assertEqual(hit["sig"].time, "09:30")
+
+    def test_without_the_re_base_the_window_still_refuses(self):
+        report = {}
+        self.assertIsNone(scan1m.catchup_candidate(five_minute_history(),
+                                                   [base.signal(time="09:30")], "BUY", BAR,
+                                                   BAR + timedelta(hours=2), None,
+                                                   report=report, max_minutes=40))
+        self.assertEqual(report["why"], "old")
+
     def test_a_refusal_without_a_report_dict_still_refuses_quietly(self):
         self.assertIsNone(scan1m.catchup_candidate(None, [base.signal(time="09:30")],
                                                    "BUY", BAR, CLOSE, None))

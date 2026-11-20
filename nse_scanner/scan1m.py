@@ -1176,7 +1176,8 @@ _CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
                       bar: datetime, now: datetime, daily=None,
                       report: dict | None = None, max_minutes: float | None = None,
-                      max_r: float | None = None, fresh_pick: bool = False) -> dict | None:
+                      max_r: float | None = None, fresh_pick: bool = False,
+                      rebase: bool = False) -> dict | None:
     """The name's day-first fire of this side, if a catch-up is still justified.
 
     Valid means all of: the fire is on an earlier candle of today's session, its
@@ -1209,6 +1210,15 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
         report["age"] = age
     if age < 0:                       # a fire in the future is never a catch-up
         return _no("old")
+    if rebase and age > (leader_max_minutes() if max_minutes is None else max_minutes):
+        # ``LATE_LEADER_REBASE``: the fire is further back than the window, so
+        # the levels it defined are not this trade's. Hand back the fire (it is
+        # still the evidence of the turn) and let the caller re-base — entry at
+        # this candle's close, stop at this candle's EMA9 (``trade.plan_at``).
+        # The anti-chase gates are not skipped, they are measured where the risk
+        # is taken: ``pipeline.late_plan`` rebuilds them on the new levels.
+        return {"sig": sig, "plan": None, "price": float(frame["Close"].iloc[-1]),
+                "r": None, "fire": fire, "age": age, "rebase": True}
     if not fresh_pick and age > (leader_max_minutes() if max_minutes is None
                                  else max_minutes):
         # The clock starts at the fire — unless the *pick* is what just arrived,
@@ -1298,7 +1308,7 @@ def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: dat
     close = bar + timedelta(minutes=BAR_MINUTES)
     side = items[0]["hit"]["sig"].side
     arrow = "🟢" if side == "BUY" else "🔴"
-    shown = sorted(items, key=lambda i: -i["hit"]["r"])[:8]
+    shown = sorted(items, key=lambda i: -(i["hit"].get("r") or 0.0))[:8]
     lines = [f"⏰ {arrow} <b>LATE LEADER {side} ×{len(items)}</b> — "
              + (f"{more} more from the same pick" if more
                 else "fired before their sector was picked"),
