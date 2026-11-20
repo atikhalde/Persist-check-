@@ -188,6 +188,7 @@ jobs:
           SCAN5M_LEADER_CATCHUP: ${{ vars.SCAN5M_LEADER_CATCHUP || '1' }}
           SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '40' }}
           LATE_LEADER_ENTRY: ${{ vars.LATE_LEADER_ENTRY || '1' }}
+          LATE_LEADER_REBASE: ${{ vars.LATE_LEADER_REBASE || '1' }}
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_CATCHUP: ${{ vars.PICK_CATCHUP || '1' }}
           SCAN1M_EARLY_FROM: ${{ vars.SCAN1M_EARLY_FROM || '09:30' }}

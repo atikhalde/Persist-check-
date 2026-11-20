@@ -1383,6 +1383,54 @@ class LateLeaderEntryTests(LiveAlertTests):
         far = TradePlan(100.0, 99.0, 99.0, 1.0, 105.0, 106.0, 108.0)    # target worth it
         self.assertIsNotNone(pipeline.late_plan({**hit, "plan": far, "price": 100.5}))
 
+    def test_a_fire_older_than_the_window_is_re_based_on_this_candle(self):
+        """20 Nov BANK: the pick arrives after every name in the sector has fired.
+
+        With the window at 10 minutes the 09:20 fire is 41 minutes old on the
+        10:00 candle — `old`, on every candle the sector held the pick. The fire's
+        entry, stop and target are hours of trend out of date by the time the
+        sector qualifies, so the trade taken is this candle's: 1R from here, not
+        4R from there. ``plan_at`` supplies it and the fire supplies the reason.
+        """
+        plan = TradePlan(100.0, 99.0, 98.5, 1.5, 102.25, 105.0, 108.0)
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:20")]
+        with patch.dict("os.environ", {"SCAN5M_LEADER_MAX_MINUTES": "10"}), \
+                patch.object(pipeline.trade, "plan_at", return_value=plan) as at:
+            pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        entry = [t for t in texts if "LATE LEADER ENTRY (re-based)" in t]
+        self.assertEqual(len(entry), 1, texts)
+        self.assertIn("levels re-based on this candle", entry[0])
+        self.assertIn("this candle's EMA9 stop", entry[0])
+        self.assertNotIn("R from the fire", entry[0])
+        self.assertEqual(at.call_count, 1)
+        st = state.load()
+        self.assertEqual(st["stats"]["rebased_entries"], 1)
+        self.assertEqual(st["stats"]["late_entries"], 1)
+        self.assertEqual(st["positions"]["ABC"]["sl"], 98.5)   # this candle's, not the fire's
+        self.assertTrue(st["catchup"]["ABC"]["entry"])
+
+    def test_the_re_base_knob_leaves_only_the_fires_own_levels(self):
+        """With the re-base off, the window is open but there is nothing to take.
+
+        ``PICK_CATCHUP`` re-opens the catch-up for a late pick, so the refusal is
+        no longer ``old`` — it is the fire's own plan that refuses (its entry,
+        its stop, its targets are hours stale). That is the whole reason the
+        re-base exists, and ``LATE_LEADER_REBASE=0`` restores exactly it.
+        """
+        self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:20")]
+        with patch.dict("os.environ", {"SCAN5M_LEADER_MAX_MINUTES": "10",
+                                       "LATE_LEADER_REBASE": "0"}):
+            pipeline.run_once()
+        texts = [c.args[0] for c in self.send.call_args_list]
+        self.assertEqual([t for t in texts if "LATE LEADER ENTRY" in t], [])
+        st = state.load()
+        self.assertNotIn("ABC", st["positions"])
+        self.assertNotIn("rebased_entries", st["stats"])
+        skips = st["stats"]["catchup_skip"]
+        self.assertEqual(skips.get("old"), None)          # the window was re-opened
+        self.assertEqual(sum(skips.values()), 1)          # and the fire's plan refused
+
     def test_the_knob_restores_the_plain_heads_up(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
         with patch.dict("os.environ", {"LATE_LEADER_ENTRY": "0"}):

@@ -9,7 +9,7 @@ import pandas as pd
 from nse_scanner.session import IST
 from nse_scanner.stock import StockSignal
 from nse_scanner import pipeline
-from nse_scanner.trade import (PivotBasis, build_plan, ema9_on_bar, exit_buffer, pivot_basis,
+from nse_scanner.trade import (PivotBasis, build_plan, ema9_on_bar, exit_buffer, pivot_basis, plan_at,
                              pivot_targets,
                              trail_broken)
 
@@ -128,6 +128,38 @@ class TradePlanTests(TestCase):
         previous.index = previous.index - timedelta(days=3)
         df = pd.concat([previous, candles([100.] * 10)])
         self.assertEqual(pivot_targets("BUY", 100., df, BAR), [102., 104., 106.])
+
+
+class PlanAtTests(TestCase):
+    """``plan_at`` — the levels of a trade that has no signal on its candle.
+
+    20 Nov, BANK: the sector was picked at 12:05 with every bank having fired at
+    09:20, so the trade still available had no fire on the candle it was taken
+    on. Its entry, stop and targets are that candle's, built by the same rules a
+    fresh entry obeys — ``MIN_TARGET_R``, the measured fallback, the EMA9 stop.
+    """
+
+    def test_the_levels_are_the_candle_s_own(self):
+        df = candles([100.0] * 9 + [102.0])
+        plan = plan_at("BUY", df, BAR)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.entry, 102.0)
+        self.assertLess(plan.sl, plan.entry)
+        self.assertAlmostEqual(plan.ema9, ema9_on_bar(df, BAR), places=6)
+
+    def test_the_short_side_is_mirrored(self):
+        df = candles([100.0] * 9 + [98.0])
+        plan = plan_at("SELL", df, BAR)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.entry, 98.0)
+        self.assertGreater(plan.sl, plan.entry)
+
+    def test_a_bar_that_is_not_the_frames_last_is_refused(self):
+        df = candles([100.0] * 10)
+        self.assertIsNone(plan_at("BUY", df, df.index[-2]))
+
+    def test_a_side_that_is_not_a_trade_is_refused(self):
+        self.assertIsNone(plan_at("HOLD", candles([100.0] * 10), BAR))
 
 
 class TargetQualityTests(TestCase):

@@ -1069,6 +1069,8 @@ def format_summary(st: dict) -> str | None:
              _summary_not_held(x),
              f"Entries {x.get('entries', 0)}"
              + (f" · {x['late_entries']} from late leaders" if x.get("late_entries") else "")
+             + (f" · {x['rebased_entries']} of them re-based on the pick candle"
+                if x.get("rebased_entries") else "")
              + (f" · sent {x['lag_sum'] / x['entries']:.0f}s after the close on average,"
                 f" slowest {x.get('lag_max', 0):.0f}s" if x.get("entries") else ""),
              _summary_rejects(st),
@@ -2422,15 +2424,22 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
     """
     if not scan5m_leader_catchup():
         return
-    from .scan1m import catchup_candidate, pick_is_fresh
+    from .scan1m import catchup_candidate
     why: dict = {}
     # The same re-opened window bot 3 has: a pick that arrives late is what makes
     # the leaders tradeable, so the fire's age is not the test on that candle.
-    fresh = pick_is_fresh(st.get("late_pick"), bar)
+    # ``_consider_late`` is only reached on a candle inside the window
+    # ``_late_due`` opened for the current pick, so the pick *is* fresh here.
+    # It used to re-ask ``pick_is_fresh``, which compares the candle stored in
+    # ``late_pick["since"]`` with this one: on 20 Nov the pick flipped to BANK at
+    # 12:05 in the scanner's own record (the audit's timeline has it at 12:10),
+    # so the marker was one candle behind and every BANK name fell back to the
+    # plain 40-minute clock — 148 refusals, all five names, all 37 candles.
+    fresh = True
     try:
         hit = catchup_candidate(df5, fires, want, bar, now_ist(), daily, report=why,
                                 max_minutes=late_max_minutes(), max_r=late_max_r(),
-                                fresh_pick=fresh)
+                                fresh_pick=fresh, rebase=late_leader_rebase())
     except Exception:
         log.exception("late-leader check failed for %s", raw)
         return
@@ -2448,7 +2457,7 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
         runs, why_not, _ = momentum_verdict(df5, bar, hit["price"], want == "BUY", intra)
     except Exception:
         runs, why_not = True, ""
-    late.append({"raw": raw, "hit": hit, "sector": sector,
+    late.append({"raw": raw, "hit": hit, "sector": sector, "frame": df5,
                  "runs": runs, "why_not": why_not})
 
 
@@ -2471,7 +2480,25 @@ def late_leader_entry() -> bool:
     return os.environ.get("LATE_LEADER_ENTRY", "1").strip() != "0"
 
 
-def late_plan(hit) -> TradePlan | None:
+#: ``LATE_LEADER_REBASE`` (1): a fire older than the catch-up window is still a
+#: turn, but its levels are not this trade's — re-base them on the current candle.
+#:
+#: 20 Nov, BANK: the sector crossed the persistence floor at 11:50, was picked at
+#: 12:05 and held 37 candles, and every one of its five kept names was refused on
+#: every one of them. ``PICK_CATCHUP`` re-opens the *window* for a late pick, but
+#: the checks behind it still measure the fire's entry: AXISBANK was +4.3% from a
+#: 09:20 fire against a ~1% stop — 4R, past ``SCAN5M_LEADER_MAX_R`` — and its T1
+#: was behind the price by lunchtime. Re-basing says the obvious thing: the trade
+#: still there is a *new* trade on the candle the sector finally qualifies, with
+#: that candle's stop, so the risk is 1R and the chase guards apply to the trade
+#: actually being taken. 20 Nov, from the first scanned candle to the close:
+#: AXISBANK +1.73pp, INDUSINDBK +1.03, RBLBANK +1.53, FEDERALBNK +1.03 — and
+#: zero entries. ``0`` restores the fire's levels only (today's behaviour).
+def late_leader_rebase() -> bool:
+    return os.environ.get("LATE_LEADER_REBASE", "1").strip() != "0"
+
+
+def late_plan(hit, frame=None, bar=None) -> TradePlan | None:
     """The late leader's trade taken *now*, or ``None`` if it is no longer there.
 
     Entry is the current price (the candle the scan is judging), the stop is the
@@ -2488,6 +2515,13 @@ def late_plan(hit) -> TradePlan | None:
     the name stays the heads-up it should be.
     """
     sig, plan = hit.get("sig"), hit.get("plan")
+    if hit.get("rebase"):
+        # The fire is older than the window: its levels describe a trade that is
+        # gone. Take this candle's — the same builder a fresh entry uses, so the
+        # target gates (``MIN_TARGET_R``, the measured fallback) apply unchanged.
+        if not late_leader_rebase() or frame is None or bar is None or sig is None:
+            return None
+        return trade.plan_at(sig.side, frame, bar)
     if sig is None or plan is None or plan.risk is None or plan.t1 is None:
         return None
     price = float(hit.get("price") or 0.0)
@@ -2510,24 +2544,36 @@ def format_late_entry(raw: str, hit: dict, plan: TradePlan, md, bar: datetime,
                       dual: str = "") -> str:
     """The catch-up entry alert — every field says what it is, so it cannot be
     mistaken for a signal that fired on this candle."""
-    sig, fire = hit["sig"], hit["plan"]
+    sig, fire = hit["sig"], hit.get("plan")
     arrow = "🟢" if sig.side == "BUY" else "🔴"
     risk_pct = plan.risk / plan.entry * 100.0 if plan.entry else 0.0
+    rebased = bool(hit.get("rebase"))
     return (
-        f"⏰ {arrow} <b>LATE LEADER ENTRY — {sig.side}</b>  |  <b>{sig.name}</b>  {raw}\n"
+        f"⏰ {arrow} <b>LATE LEADER ENTRY{' (re-based)' if rebased else ''} — "
+        f"{sig.side}</b>  |  <b>{sig.name}</b>  {raw}\n"
         f"{telegram.esc(sector or md.pick_sector)}  |  Market {md.dir_label} ({md.dir_conf}%)\n"
         + (f"<i>{telegram.esc(dual)}</i>\n" if dual else "")
-        + f"Fired <b>{sig.time}</b> as {sig.name} @ {fire.entry:.2f} · "
-        f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
-        f"Entry <b>{plan.entry:.2f}</b> (this candle's close) · SL {plan.sl:.2f} "
-        f"(the fire candle's EMA9 stop, untouched since)\n"
-        f"Risk {plan.risk:.2f} ({risk_pct:.2f}%) · {hit['r']:+.1f}R from the fire  |  "
-        f"targets: {_target_text(plan)}\n"
+        + (f"Fired <b>{sig.time}</b> as {sig.name} · "
+           f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n"
+           if rebased else
+           f"Fired <b>{sig.time}</b> as {sig.name} @ {fire.entry:.2f} · "
+           f"sector picked {bar:%H:%M} · {hit['age']:.0f} min ago\n")
+        + f"Entry <b>{plan.entry:.2f}</b> (this candle's close) · SL {plan.sl:.2f} "
+        + ("(this candle's EMA9 stop — the fire's levels are hours old)\n"
+           if rebased else "(the fire candle's EMA9 stop, untouched since)\n")
+        + f"Risk {plan.risk:.2f} ({risk_pct:.2f}%) · "
+        + ("levels re-based on this candle  |  " if rebased
+           else f"{hit['r']:+.1f}R from the fire  |  ")
+        + f"targets: {_target_text(plan)}\n"
         f"Score {sig.score} {sig.strength}   {telegram.esc(sig.reason)}\n"
         + (f"Taken from the 5m close scan ({bot}).\n" if bot == "5m"
            else "Taken by the 1m scanner on this minute.\n")
-        + "<b>Catch-up entry</b> — the crossover fired before its sector was picked and "
-        "the trade is still before T1. The stop is the fire candle's, not this candle's."
+        + ("<b>Catch-up entry, re-based</b> — the sector only became tradeable now, so "
+           "the entry, the stop and the targets are this candle's, not the fire's. "
+           "Risk is 1R from here."
+           if rebased else
+           "<b>Catch-up entry</b> — the crossover fired before its sector was picked and "
+           "the trade is still before T1. The stop is the fire candle's, not this candle's.")
     )
 
 
@@ -2545,7 +2591,7 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
                              dir_conf=md.get("conf"))
     if not late_leader_entry():
         return False
-    plan = late_plan(hit)
+    plan = late_plan(hit, frame=item.get("frame"), bar=bar)
     if plan is None:
         return False
     if scan_require_target() and not _plan_has_target(plan):
@@ -2568,6 +2614,8 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
     take_entry_slot(st, key)
     _bump(st, "entries")
     _bump(st, "late_entries")
+    if hit.get("rebase"):
+        _bump(st, "rebased_entries")
     st.setdefault("sent", {})[raw] = {"code": hit["sig"].code, "name": hit["sig"].name,
                                       "time": hit["sig"].time, "price": plan.entry}
     st.setdefault("positions", {})[raw] = new_position(hit["sig"].side, plan,
@@ -2579,9 +2627,11 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
         "fired": hit["sig"].time, "side": hit["sig"].side, "code": hit["sig"].code,
         "price": plan.entry, "at": now.strftime("%H:%M:%S"), "entry": True}
     (save or _save)(st)
-    log.info("LATE LEADER ENTRY %s %s fired %s as %s at %.2f (%.1fR from the fire), "
-             "sector %s picked %s", raw, hit["sig"].side, hit["sig"].time,
-             hit["sig"].name, plan.entry, hit["r"], item.get("sector"),
+    log.info("LATE LEADER ENTRY%s %s %s fired %s as %s at %.2f (%s), sector %s picked %s",
+             " (re-based)" if hit.get("rebase") else "", raw, hit["sig"].side,
+             hit["sig"].time, hit["sig"].name, plan.entry,
+             ("levels of this candle" if hit.get("rebase")
+              else f"{hit['r']:.1f}R from the fire"), item.get("sector"),
              bar.strftime("%H:%M"))
     return True
 
@@ -2601,7 +2651,9 @@ def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict],
     todo = [item for item in late if item["raw"] not in sent and item["raw"] not in book]
     if not todo:
         return
-    todo.sort(key=lambda item: -item["hit"]["r"])
+    # A re-based hit carries no distance from the fire (``r`` is None): it sorts
+    # last, and it is never a heads-up — it is an entry or nothing.
+    todo.sort(key=lambda item: -(item["hit"].get("r") or 0.0))
     # What is still a live trade becomes an entry; what has already paid, been
     # stopped out or run past 2R stays a heads-up (``LATE_LEADER_ENTRY=0`` keeps
     # every one of them a heads-up, as on 19 Nov).
@@ -2609,6 +2661,7 @@ def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict],
             if not take_late_entry(st, md, bar, item, now,
                                    side_of=side_of,
                                    dual=alt_note if item["sector"] == alt else "")]
+    rest = [item for item in rest if not item["hit"].get("rebase")]
     if not rest:
         return
     todo = rest

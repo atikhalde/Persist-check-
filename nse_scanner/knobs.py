@@ -65,6 +65,7 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("SCAN5M_REQUIRE_TARGET", "1"),
     ("SCAN5M_LEADER_CATCHUP", "1"),
     ("LATE_LEADER_ENTRY", "1"),
+    ("LATE_LEADER_REBASE", "1"),
     ("SCAN5M_LEADER_MAX_MINUTES", "40"),
     ("SCAN5M_LEADER_MAX_R", "2.0"),
     ("PICK_STICKY_LOG", "0"),

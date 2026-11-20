@@ -1,6 +1,7 @@
 # Next session — where to start
 
-Read `docs/analysis-2026-11-20-1m.md` first; it is the tape this agenda comes from.
+Read `docs/analysis-2026-11-20-5m.md` first (then `-1m.md`); it is the tape this agenda
+comes from.
 Nothing here is a guess: every item names the number that decided it.
 
 ## 1. What is live now
@@ -8,6 +9,7 @@ Nothing here is a guess: every item names the number that decided it.
 | knob | default | what it does |
 |---|---|---|
 | `PICK_CATCHUP` | `1` | a pick that arrives late re-opens the 40-min leader catch-up for its names (both bots). Anti-chase guards unchanged: the fire's stop must be untouched since, the move from the fire ≤ `SCAN5M_LEADER_MAX_R` / `SCAN1M_LEADER_MAX_R` |
+| `LATE_LEADER_REBASE` | `1` | when a `PICK_CATCHUP` window opens and the name's fire is *older than* the window, the fire's levels are discarded and this candle's are built instead (`trade.plan_at`): entry = close, stop = EMA9, targets from the current price. The name must still be running and ahead of its sector; once per name. 20 Nov BANK: 148 refusals, 0 entries, +1.73pp left on AXISBANK after the scan reached it |
 | `TARGET_FALLBACK` | `1` | a name above every pivot gets a measured target at the `MIN_TARGET_R` / `MIN_TARGET_PCT` floor instead of a "no pivot target" refusal. A pivot *ahead but too close* is still a refusal |
 | `SCAN1M_EARLY_FROM` | `09:30` | no projected heads-up for the first two candles of the session |
 | `AUDIT_BOARD` | `1` | score the **whole board** — all 15 sectors, all names — once per 5m candle, 09:20–15:15, and ship it as a per-name summary in the audit, a `board-*.jsonl` companion and a printable `board-*.html` |
