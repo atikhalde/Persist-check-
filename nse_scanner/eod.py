@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 from . import audit, costs, ledger, telegram
 
@@ -696,7 +697,8 @@ def send_eod(st: dict, *, bot: str = "5m", send=None, send_doc=None,
             books = payload.get("books") or {}
             caption = (f"Audit {st.get('session')} · {books.get('trades', 0)} trade(s) · "
                        f"net ₹{books.get('net_rs', 0):,.0f}")
-            for path in (json_path, xlsx_path):
+            extra = [Path(p) for p in (payload.get("board") or {}).get("files") or []]
+            for path in (json_path, xlsx_path, *extra):
                 if not send_doc(str(path), caption):
                     log.error("audit attachment %s was not delivered", path)
                     ok = False

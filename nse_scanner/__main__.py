@@ -135,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         out = (confirm_pass(bar - timedelta(minutes=5), now=now, force_sector=args.sector)
                if minute == 0 else run_minute(bar, now=now, force_sector=args.sector))
         kind = "confirmed" if minute == 0 else "projected"
+        # After the alerts, never before them: the board is a record, and a record
+        # must not stand between a signal and its deadline.
+        from .board import sweep
+        sweep(now=now)
         print(f"{bar:%Y-%m-%d %H:%M}  minute {minute}  {kind} alerts={len(out)}")
         for s in out:
             print(f"  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")

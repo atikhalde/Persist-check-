@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 
+from . import board as board_book
 from . import costs, knobs, ledger, xlsx
 
 THRESH_70 = 70
@@ -181,6 +182,11 @@ def build(st: dict, *, bot: str = "5m") -> dict:
                          for name, c in (row.get("sec") or {}).items()}}
             for row in stats.get("timeline") or []],
         "leadership": leadership_rows(st),
+        "board": {
+            "meta": dict((st.get("stats") or {}).get("board", {}).get("meta") or {}),
+            "summary": board_book.summary(st, closed=closed, opened=opened, blocked=blocked),
+            "files": [],
+        },
         "diagnostics": {
             "pending": stats.get("pending") or [],
             "checked": stats.get("checked") or [],
@@ -376,10 +382,25 @@ SHEETS = {
 
 
 def write(st: dict, *, bot: str = "5m") -> tuple[Path, Path, dict]:
-    """Write both attachments and return ``(json, xlsx, audit)``."""
+    """Write every attachment and return ``(json, xlsx, audit)``.
+
+    The board is written twice: its per-name summary is inside the audit above,
+    and its per-candle rows go to a JSONL companion (one line per candle) with a
+    printable HTML page beside it — 13,000 rows in the audit's indented JSON
+    would have made the file unreadable for the sake of a grid nobody reads
+    there. Both paths are listed in ``audit["board"]["files"]`` so the
+    end-of-day message attaches them without knowing their names.
+    """
     audit = build(st, bot=bot)
-    json_path, xlsx_path = paths(str(st.get("session") or "session"), bot)
+    session = str(st.get("session") or "session")
+    json_path, xlsx_path = paths(session, bot)
     json_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        files = board_book.write_files(st, audit, session=session, bot=bot,
+                                       directory=json_path.parent)
+    except Exception:                       # a page that fails must not cost the audit
+        files = []
+    audit["board"]["files"] = [str(p) for p in files]
     json_path.write_text(json.dumps(audit, indent=2, default=str), encoding="utf-8")
     xlsx.write(xlsx_path, {name: builder(audit) for name, builder in SHEETS.items()})
     return json_path, xlsx_path, audit

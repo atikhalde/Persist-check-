@@ -191,6 +191,11 @@ jobs:
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_CATCHUP: ${{ vars.PICK_CATCHUP || '1' }}
           SCAN1M_EARLY_FROM: ${{ vars.SCAN1M_EARLY_FROM || '09:30' }}
+          AUDIT_BOARD: ${{ vars.AUDIT_BOARD || '1' }}
+          AUDIT_BOARD_EVERY_MIN: ${{ vars.AUDIT_BOARD_EVERY_MIN || '5' }}
+          AUDIT_BOARD_FROM: ${{ vars.AUDIT_BOARD_FROM || '09:20' }}
+          AUDIT_BOARD_TO: ${{ vars.AUDIT_BOARD_TO || '15:15' }}
+          AUDIT_BOARD_PERIOD: ${{ vars.AUDIT_BOARD_PERIOD || '1d' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also scan the leading sector on the other side of the pick.
