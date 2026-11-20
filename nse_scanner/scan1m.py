@@ -1388,6 +1388,22 @@ _no_pick_bar: str | None = None      # the last candle that logged "no sector pi
 _quiet_bar: str | None = None        # the last candle held back by SCAN1M_EARLY_FROM
 
 
+def sweep_board(now: datetime | None = None) -> dict | None:
+    """Score the whole board once per candle (``AUDIT_BOARD``), after the alerts.
+
+    ``board.sweep`` already refuses anything it should not do and never raises;
+    this wrapper exists so the long-running loop has one call to make and the
+    tests have one thing to stub.
+    """
+    from .board import sweep
+
+    try:
+        return sweep(now=now)
+    except Exception:                       # noqa: BLE001 — never cost a candle
+        log.exception("board sweep failed")
+        return None
+
+
 def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
                force_sector: str | None = None) -> list[dict]:
     """Evaluate the forming candle ``bar`` from the 1m prints and alert bot 3.
@@ -2393,6 +2409,8 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
                 action = tick(now)      # a healthy feed finishes this in seconds
             if action == "project":
                 run_minute(bar, now=now, force_sector=force_sector)
+            # The whole board, once per candle, after the alerts of this minute.
+            sweep_board(now=now)
             # Holiday detection, exactly as the 5m loop does it: three candles in
             # a row with no NSE bar today and the day is treated as closed.
             if _session_closed(now):

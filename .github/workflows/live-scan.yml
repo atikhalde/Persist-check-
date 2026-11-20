@@ -238,6 +238,11 @@ jobs:
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
           PICK_CATCHUP: ${{ vars.PICK_CATCHUP || '1' }}
           SCAN1M_EARLY_FROM: ${{ vars.SCAN1M_EARLY_FROM || '09:30' }}
+          AUDIT_BOARD: ${{ vars.AUDIT_BOARD || '1' }}
+          AUDIT_BOARD_EVERY_MIN: ${{ vars.AUDIT_BOARD_EVERY_MIN || '5' }}
+          AUDIT_BOARD_FROM: ${{ vars.AUDIT_BOARD_FROM || '09:20' }}
+          AUDIT_BOARD_TO: ${{ vars.AUDIT_BOARD_TO || '15:15' }}
+          AUDIT_BOARD_PERIOD: ${{ vars.AUDIT_BOARD_PERIOD || '1d' }}
           # 1 = look the incumbent pick up in a per-bar log, so the early pass
           # cannot erase the candle before this one (pick cannot flip inside a
           # candle). Off: 17 Nov it would have held REALTY and lost BANKINDIA.

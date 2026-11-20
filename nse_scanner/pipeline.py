@@ -2367,6 +2367,15 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     st["session"] = session
     _save(st)
     result["signals"] = new_signals
+    # The whole board for this candle, after every alert of it has gone out. Its
+    # own ledger, so it costs nothing to skip when the knob is off.
+    try:
+        from .board import sweep as _board_sweep
+
+        if _board_sweep(st, frames=sm5) is not None:
+            _save(st)
+    except Exception:                       # noqa: BLE001 — never cost a candle
+        log.exception("board sweep failed")
     return result
 
 

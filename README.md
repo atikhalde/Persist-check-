@@ -81,6 +81,7 @@ be traced back to the candle that produced it (and checked against the JSON).
 | **Sector momentum timeline** | every ~15 min: market tilt (label + confidence), the pick, its **bull▲/bear▼ flow**, the sector's day and from-open move, the regime — with the moments the pick moved |
 | **Persistent-sector performance** | per sector: score range (min–max–now), candles ≥70, candles and **spells with the gate open** (times), crossings of 70/85, candles as pick and how many runs, entries |
 | **Top-5 leadership activity** | per scanned sector, the names that kept coming up: average combined rank and its three legs (`s` strength / `v` volume / `t` structure), times in the top 5, times first, and `✚ entered` / `⊘ rule` for what became of them |
+| **The whole board** *(audit only)* | every name in every sector, scored every 5m candle 09:20–15:15 with the same strength · volume · structure the trim uses, next to its sector's persistence and move — the sectors no scan looked at are the ones that hold the misses, and this is the only place they appear. Shipped as a per-name summary in the audit JSON, a per-candle `board-*.jsonl` companion and a printable `board-*.html` (open it and print to PDF) |
 | **Were the entries leaders?** | every entry's rank inside its own sector on the board it was judged against, then the count — "2 of 6 went to a name ranked in its sector's top five" is the fastest read on whether the entry filter is buying leaders or whatever was left after the leaders were refused |
 | **Every blocked signal** | one line per signal, under the rule that blocked it, with its own reason (`N4 10:35 — rank 4 is behind its sector's runners`) — no sampling, no "6 of 31" |
 | **Trader ledger** | every trade: quantity, entry/exit price and time, why it closed, targets hit, hold time, **gross ₹, costs ₹, net ₹**, gross R and net R; open trades marked at the close; then the day's book — wins/losses, profit factor, expectancy, best/worst, max drawdown, risk deployed and return on risk |
@@ -113,6 +114,9 @@ rank (s strength / v volume / t structure) · ×N = times in the top 5 · every 
 Were the entries leaders?
 TATAMOTORS 1 of 5 · M&M outside the 5 listed · HAVELLS 3 of 5
 2 of 3 entries went to a name ranked in its sector's top five when it was taken · 1 was what was left after the leaders were refused
+
+The whole board — 15 sectors × 190 names × 72 candles, in board-<session>-<bot>.jsonl
+16 names were in their sector's top five for the whole session; 9 of them were never entered
 
 Every blocked signal
 44 signals blocked — listed one by one below
