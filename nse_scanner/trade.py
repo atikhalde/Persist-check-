@@ -77,6 +77,24 @@ def min_target_pct() -> float:
     return _env_float("MIN_TARGET_PCT", 0.10)
 
 
+def target_fallback() -> bool:
+    """Give a broken-out name a measured target instead of refusing it (1).
+
+    A name that has cleared its own pivots has no level left above it, so
+    :func:`_keep_targets` returns nothing and the entry used to be refused for
+    "no pivot target at all". That is backwards: a name trading above every
+    level is the *most* extended leader on the board, not the weakest. 20 Nov,
+    five of the IT leaders the catch-up had just found — COFORGE, PERSISTENT,
+    MPHASIS, LTIM, LTTS — were skipped at 09:30 with "no pivot target — the
+    trade has no exit", and the bot bought the laggards (TCS, HCLTECH) instead.
+
+    The fallback keeps the trade defined without moving the entry: the target is
+    the same ``MIN_TARGET_R`` / ``MIN_TARGET_PCT`` floor every pivot must clear,
+    measured from the entry. ``TARGET_FALLBACK=0`` restores the refusal.
+    """
+    return os.environ.get("TARGET_FALLBACK", "1") != "0"
+
+
 def exit_buffer(close: float, risk: float | None) -> float:
     """Noise band around EMA9 before a close counts as a broken trail.
 
@@ -370,8 +388,21 @@ def build_plan(sig: StockSignal, df5: pd.DataFrame, bar,
     if risk <= 0:
         return None
     basis = pivot_basis(df5, bar, df1)
-    kept, skipped = _keep_targets(sig.side, float(entry), float(risk),
-                                  _all_levels(sig.side, float(entry), basis))
+    levels = _all_levels(sig.side, float(entry), basis)
+    kept, skipped = _keep_targets(sig.side, float(entry), float(risk), levels)
+    # ``not levels`` — not "every level was too close". A name whose pivots are
+    # all *behind* the entry has broken out and has nothing left to aim at; a
+    # name whose pivots are ahead but too close was entered into its resistance
+    # and must still be refused (the GODREJCP lesson).
+    if not kept and not levels and target_fallback():
+        # No pivot ahead of the entry: the ladder is behind the price. Aim at the
+        # floor every pivot is held to, so the trade still has a defined exit.
+        floor = max(min_target_r() * float(risk),
+                    float(entry) * min_target_pct() / 100.0)
+        level = (Decimal(str(float(entry) + floor)).quantize(TICK) if sig.side == "BUY"
+                 else Decimal(str(float(entry) - floor)).quantize(TICK, rounding=ROUND_CEILING))
+        kept = [(f"{min_target_r():.1f}R", float(level))]
+        skipped = tuple(skipped) + ("no pivot ahead — measured target",)
     targets = (kept[:3] + [(None, None)] * 3)[:3]
     return TradePlan(float(entry), ema, float(stop), float(risk),
                      *(price for _, price in targets),

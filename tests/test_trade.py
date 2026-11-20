@@ -29,6 +29,48 @@ def signal(side, price):
                        "10:00", price, 65, "Strong", 20, 0, "test")
 
 
+class TargetFallbackTests(TestCase):
+    """A broken-out name gets a measured target instead of a refusal.
+
+    20 Nov: COFORGE, PERSISTENT, MPHASIS, LTIM and LTTS were the IT leaders the
+    catch-up had just found, and all five were skipped at 09:30 with "no pivot
+    target — the trade has no exit" — every one of them trading above its own
+    pivots. A name past its levels is the most extended leader on the board.
+    """
+
+    def daily(self, high, low, close):
+        return pd.DataFrame({"Open": [close], "High": [high], "Low": [low],
+                             "Close": [close], "Volume": [1]},
+                            index=[BAR - timedelta(days=3)])
+
+    def test_a_name_above_every_pivot_gets_the_measured_floor(self):
+        # A clean break above yesterday's high: every pivot is behind a 102 entry.
+        prior = self.daily(101.0, 100.0, 100.5)
+        df = candles([100.0] * 9 + [102.0])
+        plan = build_plan(signal("BUY", 102.0), df, BAR, prior)
+        self.assertIsNotNone(plan)
+        self.assertIsNotNone(plan.t1)
+        self.assertEqual(plan.pivot_names[0], "0.5R")
+        self.assertGreaterEqual(plan.t1 - plan.entry, 0.5 * plan.risk - 0.011)
+        self.assertIn("no pivot ahead — measured target", plan.skipped)
+
+    def test_the_switch_restores_the_refusal(self):
+        prior = self.daily(101.0, 100.0, 100.5)
+        df = candles([100.0] * 9 + [102.0])
+        with patch.dict("os.environ", {"TARGET_FALLBACK": "0"}):
+            plan = build_plan(signal("BUY", 102.0), df, BAR, prior)
+        self.assertIsNone(plan.t1)
+
+    def test_a_pivot_too_close_is_still_a_refusal(self):
+        # Pivots *ahead* but inside the floor: the GODREJCP case, not a breakout.
+        prior = self.daily(102.0, 98.0, 100.0)
+        df = candles([100.0] * 9 + [102.0])
+        with patch.dict("os.environ", {"MIN_TARGET_R": "999"}):
+            plan = build_plan(signal("BUY", 102.0), df, BAR, prior)
+        self.assertIsNone(plan.t1)
+        self.assertTrue(plan.skipped)
+
+
 class TradePlanTests(TestCase):
     def test_buy_stop_unchanged_and_targets_are_next_pivots(self):
         df = candles([100.0] * 9 + [102.0])
