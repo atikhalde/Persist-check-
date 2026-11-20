@@ -924,6 +924,8 @@ def _close_trade(st: dict, raw: str, pos: dict, price: float, why: str, hhmm: st
                      "net_r": round(money["net"] / (risk * qty), 2) if risk and qty else 0.0,
                      "t_hit": len(pos.get("hit_targets") or ()),
                      "stop0": pos.get("sl0"),
+                     "mfe_r": pos.get("mfe_r"), "mae_r": pos.get("mae_r"),
+                     "mfe_pct": pos.get("mfe_pct"), "mae_pct": pos.get("mae_pct"),
                      "t1": pos.get("t1"), "t2": pos.get("t2"), "t3": pos.get("t3"),
                      "entry_bar": pos.get("entry_bar"),
                      "sector": pos.get("sector") or (st.get("scan") or {}).get("sector") or ""})
@@ -1650,6 +1652,35 @@ def _alert_key(raw: str, pos: dict, tag: str) -> str:
     return _alert_prefix(raw, pos) + tag
 
 
+def _note_excursion(pos: dict, side: str, row) -> None:
+    """How far this candle took the trade each way, in R and in % of the entry.
+
+    The ledger has always known the entry, the exit and the hold time, but never
+    the best and worst point in between — so "the trail is giving back the move"
+    could be felt on the day and never measured across days
+    (``docs/next-session.md`` §4). ``sl0`` is the *original* stop even after T1
+    has moved the live stop to breakeven, so R is measured against the risk that
+    was actually taken.
+    """
+    try:
+        entry = float(pos.get("entry") or 0.0)
+        risk = float(pos.get("risk") or 0.0)
+        if not risk and pos.get("sl0") is not None:
+            risk = abs(entry - float(pos["sl0"]))
+        if not entry or not risk:
+            return
+        high, low = float(row["High"]), float(row["Low"])
+        long = str(side).upper() != "SELL"
+        fav = (high - entry) if long else (entry - low)
+        adv = (low - entry) if long else (entry - high)
+        pos["mfe_r"] = round(max(float(pos.get("mfe_r") or 0.0), fav / risk), 2)
+        pos["mae_r"] = round(min(float(pos.get("mae_r") or 0.0), adv / risk), 2)
+        pos["mfe_pct"] = round(max(float(pos.get("mfe_pct") or 0.0), fav / entry * 100.0), 2)
+        pos["mae_pct"] = round(min(float(pos.get("mae_pct") or 0.0), adv / entry * 100.0), 2)
+    except (TypeError, ValueError, KeyError):
+        return                          # a measurement must never cost an alert
+
+
 def _track_positions(st: dict, bar: datetime, period_5m: str, *,
                      send=None, save=None) -> list[str]:
     """One-line hit alerts for open trades, independent of market/sector state.
@@ -1765,6 +1796,10 @@ def _track_positions(st: dict, bar: datetime, period_5m: str, *,
         for ts in replay:
             row = grid.loc[ts]
             hhmm = to_ist(ts).strftime("%H:%M")
+            # The candle is here, so its high and low are the trade's own: the
+            # best and worst it has been, kept on the position and filed with the
+            # trade at the exit.
+            _note_excursion(pos, side, row)
 
             # The stop in force at the OPEN of this bar. A T1 hit below may move
             # it to breakeven, which then binds from the NEXT bar: intrabar order

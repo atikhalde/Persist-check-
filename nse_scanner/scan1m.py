@@ -1062,6 +1062,13 @@ def format_summary(st: dict) -> str:
         shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
         lines.append(f"⚠ candle(s) never judged: {len(names)} — {shown} — no market bar for them"
                      f" inside the alert deadline, so their entries were not considered")
+    if stats.get("no_bar"):
+        # The feed's own gap, not the loop's: candles past the last bar it
+        # published. Named so "never judged" can keep meaning "the loop missed it".
+        names = list(stats["no_bar"])
+        shown = ", ".join(names[:6]) + (" …" if len(names) > 6 else "")
+        lines.append(f"candle(s) with no published bar: {len(names)} — {shown} — the feed stopped,"
+                     f" so no entry was possible (not a missed candle)")
     if lost:
         shown = " · ".join(f"{e.get('raw')} {e.get('time')} ({_tries(e)})"
                            for e in list(lost.values())[:6])
@@ -2299,23 +2306,89 @@ def _sleep_until(target: datetime) -> None:
         time.sleep(min(left, 30))
 
 
-def missing_candles(stats: dict, now: datetime) -> list[str]:
-    """The session's candles whose close has passed and that were never judged.
+def _judged_marks(stats: dict) -> set[str]:
+    """Every candle the day can *prove* was judged, as ``HH:MM``.
 
-    Bot 3 cannot judge a candle without the market bar for it, and the loop gives
-    each one three minutes (``MAX_ALERT_LAG_SECONDS``). When the index feed stops —
-    18 Nov it stopped at the 15:15 bar — the last closes simply expire, and
-    nothing else in the day says which ones did.
+    Two records exist and they are not the same one. ``stats["judged"]`` is
+    written by :func:`_mark_judged` at the end of a close pass; the timeline row
+    is written when the pick for the candle is made and counted. A pass that
+    returns early after the pick — or that is retried and then completes through
+    another path — leaves the timeline row without the mark.
+
+    20 Nov the summary named 12:20, 12:30, 13:20 and 15:10 as "candles never
+    judged" while all four have a pick and a timeline row in the same audit: a
+    false alarm is worse than no alarm, because it sends a reader to fix a loop
+    that is not broken. A candle with a pick was judged.
     """
-    judged = set(stats.get("judged") or ())
+    judged = {str(k) for k in (stats.get("judged") or {})}
+    for row in stats.get("timeline") or []:
+        bar = str(row.get("b") or "")
+        if bar:
+            judged.add(bar[-5:])
+    return judged
+
+
+def _last_published(stats: dict) -> str:
+    """The latest candle the feed ever gave us, as ``HH:MM`` ("" if none)."""
+    marks = _judged_marks(stats)
+    return max(marks) if marks else ""
+
+
+def _grid(last: str) -> list[str]:
+    """Every candle of the 5m session grid whose close is inside the day."""
     out: list[str] = []
     t = clock_time(9, 15)
-    while t <= clock_time(15, 25):
-        close = datetime.combine(now.date(), t, tzinfo=now.tzinfo) + timedelta(minutes=BAR_MINUTES)
-        if now >= close and t.strftime("%H:%M") not in judged:
-            out.append(t.strftime("%H:%M"))
-        t = (datetime.combine(now.date(), t, tzinfo=now.tzinfo)
-             + timedelta(minutes=BAR_MINUTES)).time()
+    stop = clock_time(15, 25)
+    while t <= stop:
+        hhmm = t.strftime("%H:%M")
+        out.append(hhmm)
+        if hhmm == last:
+            break
+        t = (datetime.combine(datetime(2000, 1, 1).date(), t) + timedelta(minutes=BAR_MINUTES)).time()
+    return out
+
+
+def missing_candles(stats: dict, now: datetime) -> list[str]:
+    """Candles the feed published and the session whose close has passed without a judgement.
+
+    Bot 3 cannot judge a candle without the market bar for it, and the loop gives
+    each one three minutes (``MAX_ALERT_LAG_SECONDS``). This is the *fault* case:
+    the bar existed (there is evidence of a later candle) and this one was never
+    judged. Candles past the last bar the feed published are not failures —
+    :func:`unpublished_candles` names them instead.
+    """
+    judged = _judged_marks(stats)
+    last = max(judged) if judged else ""
+    out: list[str] = []
+    for hhmm in _grid(last):
+        close = (datetime.combine(now.date(), clock_time(int(hhmm[:2]), int(hhmm[3:])),
+                                  tzinfo=now.tzinfo) + timedelta(minutes=BAR_MINUTES))
+        if now >= close and hhmm not in judged:
+            out.append(hhmm)
+    return out
+
+
+def unpublished_candles(stats: dict, now: datetime, *, through: str = "15:25") -> list[str]:
+    """Session candles after the feed's last bar: no bar to judge, no entry possible.
+
+    18 Nov the index feed stopped at the 15:15 bar and the loop still owed the
+    15:20 and 15:25 closes; 20 Nov the feed stopped at 15:10. Those are a fact
+    about the feed, not about the loop, and the report says so in its own words.
+    """
+    last = _last_published(stats)
+    if not last:
+        return []
+    out: list[str] = []
+    t = clock_time(int(last[:2]), int(last[3:]))
+    while True:
+        t = (datetime.combine(datetime(2000, 1, 1).date(), t) + timedelta(minutes=BAR_MINUTES)).time()
+        hhmm = t.strftime("%H:%M")
+        if hhmm > through:
+            break
+        close = (datetime.combine(now.date(), t, tzinfo=now.tzinfo)
+                 + timedelta(minutes=BAR_MINUTES))
+        if now >= close:
+            out.append(hhmm)
     return out
 
 
@@ -2340,6 +2413,14 @@ def _end_of_session(now: datetime) -> None:
             log.warning("1m candle(s) never judged: %s — no market bar for them inside the "
                         "alert deadline, so their entries were not considered",
                         ", ".join(late))
+        tail = (unpublished_candles(stats, now) if stats.get("judged") else [])
+        if tail:
+            # Not a failure: there was no bar to judge. Named separately so the
+            # "never judged" count above keeps meaning "the loop missed it".
+            stats["no_bar"] = tail
+            save_ledger(st)
+            log.info("1m candle(s) with no published bar: %s — the feed stopped at %s",
+                     ", ".join(tail), _last_published(stats))
         if want_summary() and not stats.get("reported") and stats.get("candles"):
             from . import eod
 

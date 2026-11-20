@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from nse_scanner import pipeline, state
+from nse_scanner import ledger, pipeline, state
 
 # The real market formatter, captured before setUp patches it to "market".
 REAL_FORMAT_MARKET = pipeline.format_market
@@ -1188,6 +1188,65 @@ class PendingBookKeepingTests(TestCase):
     @staticmethod
     def send_none(text, dry_run=False):
         return True
+
+
+class ExcursionTests(TestCase):
+    """How far each trade went each way — the datum the exit question needs.
+
+    The ledger knew the entry, the exit and the hold time but never the best and
+    worst point in between, so "the trail is giving back the move" could be felt
+    on the day and never measured across days (``docs/next-session.md`` §4). The
+    tracker sees every candle anyway; it now keeps the excursion on the position
+    and files it with the trade.
+    """
+
+    def setUp(self):
+        self.times = ([BAR - timedelta(minutes=5 * i) for i in range(6, 0, -1)] + [BAR])
+
+    def frame(self, highs, lows):
+        return pd.DataFrame({"Open": highs, "High": highs, "Low": lows, "Close": highs,
+                             "Volume": [1] * len(highs)}, index=pd.DatetimeIndex(self.times))
+
+    def position(self, **over):
+        pos = {"side": "BUY", "entry": 100.0, "sl": 99.0, "sl0": 99.0, "risk": 1.0,
+               "entry_bar": self.times[0].isoformat(),
+               "last_bar": self.times[-2].isoformat(), "session": str(BAR.date()),
+               "t1": None, "t2": None, "t3": None, "qty": 100, "sector": "IT"}
+        pos.update(over)
+        return pos
+
+    def track(self, st, highs, lows):
+        frame = self.frame(highs, lows)
+        with patch.object(pipeline.data, "fetch_many", return_value={"ABC.NS": frame}), \
+                patch.object(pipeline, "_unsettled", return_value=(set(), False)):
+            pipeline._track_positions(st, BAR, "7d", send=lambda *a, **k: True,
+                                      save=lambda _: None)
+        return st
+
+    def test_the_best_and_worst_point_are_kept_on_the_position(self):
+        st = {"session": str(BAR.date()), "alerts": {}, "sent": {}, "stats": {},
+              "positions": {"ABC": self.position()}}
+        self.track(st, [100.0] * 6 + [102.5], [100.0] * 6 + [99.5])
+        pos = st["positions"]["ABC"]
+        self.assertEqual((pos["mfe_r"], pos["mae_r"]), (2.5, -0.5))
+        self.assertEqual((pos["mfe_pct"], pos["mae_pct"]), (2.5, -0.5))
+
+    def test_a_short_measures_the_same_way_the_trade_does(self):
+        st = {"session": str(BAR.date()), "alerts": {}, "sent": {}, "stats": {},
+              "positions": {"ABC": self.position(side="SELL", sl=101.0, sl0=101.0)}}
+        self.track(st, [100.0] * 6 + [100.5], [100.0] * 6 + [97.5])
+        pos = st["positions"]["ABC"]
+        self.assertEqual((pos["mfe_r"], pos["mae_r"]), (2.5, -0.5))    # falls: good for a short
+
+    def test_the_excursion_is_filed_with_the_trade_at_the_exit(self):
+        st = {"session": str(BAR.date()), "alerts": {}, "sent": {}, "stats": {},
+              "positions": {"ABC": self.position()}}
+        self.track(st, [100.0] * 6 + [102.5], [100.0] * 6 + [99.5])
+        pipeline._close_trade(st, "ABC", st["positions"]["ABC"], 101.0, "EMA9 EXIT", "10:05")
+        rec = st["stats"]["closed"][0]
+        self.assertEqual((rec["mfe_r"], rec["mae_r"]), (2.5, -0.5))
+        row = ledger.closed_rows(st)[0]
+        self.assertEqual(row["give_back_r"], 1.5)          # ran 2.5R, kept 1.0R
 
 
 class SummaryInvariantTests(TestCase):

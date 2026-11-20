@@ -37,6 +37,13 @@ All four are in the end-of-day message — no query needed.
 4. **`candles never judged`.** 20 Nov: **7**, three of them inside BANK's pick
    window. If it is not zero, fix the loop before tuning anything: no rule can
    trade a candle that was never judged.
+   **21 Nov: that number was a false alarm.** All four in-session candles it named
+   (12:20, 12:30, 13:20, 15:10) have a pick *and* a timeline row in the same
+   audit — they were judged, the `_mark_judged` mark was simply not reached. The
+   count now takes the timeline as evidence, and candles past the feed's last bar
+   are reported separately as **`no published bar`** (the 15:15–15:25 tail) since
+   there was no bar to judge. Re-read it on the next audit: `never judged` must
+   now mean the loop missed a candle that existed.
 
 ## 3. Open candidates — each needs data, not an opinion
 
@@ -82,7 +89,7 @@ The question this is meant to answer, on a day where it happens: *was the winner
 in a sector we never scanned, or in a sector we scanned and refused?* Those are
 two different bugs and 20 Nov could not tell them apart.
 
-## 4. The one piece of data the ledger is missing
+## 4. The one piece of data the ledger *was* missing  — **now recorded (21 Nov)**
 
 **Maximum favourable excursion (MFE) per trade.** The audit has entry, exit and
 hold time, but not how far the trade went in its favour before it closed — so
@@ -90,6 +97,14 @@ hold time, but not how far the trade went in its favour before it closed — so
 `mfe`/`mae` per position (updated in `_track_positions`, which already sees every
 candle) would make the exit question answerable and would let the EMA9 buffer be
 tuned on evidence.
+
+**Shipped:** `pipeline._note_excursion` records `mfe_r` / `mae_r` / `mfe_pct` /
+`mae_pct` on the position for every replayed candle, `_close_trade` files them,
+and `ledger.closed_rows` adds `give_back_r` (MFE − what the trade kept) with
+`avg_mfe_r` / `avg_give_back_r` / `give_back_pct` in `totals`. The report's book
+block now prints it, and the audit's trade sheet has `mfe R` / `mae R` /
+`gave back R` columns. Read it on the next session: a `give_back_pct` above ~50%
+with the EMA9 trail means the exit, not the entry, is the thing to tune.
 
 ## 5. Housekeeping that paid for itself
 

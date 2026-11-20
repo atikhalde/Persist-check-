@@ -2129,12 +2129,51 @@ class EndOfSessionTests(Scan1mFixture):
         return st
 
     def test_the_candles_the_index_feed_stole_are_named(self):
+        """18 Nov's two candles had no bar; that is the feed's fault, not the loop's.
+
+        They used to be reported as "candles never judged — their entries were not
+        considered", which reads as a broken loop. There was nothing to judge.
+        """
         self.ledger_with()
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            scan1m._end_of_session(self.END)
+        self.assertFalse([line for line in logs.output if "never judged" in line], logs.output)
+        self.assertTrue([line for line in logs.output if "no published bar: 15:20, 15:25" in line],
+                        logs.output)
+        self.assertNotIn("unjudged", self.ledger()["stats"])
+        self.assertEqual(self.ledger()["stats"]["no_bar"], ["15:20", "15:25"])
+
+    def test_a_candle_the_feed_published_and_the_loop_missed_is_a_warning(self):
+        """The fault case: evidence of a later bar, no judgement of this one."""
+        judged = {f"{h:02d}:{m:02d}": 1 for h in (9, 10, 11, 12, 13, 14)
+                  for m in range(0, 60, 5)} | {"15:00": 1, "15:05": 1, "15:10": 1}
+        judged.pop("12:20")
+        self.ledger_with(judged=judged)
         with self.assertLogs("nse_scanner.scan1m", level="WARNING") as logs:
             scan1m._end_of_session(self.END)
-        self.assertIn("candle(s) never judged: 15:20, 15:25", logs.output[0])
+        self.assertIn("candle(s) never judged: 12:20", logs.output[0])
         self.assertIn("entries were not considered", logs.output[0])
-        self.assertEqual(self.ledger()["stats"]["unjudged"], ["15:20", "15:25"])
+        self.assertEqual(self.ledger()["stats"]["unjudged"], ["12:20"])
+
+    def test_a_candle_with_a_pick_is_judged_even_without_the_mark(self):
+        """20 Nov named 12:20, 12:30, 13:20 and 15:10 while all four had a pick.
+
+        The timeline row is written when the candle's pick is made and counted;
+        ``_mark_judged`` is written at the end of the close pass, and a pass that
+        returns early after the pick leaves the row without the mark. A false
+        "never judged" sends a reader to fix a loop that is not broken.
+        """
+        judged = {f"{h:02d}:{m:02d}": 1 for h in (9, 10, 11, 12, 13, 14)
+                  for m in range(0, 60, 5)} | {"15:00": 1, "15:05": 1, "15:10": 1}
+        # The four candles whose mark is missing, but whose pick was made.
+        timeline = [{"b": f"2026-11-20 {hhmm}", "pick": "BANK"} for hhmm in judged]
+        for missing in ("12:20", "12:30", "13:20", "15:10"):
+            judged.pop(missing)
+        self.ledger_with(judged=judged, timeline=timeline)
+        with self.assertLogs("nse_scanner.scan1m", level="INFO") as logs:
+            scan1m._end_of_session(self.END)
+        self.assertFalse([line for line in logs.output if "never judged" in line], logs.output)
+        self.assertNotIn("unjudged", self.ledger()["stats"])
 
     def test_the_summary_says_which_candles_were_never_judged(self):
         st = self.ledger_with(unjudged=["15:20", "15:25"])
@@ -2151,6 +2190,13 @@ class EndOfSessionTests(Scan1mFixture):
         self.assertFalse(any("never judged" in line for line in logs.output))
         self.assertTrue(any("1m summary sent" in line for line in logs.output), logs.output)
         self.assertTrue(self.ledger()["stats"]["reported"])
+
+    def test_the_summary_tells_a_feed_gap_from_a_missed_candle(self):
+        st = self.ledger_with(no_bar=["15:20", "15:25"])
+        text = scan1m.format_summary(st)
+        self.assertIn("candle(s) with no published bar: 2 — 15:20, 15:25", text)
+        self.assertIn("not a missed candle", text)
+        self.assertNotIn("never judged", text)
 
     def test_a_summary_telegram_refuses_says_so_instead_of_vanishing(self):
         self.ledger_with()
