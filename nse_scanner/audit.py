@@ -191,6 +191,7 @@ def build(st: dict, *, bot: str = "5m") -> dict:
             "pending": stats.get("pending") or [],
             "checked": stats.get("checked") or [],
             "unjudged": stats.get("unjudged") or [],
+            "no_bar": stats.get("no_bar") or [],
             "feed_behind": stats.get("feed_behind"),
             "scan_late": stats.get("scan_late"), "scan_lag_max": stats.get("scan_lag_max"),
             "lag_sum": stats.get("lag_sum"), "lag_max": stats.get("lag_max"),
@@ -281,23 +282,26 @@ def _summary_sheet(audit: dict) -> list[list]:
 def _trade_sheet(audit: dict) -> list[list]:
     head = ["#", "name", "sector", "side", "qty", "entry_at", "entry", "stop0",
             "risk/share", "risk ₹", "T1", "T2", "T3", "exit_at", "exit", "why",
-            "targets hit", "hold min", "move %", "gross ₹", "costs ₹", "net ₹",
-            "gross R", "net R", "cum ₹"]
+            "targets hit", "mfe R", "mae R", "hold min", "move %", "gross ₹", "costs ₹",
+            "net ₹", "gross R", "net R", "gave back R", "cum ₹"]
     rows = [head]
     for i, t in enumerate(audit.get("trades") or [], start=1):
         rows.append([i, t.get("name"), t.get("sector"), t.get("side"), t.get("qty"),
                      t.get("entry_at"), t.get("entry"), t.get("stop0"),
                      t.get("risk_per_share"), t.get("risk_rs"), t.get("t1"), t.get("t2"),
                      t.get("t3"), t.get("exit_at"), t.get("exit"), t.get("why"),
-                     t.get("targets_hit"), t.get("hold_min"), t.get("move_pct"),
+                     t.get("targets_hit"), t.get("mfe_r"), t.get("mae_r"),
+                     t.get("hold_min"), t.get("move_pct"),
                      t.get("gross_rs"), t.get("costs_rs"), t.get("net_rs"),
-                     t.get("gross_r"), t.get("net_r"), t.get("cum_rs")])
+                     t.get("gross_r"), t.get("net_r"), t.get("give_back_r"),
+                     t.get("cum_rs")])
     for t in audit.get("open_trades") or []:
         rows.append(["open", t.get("name"), t.get("sector"), t.get("side"), t.get("qty"),
                      "", t.get("entry"), t.get("stop"), t.get("risk_rs"), "",
                      "", "", "", "", t.get("mark"), "still open", t.get("targets_hit"),
-                     "", "", t.get("gross_rs"), t.get("costs_rs"), t.get("net_rs"),
-                     t.get("gross_r"), t.get("net_r"), ""])
+                     t.get("mfe_r"), t.get("mae_r"), "", "", t.get("gross_rs"),
+                     t.get("costs_rs"), t.get("net_rs"), t.get("gross_r"), t.get("net_r"),
+                     "", ""])
     return rows
 
 

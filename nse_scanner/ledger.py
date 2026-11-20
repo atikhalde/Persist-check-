@@ -30,6 +30,27 @@ def _minutes(entry_bar, exit_time) -> float | None:
         return None
 
 
+def _give_back(rec: dict) -> float | None:
+    """The R the trade gave back from its best point, or ``None`` if unmeasured."""
+    mfe = rec.get("mfe_r")
+    if mfe is None:
+        return None
+    try:
+        r = rec.get("r")
+        if r is None:
+            risk = float(rec.get("risk") or 0.0) or abs(float(rec.get("entry") or 0.0)
+                                                        - float(rec.get("stop0") or 0.0))
+            if not risk:
+                return None
+            move = float(rec.get("exit") or 0.0) - float(rec.get("entry") or 0.0)
+            if str(rec.get("side") or "BUY").upper() == "SELL":
+                move = -move
+            r = move / risk
+        return round(max(0.0, float(mfe) - float(r)), 2)
+    except (TypeError, ValueError):
+        return None
+
+
 def closed_rows(st: dict) -> list[dict]:
     """One row per closed trade, in the order they closed, with a running total."""
     rows: list[dict] = []
@@ -63,6 +84,11 @@ def closed_rows(st: dict) -> list[dict]:
             "t1": rec.get("t1"), "t2": rec.get("t2"), "t3": rec.get("t3"),
             "exit_at": rec.get("time"), "exit": round(exit_, 2),
             "why": rec.get("why"), "targets_hit": rec.get("t_hit") or 0,
+            # How far the trade went each way before it closed. ``give_back_r``
+            # is the part of the best move the exit did not keep — the number the
+            # "hold winners past the trail?" question needs (next-session §4).
+            "mfe_r": rec.get("mfe_r"), "mae_r": rec.get("mae_r"),
+            "give_back_r": _give_back(rec),
             "hold_min": _minutes(rec.get("entry_bar"), rec.get("time")),
             "move_pct": round(move_pct, 2),
             "gross_rs": round(gross, 2), "costs_rs": round(float(rec.get("costs",
@@ -104,6 +130,7 @@ def open_rows(st: dict) -> list[dict]:
             "gross_r": round(r, 2),
             "net_r": round(money["net"] / (risk * qty), 2) if risk and qty else 0.0,
             "targets_hit": len(pos.get("hit_targets") or ()),
+            "mfe_r": pos.get("mfe_r"), "mae_r": pos.get("mae_r"), "give_back_r": None,
             "sector": pos.get("sector") or "", "why": "still open",
         })
     return rows
@@ -134,8 +161,14 @@ def totals(rows: list[dict], opened: list[dict] | None = None) -> dict:
     worst, peak = _drawdown(curve or [0.0])
     holds = [float(r["hold_min"]) for r in rows if r.get("hold_min") is not None]
     open_net = sum(float(r["net_rs"] or 0.0) for r in (opened or []))
+    # Did the exits keep the moves? Only trades whose MFE was measured count.
+    mfe = [float(r["mfe_r"]) for r in rows if r.get("mfe_r") is not None]
+    back = [float(r["give_back_r"]) for r in rows if r.get("give_back_r") is not None]
     risk = sum(float(r.get("risk_rs") or 0.0) for r in rows if r.get("risk_rs"))
     return {
+        "avg_mfe_r": round(sum(mfe) / len(mfe), 2) if mfe else None,
+        "avg_give_back_r": round(sum(back) / len(back), 2) if back else None,
+        "give_back_pct": round(sum(back) / sum(mfe) * 100.0, 1) if mfe and sum(mfe) > 0 else None,
         "trades": len(rows),
         "wins": len(wins), "losses": len(losses),
         "win_rate": round(100.0 * len(wins) / len(rows), 1) if rows else 0.0,

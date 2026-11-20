@@ -99,6 +99,40 @@ class LedgerTests(base.TestCase):
         self.assertEqual(row["gross_r"], 2.0)
         self.assertAlmostEqual(row["net_r"], round(9895.0 / 5000.0, 2))
 
+    def test_the_give_back_is_what_the_exit_did_not_keep(self):
+        """MFE minus what the trade kept: the number the exit question needs.
+
+        20 Nov's exits were all the EMA9 trail; without MFE the report could say
+        what a trade made but never what it had offered (next-session §4).
+        """
+        rows = ledger.closed_rows(state(closed=[trade(mfe_r=4.0, mae_r=-0.6)]))
+        row = rows[0]
+        self.assertEqual((row["mfe_r"], row["mae_r"]), (4.0, -0.6))
+        self.assertEqual(row["give_back_r"], 2.0)          # ran 4.0R, kept 2.0R
+        books = ledger.totals(rows)
+        self.assertEqual(books["avg_mfe_r"], 4.0)
+        self.assertEqual(books["avg_give_back_r"], 2.0)
+        self.assertEqual(books["give_back_pct"], 50.0)
+
+    def test_an_unmeasured_trade_does_not_pollute_the_average(self):
+        rows = ledger.closed_rows(state(closed=[trade(mfe_r=2.0), trade(raw="TCS")]))
+        self.assertEqual(rows[0]["give_back_r"], 0.0)      # ran 2.0R, kept 2.0R
+        self.assertIsNone(rows[1]["give_back_r"])
+        books = ledger.totals(rows)
+        self.assertEqual(books["avg_mfe_r"], 2.0)          # measured trades only
+
+    def test_a_trade_is_costed_from_its_stop_when_the_risk_was_not_stored(self):
+        """The 20 Nov audit's shape: ``risk`` absent, ``stop0`` present.
+
+        Every row in that file printed ``risk_share 0.00``; the recovery from
+        ``stop0`` is what fixed it, and this pins it.
+        """
+        rec = trade(risk=None, stop0=95.0, entry=100.0)
+        rec.pop("risk")
+        row = ledger.closed_rows(state(closed=[rec]))[0]
+        self.assertEqual(row["risk_per_share"], 5.0)
+        self.assertEqual(row["risk_rs"], 5000.0)
+
     def test_an_open_trade_is_marked_and_costed_as_if_it_closed_there(self):
         opened = ledger.open_rows({"session": "2026-11-20", "stats": {}, "positions": {
             "MARUTI": {"side": "BUY", "entry": 100.0, "risk": 5.0, "sl": 95.0, "qty": 1000,

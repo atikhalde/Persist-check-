@@ -95,6 +95,24 @@ class ContentTests(base.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    def test_the_book_says_how_much_of_the_move_the_exits_kept(self):
+        """The exit question, measured: MFE against what the trade actually kept.
+
+        "The trail gives back the move" was a feeling until the ledger recorded
+        the best point of each trade (next-session §4). 20 Nov: TATAELXSI +2.38R
+        net, TMPV -0.91R, and nothing anywhere said how far either had been.
+        """
+        text = eod.format_eod(day(closed=[trade(mfe_r=2.5, mae_r=-0.5),
+                                           trade(raw="TCS", r=0.5, mfe_r=1.5)]))
+        self.assertIn("Best point vs kept", text)
+        self.assertIn("ran +2.0R on average", text)
+        self.assertIn("the exits kept +0.9R", text)      # 1.2R + 0.5R kept
+        self.assertIn("58% of what they offered given back", text)
+
+    def test_a_book_without_excursions_says_nothing_about_them(self):
+        text = eod.format_eod(day(closed=[trade()]))
+        self.assertNotIn("Best point vs kept", text)
+
     def test_every_blocked_signal_is_listed_one_by_one_with_its_reason(self):
         names = {f"N{i:02d} {10 + i // 60:02d}:{(i % 60):02d}":
                  f"N{i:02d} {10 + i // 60:02d}:{(i % 60):02d} — rank {i} is behind "

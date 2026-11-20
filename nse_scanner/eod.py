@@ -515,6 +515,13 @@ def _trades(st: dict) -> list[str]:
                          f"{books['return_on_risk_pct']:+.1f}%"
                          + (f" · avg hold {books['avg_hold_min']:.0f} min"
                             if books.get("avg_hold_min") is not None else ""))
+        if books.get("avg_mfe_r") is not None and books.get("avg_give_back_r") is not None:
+            # The exit question, measured instead of felt: how much of the best
+            # point of each trade the trail actually kept (next-session §4).
+            kept = books["avg_mfe_r"] - books["avg_give_back_r"]
+            lines.append(f"Best point vs kept: the trades ran {books['avg_mfe_r']:+.1f}R on "
+                         f"average and the exits kept {kept:+.1f}R — "
+                         f"{books['give_back_pct']:.0f}% of what they offered given back")
     lines.append(f"Cost model: {costs.cost_bps():g} bps/side (min ₹{costs.cost_min():g} per "
                  f"order) on ₹{costs.trade_capital():,.0f} a trade — COST_BPS / COST_MIN / "
                  f"TRADE_CAPITAL")
@@ -539,6 +546,11 @@ def _health(st: dict) -> list[str]:
                      f"(slowest {float(x.get('lag_max') or 0):.0f}s, {lag_n} candle(s))")
     if x.get("feed_behind"):
         lines.append(f"• the 1m feed lagged past the close on {x['feed_behind']} candle(s)")
+    if x.get("no_bar"):
+        names = list(x["no_bar"])
+        lines.append(f"• candles the feed never published: {len(names)} — "
+                     + ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+                     + " (no bar to judge, so no entry was possible)")
     if x.get("unjudged"):
         names = list(x["unjudged"])
         lines.append(f"• candles never judged: {len(names)} — "
