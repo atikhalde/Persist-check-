@@ -228,6 +228,23 @@ class ContentTests(base.TestCase):
             trade(raw="B", entry=100.0, exit=100.04, r=0.02, qty=1000)]))
         self.assertIn("costs ate ₹", text)
 
+    def test_the_report_names_the_catch_ups_the_window_refused(self):
+        st = day()
+        st["stats"]["catchup_skip"] = {"old": 81, "none": 44}
+        st["stats"]["catchup"] = 5
+        st["stats"]["late_entries"] = 3
+        text = eod.format_eod(st)
+        self.assertIn("81 leader catch-ups refused as older than the window", text)
+        self.assertIn("PICK_CATCHUP", text)
+
+    def test_a_handful_of_old_refusals_is_not_an_alarm(self):
+        st = day()
+        st["stats"]["catchup_skip"] = {"old": 4}
+        st["stats"]["catchup"] = 5
+        # the diagnostics still count them; it is the alarm line that must stay quiet
+        self.assertIn("older than the window 4", eod.format_eod(st))
+        self.assertNotIn("cannot buy them", eod.format_eod(st))
+
     def test_a_ledger_with_no_sector_histogram_still_names_the_picks(self):
         st = day()
         st["stats"].pop("sector_hist", None)

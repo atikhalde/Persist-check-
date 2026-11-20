@@ -165,6 +165,29 @@ numbered parts (`(1/4)`, `(2/4)`, …) cut on section boundaries (`EOD_MAX_CHARS
 and both attachments arrived**. `EOD_REPORT=0` restores the short one-message
 summary, `EOD_AUDIT=0` sends the messages without the files.
 
+### The day the pick was right and nothing could be bought (20 Nov 2026)
+
+BANK was the day's sector by every measure: persistence 85 → 97, day **+2.50%**,
+**+3.18%** after the open, `INDUSINDBK` 6.8pp ahead of its own index on all 39
+candles and `AXISBANK` still accelerating (+1.60 → +2.60pp). It was picked at
+**12:05** and held for 38 candles. The scan entered **nothing** in it: every bank
+had fired at 09:20, the 40-minute catch-up window had run out by 10:00, and the
+audit counted `81` leader catch-ups refused as *older than the window*. The same
+hole swallowed FIN (+2.04%, persist 93, its leaders in the top five for 15–20
+candles each, zero entries).
+
+Where the money went instead: AUTO — persist 92 on the day's first candle, of
+which **+3.92pp was overnight gap** and only +0.37% was made after the open — and
+IT, whose leaders the catch-up then found at 09:26 and refused at 09:30 for
+having *no pivot target* (their own levels were all behind the price). WIPRO,
+TECHM and HCLTECH — ranked 8th and worse — were entered by elimination. Closed
+book: −₹1,008 net against −₹513 gross, with ₹495 of costs.
+
+`PICK_CATCHUP`, `TARGET_FALLBACK` and `SCAN1M_EARLY_FROM` are the three rules that
+come out of that tape; `docs/analysis-2026-11-20-1m.md` has the trade-by-trade and
+miss-by-miss arithmetic, including the two counterfactuals that are *not* shipped
+(a gap veto on the pick would have chosen FMCG, which finished worse).
+
 ### Why a pivot target can look wrong (verified case: PNB, 11 Nov 2026)
 
 The levels above are real. NSE was shut on **Tue 10 Nov 2026** (Diwali-Balipratipada),
@@ -735,6 +758,9 @@ BULL/BEAR market is unaffected.
 | `COST_BPS` | `5` | all-in trading cost **per side**, in basis points of turnover: brokerage, STT, exchange + SEBI fees, stamp duty, GST and the spread. Used by the ledger for gross → net |
 | `COST_MIN` | `20` | floor cost per order (₹) — a ₹9,000 position is not costed as if it were free |
 | `TRADE_CAPITAL` | `100000` | notional one entry is sized at (₹), so every trade gets a quantity, a rupee risk and a net P&L beside its R |
+| `PICK_CATCHUP` | `1` | a pick that arrives **late** re-opens the 40-minute leader catch-up for its names. The clock starts at the fire, but the thing that makes a name tradeable is the pick — 20 Nov BANK was picked at 12:05 (persist 85) after every bank had fired at 09:20, held 38 candles and ran another +1.03pp with **zero** entries; the audit counted 81 catch-ups refused as "older than the window". The anti-chase guards are unchanged: the fire candle's own stop must be untouched since, and the move from the fire must still be ≤ `SCAN5M_LEADER_MAX_R` / `SCAN1M_LEADER_MAX_R`. `0` = the plain 40-minute clock |
+| `TARGET_FALLBACK` | `1` | a name trading **above every pivot** has no level left to aim at; it used to be refused for "no pivot target" — which is backwards, since being past every level is what a breakout is. On 20 Nov the five IT leaders the catch-up had just found (COFORGE, PERSISTENT, MPHASIS, LTIM, LTTS) were skipped for exactly that, and the scan bought ranks 8+ instead. The fallback sets a **measured** target at the same floor a pivot must clear (`MIN_TARGET_R` / `MIN_TARGET_PCT` from the entry): entry, stop and risk are unchanged. A pivot that is *ahead but too close* is still a refusal (the GODREJCP lesson). `0` = refuse instead |
+| `SCAN1M_EARLY_FROM` | `09:30` | the earliest 5m close a projected **heads-up** may belong to. A projection is advisory — the close confirm is what books the trade — so holding the first ones back cannot lose an entry. 20 Nov sent four early alerts on the 09:20 candle: two were cancelled at the close, one stopped, and the two confirmed entries were booked by the close pass anyway. `09:15` restores the old behaviour |
 
 **Triple pick (before the dual).** When the pick's *own* side has three sectors
 above `TRIPLE_MIN_PERSIST` (85) at the same time, the scan takes those three and

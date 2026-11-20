@@ -1913,6 +1913,79 @@ class CatchupWindowTests(TestCase):
             self.assertFalse(scan1m.catchup_due({}, self.pick, self.bar(0)))
 
 
+class PickCatchupTests(TestCase):
+    """A pick that arrives late re-opens the catch-up window (PICK_CATCHUP).
+
+    20 Nov: BANK's persistence crossed 85 at 12:05 and the pick held it for the
+    next 38 candles while the sector ran another +1.03pp into the close. Nothing
+    was entered: every BANK name had fired at 09:20 and the 40-minute clock had
+    run out. The audit counted 81 ``old`` refusals; INDUSINDBK (6.8pp ahead of
+    its sector) and AXISBANK (1.6 → 2.6pp) were in its top five on all 39 candles.
+    """
+
+    def candidate(self, **kw):
+        report: dict = {}
+        hit = scan1m.catchup_candidate(
+            five_minute_history(), [base.signal(time="09:20")], "BUY", BAR,
+            BAR + timedelta(minutes=40), None, report=report, max_minutes=10, **kw)
+        return hit, report
+
+    def test_a_four_hour_old_fire_is_refused_by_the_clock(self):
+        hit, report = self.candidate()
+        self.assertIsNone(hit)
+        self.assertEqual(report["why"], "old")
+
+    def test_a_fresh_pick_is_not_refused_by_the_clock(self):
+        hit, report = self.candidate(fresh_pick=True)
+        self.assertNotEqual(report.get("why"), "old")     # anywhere else is a real guard
+
+    def test_the_switch_puts_the_clock_back(self):
+        with patch.dict("os.environ", {"PICK_CATCHUP": "0"}):
+            fresh = scan1m.pick_is_fresh({"since": BAR.isoformat()}, BAR)
+            hit, report = self.candidate(fresh_pick=fresh)
+        self.assertFalse(fresh)
+        self.assertIsNone(hit)
+        self.assertEqual(report["why"], "old")
+
+    def test_the_marker_says_whether_the_pick_is_fresh(self):
+        bar = BAR
+        self.assertTrue(scan1m.pick_is_fresh({"since": bar.isoformat()}, bar))
+        self.assertFalse(scan1m.pick_is_fresh({"since": (bar - timedelta(minutes=5)).isoformat()},
+                                              bar))
+        self.assertFalse(scan1m.pick_is_fresh({}, bar))
+        with patch.dict("os.environ", {"PICK_CATCHUP": "0"}):
+            self.assertFalse(scan1m.pick_is_fresh({"since": bar.isoformat()}, bar))
+
+    def test_the_five_minute_scan_uses_the_same_marker(self):
+        st = {"late_pick": {"key": "BANK|1", "since": BAR.isoformat()}}
+        self.assertTrue(scan1m.pick_is_fresh(st["late_pick"], BAR))
+
+
+class EarlyClockTests(TestCase):
+    """No projected heads-up before SCAN1M_EARLY_FROM (09:30).
+
+    A projection is advisory — the close confirm books the trade — so holding it
+    back cannot lose an entry. 20 Nov sent four early alerts on the 09:20 candle;
+    two were cancelled at the close and one stopped.
+    """
+
+    def test_the_first_two_candles_are_quiet(self):
+        self.assertFalse(scan1m._early_clock_ok(BAR - timedelta(minutes=45)))   # 09:15
+        self.assertFalse(scan1m._early_clock_ok(BAR - timedelta(minutes=40)))   # 09:20
+        self.assertTrue(scan1m._early_clock_ok(BAR - timedelta(minutes=35)))    # 09:25
+        self.assertTrue(scan1m._early_clock_ok(BAR))                            # 10:00
+
+    def test_the_clock_is_configurable(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_FROM": "09:15"}):
+            self.assertTrue(scan1m._early_clock_ok(BAR - timedelta(minutes=40)))
+        with patch.dict("os.environ", {"SCAN1M_EARLY_FROM": "11:00"}):
+            self.assertFalse(scan1m._early_clock_ok(BAR))
+
+    def test_a_bad_value_falls_back_to_the_default(self):
+        with patch.dict("os.environ", {"SCAN1M_EARLY_FROM": "nonsense"}):
+            self.assertFalse(scan1m._early_clock_ok(BAR - timedelta(minutes=40)))
+
+
 class UndeliveredAlertTests(Scan1mFixture):
     """An entry alert Telegram refused must not vanish with a warning line.
 

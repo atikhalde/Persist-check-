@@ -164,6 +164,59 @@ def leader_catchup() -> bool:
     return os.environ.get("SCAN1M_LEADER_CATCHUP", "1") != "0"
 
 
+def early_from() -> str:
+    """The earliest 5m close a projected heads-up may belong to (``09:30``).
+
+    A projection is advisory: the close confirm is what books a trade, so holding
+    a heads-up back cannot lose an entry. The first two candles of a session are
+    the thinnest book of the day, and a bar one to four minutes old reverses as
+    often as it holds. 20 Nov sent four early alerts on the 09:20 candle:
+    BAJAJ-AUTO and UNOMINDA were cancelled at the close ("rank 60 is behind its
+    runners" / "the closed candle fired the opposite side"), TMPV stopped and only
+    MARUTI survived — and the two confirmed entries were booked by the close pass
+    regardless. ``SCAN1M_EARLY_FROM=09:15`` restores the old behaviour.
+    """
+    return os.environ.get("SCAN1M_EARLY_FROM", "09:30").strip()
+
+
+def _early_clock_ok(bar: datetime) -> bool:
+    """Is this forming candle late enough for a heads-up? (see :func:`early_from`)"""
+    raw = early_from()
+    try:
+        hh, mm = str(raw).split(":")
+        first = int(hh) * 60 + int(mm)
+    except (ValueError, AttributeError):
+        first = 9 * 60 + 30
+    close_at = bar + timedelta(minutes=BAR_MINUTES)
+    return (close_at.hour * 60 + close_at.minute) >= first
+
+
+def pick_catchup() -> bool:
+    """A fresh pick re-opens the catch-up window for its leaders (1).
+
+    The window exists to stop a chase — a name that fired an hour ago may have
+    run. But the pick itself can arrive an hour after the fire, and then the
+    window is measuring the wrong thing. 20 Nov: BANK's persistence crossed 85
+    at 12:05, the pick moved to BANK for the next 38 candles and the sector ran
+    another +1.03pp into the close — and not one BANK name was entered, because
+    every one of them had fired at 09:20. The audit counted 81 ``old`` catch-up
+    refusals. INDUSINDBK (6.8pp ahead of its sector) and AXISBANK (1.6 → 2.6pp,
+    still accelerating) were in the top five on all 39 candles and the bot
+    bought neither. ``PICK_CATCHUP=0`` restores the plain 40-minute clock.
+    """
+    return os.environ.get("PICK_CATCHUP", "1") != "0"
+
+
+def pick_is_fresh(marker: dict | None, bar: datetime) -> bool:
+    """Did the pick change on this candle? Then its leaders are new, not stale.
+
+    ``marker`` is the pick-change record either scanner keeps: bot 3's
+    ``catchup_pick`` or bot 1's ``late_pick``. Both store the candle the window
+    opened on, so one function answers for both.
+    """
+    return bool(pick_catchup() and str((marker or {}).get("since") or "") == bar.isoformat())
+
+
 def leader_max_minutes() -> int:
     """How old a pre-pick fire may be and still be worth a catch-up (40 min)."""
     return _env_int("SCAN1M_LEADER_MAX_MINUTES", 40, 5, 120)
@@ -1123,7 +1176,7 @@ _CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap
 def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
                       bar: datetime, now: datetime, daily=None,
                       report: dict | None = None, max_minutes: float | None = None,
-                      max_r: float | None = None) -> dict | None:
+                      max_r: float | None = None, fresh_pick: bool = False) -> dict | None:
     """The name's day-first fire of this side, if a catch-up is still justified.
 
     Valid means all of: the fire is on an earlier candle of today's session, its
@@ -1154,7 +1207,12 @@ def catchup_candidate(frame: pd.DataFrame | None, fires: list, want: str,
         # with nothing to say *how* old — a replay whose clock is past the close
         # and a genuinely stale window look identical without it.
         report["age"] = age
-    if age < 0 or age > (leader_max_minutes() if max_minutes is None else max_minutes):
+    if age < 0:                       # a fire in the future is never a catch-up
+        return _no("old")
+    if not fresh_pick and age > (leader_max_minutes() if max_minutes is None
+                                 else max_minutes):
+        # The clock starts at the fire — unless the *pick* is what just arrived,
+        # in which case the name was not tradeable until now (``PICK_CATCHUP``).
         return _no("old")
     upto = frame.loc[frame.index <= pd.Timestamp(fire)]
     if upto.empty or to_ist(upto.index[-1]) != to_ist(fire):
@@ -1327,6 +1385,7 @@ def _early_allowed(prev: dict | None, session: str, bar: datetime) -> bool:
 
 
 _no_pick_bar: str | None = None      # the last candle that logged "no sector pick"
+_quiet_bar: str | None = None        # the last candle held back by SCAN1M_EARLY_FROM
 
 
 def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
@@ -1376,6 +1435,14 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     # A leader that fired before its sector was picked is not a projection (its
     # signal is not on this candle) but it is what the feed was missing.
     catchup_mark = st.get("catchup_pick")
+    if names and not _early_clock_ok(bar):
+        # The heads-up is not an entry; the close pass still judges every name.
+        global _quiet_bar
+        if _quiet_bar != bar.isoformat():
+            _quiet_bar = bar.isoformat()
+            log.info("1m %s: no early heads-up before %s — the close still judges %d "
+                     "name(s)", bar.strftime("%H:%M"), early_from(), len(names))
+        names = []
     catching = ([raw for raw in tradeable if raw not in caught]
                 if catchup_due(st, pick, bar) else [])
     if st.get("catchup_pick") is not catchup_mark:
@@ -1559,6 +1626,9 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
                 "conf": window.get("conf") if window.get("conf") is not None
                 else pick.get("conf")}
     hhmm = bar.strftime("%H:%M")
+    # The pick changed on this candle: its leaders were never tradeable before
+    # now, so the fire's age is not the thing to judge them by.
+    fresh = pick_is_fresh(window, bar)
     out: list[dict] = []
     found: list[dict] = []
     for raw in catching:
@@ -1569,7 +1639,8 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
             continue
         why: dict = {}
         hit = catchup_candidate(frame, fires_list, _want(side_of or {}, raw, pick),
-                                bar, now, daily.get(data.yahoo_stock(raw)), report=why)
+                                bar, now, daily.get(data.yahoo_stock(raw)), report=why,
+                                fresh_pick=fresh)
         if hit is None:
             if why.get("why"):
                 stats = st.setdefault("stats", {})
@@ -1634,8 +1705,9 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
         stats = st.setdefault("stats", {})
         stats["catchup"] = stats.get("catchup", 0) + 1
         log.info("1m LATE LEADER %s %s fired %s as %s, sector %s picked %s "
-                 "(%.1fR, %.0f min late, sent %s IST)", raw, hit["sig"].side, hit["sig"].time,
+                 "(%.1fR, %.0f min late%s, sent %s IST)", raw, hit["sig"].side, hit["sig"].time,
                  hit["sig"].name, pick.get("sector"), hhmm, hit["r"], hit["age"],
+                 ", window re-opened by the pick change" if fresh else "",
                  now.strftime("%H:%M:%S"))
         out.append({"symbol": raw, "side": hit["sig"].side, "fired": hit["sig"].time,
                     "code": hit["sig"].code, "price": hit["price"], "r": hit["r"],

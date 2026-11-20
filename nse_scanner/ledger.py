@@ -39,6 +39,13 @@ def closed_rows(st: dict) -> list[dict]:
         exit_ = float(rec.get("exit") or 0.0)
         qty = int(rec.get("qty") or costs.quantity(entry))
         risk = float(rec.get("risk") or 0.0)
+        if not risk and rec.get("stop0") is not None:
+            # A record written before ``risk`` was stored still knows its stop, so
+            # the rupee risk (and every figure derived from it) is recoverable.
+            try:
+                risk = abs(entry - float(rec["stop0"]))
+            except (TypeError, ValueError):
+                risk = 0.0
         money = costs.round_trip(rec.get("side") or "BUY", entry, exit_, qty)
         gross = float(rec.get("gross", money["gross"]))
         net = float(rec.get("net", money["net"]))

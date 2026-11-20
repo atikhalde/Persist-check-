@@ -154,6 +154,7 @@ jobs:
           # Same exit/target rules as the 5m scan: bot 3 trails the same
           # positions and renders the same plan, so it must not fork them.
           MIN_TARGET_R: ${{ vars.MIN_TARGET_R || '0.5' }}
+          TARGET_FALLBACK: ${{ vars.TARGET_FALLBACK || '1' }}
           MIN_TARGET_PCT: ${{ vars.MIN_TARGET_PCT || '0.10' }}
           EXIT_EMA9_BUFFER_PCT: ${{ vars.EXIT_EMA9_BUFFER_PCT || '0.10' }}
           EXIT_EMA9_BUFFER_R: ${{ vars.EXIT_EMA9_BUFFER_R || '0.25' }}
@@ -188,6 +189,8 @@ jobs:
           SCAN5M_LEADER_MAX_MINUTES: ${{ vars.SCAN5M_LEADER_MAX_MINUTES || '40' }}
           LATE_LEADER_ENTRY: ${{ vars.LATE_LEADER_ENTRY || '1' }}
           SCAN5M_LEADER_MAX_R: ${{ vars.SCAN5M_LEADER_MAX_R || '2.0' }}
+          PICK_CATCHUP: ${{ vars.PICK_CATCHUP || '1' }}
+          SCAN1M_EARLY_FROM: ${{ vars.SCAN1M_EARLY_FROM || '09:30' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also scan the leading sector on the other side of the pick.

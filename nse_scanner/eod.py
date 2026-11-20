@@ -510,6 +510,12 @@ def _observations(st: dict) -> list[str]:
         out.append(f"⚠ {_n(earlier, 'signal')} fired before their sector was picked and "
                    f"only {caught} were taken or announced — the pick is late, not the "
                    f"signal")
+    skips = x.get("catchup_skip") or {}
+    stale = int(skips.get("old") or 0)
+    if stale and stale > 3 * max(caught, 1):
+        out.append(f"⚠ {_n(stale, 'leader catch-up')} refused as older than the window — "
+                   f"a sector picked hours after its leaders fired cannot buy them "
+                   f"(PICK_CATCHUP re-opens the window on a pick change)")
     books = ledger.totals(ledger.closed_rows(st), ledger.open_rows(st))
     if books.get("trades") and books.get("costs_rs") and books.get("gross_rs"):
         if books["costs_rs"] > 0.35 * abs(books["gross_rs"]):

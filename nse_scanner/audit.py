@@ -90,7 +90,13 @@ def sector_stats(st: dict, threshold: int = THRESH_70) -> dict[str, dict]:
             "pick_periods": _runs(picks),
             "transitions": crossings,
             "entries": 0,
-            "day_ret": round(float((hist.get(name) or {}).get("day_ret") or 0.0), 2),
+            # Bot 1 keeps a per-sector histogram; bot 3 does not, so its day %
+            # used to read 0.00 for every sector — the one number that says which
+            # sector actually moved. The tape carries it per candle, so fall back
+            # to the last cell.
+            "day_ret": round(float((hist.get(name) or {}).get("day_ret")
+                                   if (hist.get(name) or {}).get("day_ret") is not None
+                                   else cells[-1][1][2] or 0.0), 2),
             "series": [[b, round(v)] for b, v in scores],
         }
     # entries per sector, from the trades themselves

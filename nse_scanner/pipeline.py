@@ -918,7 +918,8 @@ def _close_trade(st: dict, raw: str, pos: dict, price: float, why: str, hhmm: st
         book.append({"raw": raw, "side": pos.get("side"), "time": hhmm, "why": why,
                      "entry": round(entry, 2), "exit": round(float(price), 2),
                      "r": round(r, 2),
-                     "qty": qty, "gross": money["gross"], "costs": money["costs"],
+                     "qty": qty, "risk": round(risk, 2),
+                     "gross": money["gross"], "costs": money["costs"],
                      "net": money["net"],
                      "net_r": round(money["net"] / (risk * qty), 2) if risk and qty else 0.0,
                      "t_hit": len(pos.get("hit_targets") or ()),
@@ -2412,11 +2413,15 @@ def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
     """
     if not scan5m_leader_catchup():
         return
-    from .scan1m import catchup_candidate
+    from .scan1m import catchup_candidate, pick_is_fresh
     why: dict = {}
+    # The same re-opened window bot 3 has: a pick that arrives late is what makes
+    # the leaders tradeable, so the fire's age is not the test on that candle.
+    fresh = pick_is_fresh(st.get("late_pick"), bar)
     try:
         hit = catchup_candidate(df5, fires, want, bar, now_ist(), daily, report=why,
-                                max_minutes=late_max_minutes(), max_r=late_max_r())
+                                max_minutes=late_max_minutes(), max_r=late_max_r(),
+                                fresh_pick=fresh)
     except Exception:
         log.exception("late-leader check failed for %s", raw)
         return

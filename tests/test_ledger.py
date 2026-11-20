@@ -286,6 +286,36 @@ class AuditTests(base.TestCase):
         self.assertEqual(sum(1 for r in rows if r["kept"]), 5)
         self.assertFalse(rows[-1]["kept"])
 
+    def test_a_closed_trade_written_before_risk_was_stored_still_has_one(self):
+        """20 Nov's audit read "risk deployed ₹ 0" on a book that risked ₹3,000.
+
+        The closed record keeps the stop it was taken with, so the rupee risk —
+        and the return on it, the R and the money beside it — is recoverable
+        without a replay.
+        """
+        from nse_scanner import ledger
+
+        rows = ledger.closed_rows({"stats": {"closed": [
+            {"raw": "ABC", "side": "BUY", "entry": 100.0, "exit": 110.0, "stop0": 95.0,
+             "qty": 1000, "time": "10:30", "entry_bar": "2026-11-20T10:00:00+05:30",
+             "r": 2.0, "sector": "IT"}]}})
+        self.assertEqual(rows[0]["risk_per_share"], 5.0)
+        self.assertEqual(rows[0]["risk_rs"], 5000.0)
+        self.assertGreater(ledger.totals(rows)["risk_rs"], 0)
+
+    def test_the_day_percent_survives_a_ledger_with_no_histogram(self):
+        """Bot 3 keeps no sector histogram, so its audit said 0.00% for every sector."""
+        from nse_scanner import audit
+
+        st = {"stats": {"timeline": [
+            {"bar": "09:15", "pick": "BANK", "side": 1,
+             "sec": {"BANK": [40, 20, 0.30, 0.31, 0], "AUTO": [92, 6, 4.29, 0.37, 0]}},
+            {"bar": "15:10", "pick": "BANK", "side": 1,
+             "sec": {"BANK": [97, 1, 2.50, 3.18, 1], "AUTO": [36, 25, 0.52, 1.01, 0]}}]}}
+        out = audit.sector_stats(st)
+        self.assertEqual(out["BANK"]["day_ret"], 2.5)
+        self.assertEqual(out["AUTO"]["day_ret"], 0.52)
+
     def test_the_entries_of_the_day_land_on_their_sector(self):
         stats = audit.sector_stats(self.day())
         self.assertEqual(stats["AUTO"]["entries"], 2)      # one closed, one open
