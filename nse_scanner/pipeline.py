@@ -933,6 +933,28 @@ def _close_trade(st: dict, raw: str, pos: dict, price: float, why: str, hhmm: st
         log.exception("could not file the closed trade for %s", raw)
 
 
+def _screen_report() -> None:
+    """Send bot 4's audit PDF once per session, after the 5m report. Never raises."""
+    try:
+        from . import screen, screen_pdf
+
+        if not screen.screen_enabled():
+            return
+        st4 = screen.load()
+        if not st4.get("session") or st4.get("reported"):
+            return
+        out = screen_pdf.report(st4, dry_run=_dry())
+        if out.get("sent"):
+            st4["reported"] = True
+            screen.save(st4)
+            log.info("screen audit sent: %s", out.get("path"))
+        else:
+            log.error("screen audit PDF was NOT delivered — %s (re-send: "
+                      "python -m nse_scanner screen-pdf)", out.get("path"))
+    except Exception:                       # noqa: BLE001 — never cost the session
+        log.exception("screen audit failed")
+
+
 def _eod():
     """The report module, imported lazily (it reads back from this one)."""
     from . import eod
@@ -2407,13 +2429,37 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # The whole board for this candle, after every alert of it has gone out. Its
     # own ledger, so it costs nothing to skip when the knob is off.
     try:
-        from .board import sweep as _board_sweep
+        from .board import last_frames, sweep as _board_sweep
 
-        if _board_sweep(st, frames=sm5) is not None:
+        payload = _board_sweep(st, frames=sm5)
+        if payload is not None:
             _save(st)
+            # Bot 4 screens the very same candle the board just scored, on the very
+            # same frames — no second fetch, and no candle the scan has not closed.
+            # It has its own ledger and its own channel: nothing here can touch the
+            # sends of bots 1/2/3, and the user is told what qualifies, not what to buy.
+            _screen_candle(payload, last_frames() or sm5, md, last)
     except Exception:                       # noqa: BLE001 — never cost a candle
         log.exception("board sweep failed")
     return result
+
+
+def _screen_candle(payload: dict, frames: dict, md, last: datetime) -> None:
+    """Run the name-first screen (bot 4) on one closed candle. Never raises."""
+    from . import screen
+
+    if not screen.screen_enabled():
+        return
+    try:
+        st4 = screen.load()
+        screen.consider(st4, payload, frames, md, last, send=telegram.send_bot4)
+        for text in screen.updates(st4):
+            if telegram.send_bot4(text, dry_run=_dry()):
+                screen.save(st4)
+            else:
+                log.warning("bot 4 refused a setup update; it will be retried next candle")
+    except Exception:                       # noqa: BLE001 — the screen is not the scan
+        log.exception("screen (bot 4) failed at %s", payload.get("b"))
 
 
 def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:
@@ -2923,6 +2969,7 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
                                   "is over, so no later run will send it")
             except Exception:
                 log.exception("session summary failed")
+            _screen_report()
             if exit_at_close:
                 return "closed"
             log.info("session over, sleep until tomorrow")

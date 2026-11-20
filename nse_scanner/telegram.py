@@ -175,6 +175,33 @@ def send_bot3(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> 
     return _send_to(token, chat, text, parse_mode=parse_mode, label="bot3")
 
 
+def fourth_config_from_env() -> tuple[str, str]:
+    """Return the screen's own bot token and chat ID (bot 4).
+
+    Bot 4 is the name-first screen's channel. It is deliberately separate from
+    bots 1/2: the screen's messages are *setups to choose from*, not entries, and
+    mixing the two streams would make either one unreadable.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN_4", "").strip()
+    chat = os.environ.get("TELEGRAM_CHAT_ID_4", "").strip()
+    return token, chat
+
+
+def send_bot4(text: str, *, dry_run: bool = False, parse_mode: str = "HTML") -> bool:
+    """Send ONLY to bot 4 — no mirroring, and never a fallback to bots 1/2."""
+    if dry_run or os.environ.get("DRY_RUN", "0") == "1":
+        log.info("DRY-RUN telegram (bot 4):\n%s", text)
+        print(text)
+        return True
+
+    token, chat = fourth_config_from_env()
+    if not token or not chat:
+        log.error("TELEGRAM_BOT_TOKEN_4 / TELEGRAM_CHAT_ID_4 missing — printing instead")
+        print(text)
+        return False
+    return _send_to(token, chat, text, parse_mode=parse_mode, label="bot4")
+
+
 def send_document(path, caption: str = "", *, bot: int = 1, dry_run: bool = False) -> bool:
     """Upload a file to a chat — the end-of-day audit's JSON and workbook.
 
@@ -186,7 +213,10 @@ def send_document(path, caption: str = "", *, bot: int = 1, dry_run: bool = Fals
     if dry_run or os.environ.get("DRY_RUN", "0") == "1":
         log.info("DRY-RUN telegram document (%s): %s", bot, path)
         return True
-    if bot == 3:
+    if bot == 4:
+        token, chat = fourth_config_from_env()
+        label = "bot4-document"
+    elif bot == 3:
         token, chat = third_config_from_env()
         label = "bot3-document"
     else:

@@ -5,3 +5,6 @@ pytz>=2024.1
 PyYAML>=6.0
 requests>=2.32.0
 python-dateutil>=2.9.0
+# A4 multi-page audit for bot 4 (screen_pdf.py); if it is missing the
+# audit degrades to a complete .txt instead of failing the session.
+reportlab>=4.0

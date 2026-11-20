@@ -131,6 +131,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN_3: ${{ secrets.TELEGRAM_BOT_TOKEN_3 }}
           TELEGRAM_CHAT_ID_3: ${{ secrets.TELEGRAM_CHAT_ID_3 }}
+          # Bot 4 belongs to the 5m loop (see the SCREEN_ knobs below).
+          TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
+          TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
           LOG_LEVEL: INFO
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           # Knobs — change them in Settings → Secrets and variables → Actions →
@@ -197,6 +200,25 @@ jobs:
           AUDIT_BOARD_FROM: ${{ vars.AUDIT_BOARD_FROM || '09:20' }}
           AUDIT_BOARD_TO: ${{ vars.AUDIT_BOARD_TO || '15:15' }}
           AUDIT_BOARD_PERIOD: ${{ vars.AUDIT_BOARD_PERIOD || '1d' }}
+          # ── bot 4 · the name-first screen ─────────────────────────────────
+          # A short list of setups (both sides) the human chooses from; it never
+          # enters. Bot 4 runs on the 5m loop — forwarded here so both workflows
+          # resolve every knob identically (the 1m loop does not call the screen).
+          SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
+          SCREEN_MIN_SCORE: ${{ vars.SCREEN_MIN_SCORE || '55' }}
+          SCREEN_PERSIST_MIN: ${{ vars.SCREEN_PERSIST_MIN || '78' }}
+          SCREEN_SLOPE_MIN: ${{ vars.SCREEN_SLOPE_MIN || '0' }}
+          SCREEN_SLOPE_BARS: ${{ vars.SCREEN_SLOPE_BARS || '3' }}
+          SCREEN_STRUCTURE_MIN: ${{ vars.SCREEN_STRUCTURE_MIN || '60' }}
+          SCREEN_STRENGTH_MIN: ${{ vars.SCREEN_STRENGTH_MIN || '55' }}
+          SCREEN_LEAD_MAX: ${{ vars.SCREEN_LEAD_MAX || '2.0' }}
+          SCREEN_RUN_MAX_R: ${{ vars.SCREEN_RUN_MAX_R || '5.0' }}
+          SCREEN_NEAR_HIGH_PCT: ${{ vars.SCREEN_NEAR_HIGH_PCT || '0.20' }}
+          SCREEN_COUNTER_PERSIST: ${{ vars.SCREEN_COUNTER_PERSIST || '90' }}
+          SCREEN_CAP_PER_SECTOR: ${{ vars.SCREEN_CAP_PER_SECTOR || '2' }}
+          SCREEN_COOLDOWN_MIN: ${{ vars.SCREEN_COOLDOWN_MIN || '45' }}
+          SCREEN_LAST_ENTRY: ${{ vars.SCREEN_LAST_ENTRY || '14:30' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also scan the leading sector on the other side of the pick.

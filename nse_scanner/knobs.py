@@ -78,6 +78,22 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("EXIT_EMA9_BUFFER_R", "0.25"),
     ("BREAKEVEN_AFTER_T1", "1"),
     ("MARKET_CONF_DELTA", "10"),
+    # ── bot 4, the name-first screen ─────────────────────────────────────────
+    ("SCREEN_BOT", "1"),
+    ("SCREEN_MAX_DAY", "6"),
+    ("SCREEN_MIN_SCORE", "55"),
+    ("SCREEN_PERSIST_MIN", "78"),
+    ("SCREEN_SLOPE_MIN", "0"),
+    ("SCREEN_SLOPE_BARS", "3"),
+    ("SCREEN_STRUCTURE_MIN", "60"),
+    ("SCREEN_STRENGTH_MIN", "55"),
+    ("SCREEN_LEAD_MAX", "2.0"),
+    ("SCREEN_RUN_MAX_R", "5.0"),
+    ("SCREEN_NEAR_HIGH_PCT", "0.20"),
+    ("SCREEN_COUNTER_PERSIST", "90"),
+    ("SCREEN_CAP_PER_SECTOR", "2"),
+    ("SCREEN_COOLDOWN_MIN", "45"),
+    ("SCREEN_LAST_ENTRY", "14:30"),
 )
 
 

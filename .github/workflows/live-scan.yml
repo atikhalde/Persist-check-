@@ -151,6 +151,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Bot 4 is the screen's own channel: setups, never entries.
+          TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
+          TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
           TELEGRAM_BOT_TOKEN_2: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
           TELEGRAM_CHAT_ID_2: ${{ secrets.TELEGRAM_CHAT_ID_2 }}
           LOG_LEVEL: INFO
@@ -244,6 +247,24 @@ jobs:
           AUDIT_BOARD_FROM: ${{ vars.AUDIT_BOARD_FROM || '09:20' }}
           AUDIT_BOARD_TO: ${{ vars.AUDIT_BOARD_TO || '15:15' }}
           AUDIT_BOARD_PERIOD: ${{ vars.AUDIT_BOARD_PERIOD || '1d' }}
+          # ── bot 4 · the name-first screen ─────────────────────────────────
+          # A short list of setups (both sides) that the human chooses from. It
+          # never enters: no position, no money, its own ledger and its own bot.
+          SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
+          SCREEN_MIN_SCORE: ${{ vars.SCREEN_MIN_SCORE || '55' }}
+          SCREEN_PERSIST_MIN: ${{ vars.SCREEN_PERSIST_MIN || '78' }}
+          SCREEN_SLOPE_MIN: ${{ vars.SCREEN_SLOPE_MIN || '0' }}
+          SCREEN_SLOPE_BARS: ${{ vars.SCREEN_SLOPE_BARS || '3' }}
+          SCREEN_STRUCTURE_MIN: ${{ vars.SCREEN_STRUCTURE_MIN || '60' }}
+          SCREEN_STRENGTH_MIN: ${{ vars.SCREEN_STRENGTH_MIN || '55' }}
+          SCREEN_LEAD_MAX: ${{ vars.SCREEN_LEAD_MAX || '2.0' }}
+          SCREEN_RUN_MAX_R: ${{ vars.SCREEN_RUN_MAX_R || '5.0' }}
+          SCREEN_NEAR_HIGH_PCT: ${{ vars.SCREEN_NEAR_HIGH_PCT || '0.20' }}
+          SCREEN_COUNTER_PERSIST: ${{ vars.SCREEN_COUNTER_PERSIST || '90' }}
+          SCREEN_CAP_PER_SECTOR: ${{ vars.SCREEN_CAP_PER_SECTOR || '2' }}
+          SCREEN_COOLDOWN_MIN: ${{ vars.SCREEN_COOLDOWN_MIN || '45' }}
+          SCREEN_LAST_ENTRY: ${{ vars.SCREEN_LAST_ENTRY || '14:30' }}
           # 1 = look the incumbent pick up in a per-bar log, so the early pass
           # cannot erase the candle before this one (pick cannot flip inside a
           # candle). Off: 17 Nov it would have held REALTY and lost BANKINDIA.
