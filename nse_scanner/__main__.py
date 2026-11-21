@@ -298,7 +298,8 @@ def _doctor() -> int:
     else:
         print("Telegram bot 4 (screen): not configured (setups print instead of sending)")
     from . import screen as _screen
-    print(f"bot 4 screen: {'on' if _screen.screen_enabled() else 'off'} · "
+    print(f"bot 4 screen (early pass {'on' if _screen.early_enabled() else 'off'}): "
+          f"{'on' if _screen.screen_enabled() else 'off'} · "
           f"max {_screen.max_day()}/day · score >= {_screen.min_score():.0f} · "
           f"persist >= {_screen.persist_min():.0f} (slope >= {_screen.slope_min():.0f} over "
           f"{_screen.slope_bars()}) · structure >= {_screen.structure_min():.0f} · "

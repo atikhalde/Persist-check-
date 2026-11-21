@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -72,6 +72,19 @@ def _i(name: str, default: int, lo: int = 0, hi: int = 1000) -> int:
 def screen_enabled() -> bool:
     """``SCREEN_BOT`` (1): run the name-first screen alongside the 5m scan."""
     return os.environ.get("SCREEN_BOT", "1").strip() != "0"
+
+
+def early_enabled() -> bool:
+    """``SCREEN_EARLY`` (1): send the card on the **forming** candle, before the close.
+
+    A 5m setup is worthless if it arrives after the candle it describes: Yahoo
+    publishes the closed bar late, the loop confirms after it, and by then the
+    price has moved. Bot 4 therefore speaks twice about the same candle — a
+    PROVISIONAL card ``EARLY_ALERT_SECONDS`` before the close (the same lead bots 1
+    and 3 already use), then one short line at the close saying whether it survived.
+    Off (0) = close-only cards, which is the late behaviour this knob removes.
+    """
+    return os.environ.get("SCREEN_EARLY", "1").strip() != "0"
 
 
 def max_day() -> int:
@@ -166,6 +179,7 @@ def last_entry() -> str:
 def knobs() -> dict:
     """Everything the screen acts on, for the alert footer and the PDF's page 1."""
     return {"SCREEN_MAX_DAY": max_day(), "SCREEN_MIN_SCORE": min_score(),
+            "SCREEN_EARLY": early_enabled(),
             "SCREEN_PERSIST_MIN": persist_min(), "SCREEN_SLOPE_MIN": slope_min(),
             "SCREEN_SLOPE_BARS": slope_bars(), "SCREEN_STRUCTURE_MIN": structure_min(),
             "SCREEN_STRENGTH_MIN": strength_min(), "SCREEN_LEAD_MAX": lead_max(),
@@ -354,6 +368,50 @@ def rank_score(cand: dict) -> float:
 
 
 # ── the screen ───────────────────────────────────────────────────────────────
+def ready_sectors(payload: dict, md, *, slopes: dict | None = None,
+                  limit: int | None = None, report: dict | None = None) -> list[tuple[str, dict, bool]]:
+    """The sectors that pass the **sector** gates, with ``(name, cell, aligned)``.
+
+    Shared by the close pass and the pre-close pass so a sector cannot be
+    screenable at 10:00 and refuse itself at 10:13. ``limit`` takes the strongest
+    ``limit`` sectors by persistence (the pre-close pass fetches their names, and
+    a fetch budget is a real constraint at T-60s).
+    """
+    report = report if report is not None else {}
+    slopes = slopes or {}
+    market_side = int(getattr(md, "dir_state", 0) or 0)
+    out: list[tuple[str, dict, bool]] = []
+    for sector, cell in ((payload or {}).get("sectors") or {}).items():
+        names = cell.get("n") or []
+        if not names:
+            continue
+        side = int(cell.get("side") or 1)
+        persist = float(cell.get("persist") or 0)
+        intra = float(cell.get("intra") or 0)
+        if persist < persist_min():
+            report["sector persist below floor"] = report.get(
+                "sector persist below floor", 0) + len(names)
+            continue
+        if float(slopes.get(sector, 0.0)) < slope_min():
+            report["sector persistence falling"] = report.get(
+                "sector persistence falling", 0) + len(names)
+            continue
+        if (intra > 0) != (side == 1):
+            report["sector moving against its side"] = report.get(
+                "sector moving against its side", 0) + len(names)
+            continue
+        aligned = market_side == 0 or market_side == side
+        if not aligned and persist < counter_persist():
+            report["sector against the market"] = report.get(
+                "sector against the market", 0) + len(names)
+            continue
+        out.append((sector, cell, aligned))
+    if limit is not None and len(out) > limit:
+        out.sort(key=lambda t: -float(t[1].get("persist") or 0))
+        out = out[:limit]
+    return out
+
+
 def candidates(payload: dict, frames: dict, last, *, slopes: dict | None = None,
                md=None, report: dict | None = None) -> list[dict]:
     """Every name that passes the gates on this candle, in both directions.
@@ -368,33 +426,13 @@ def candidates(payload: dict, frames: dict, last, *, slopes: dict | None = None,
     out: list[dict] = []
     report = report if report is not None else {}
     slopes = slopes or {}
-    market_side = int(getattr(md, "dir_state", 0) or 0)
-    for sector, cell in ((payload or {}).get("sectors") or {}).items():
+    for sector, cell, aligned in ready_sectors(payload, md, slopes=slopes, report=report):
         names = cell.get("n") or []
-        if not names:
-            continue
         side = int(cell.get("side") or 1)
         long = side == 1
         persist = float(cell.get("persist") or 0)
         slope = float(slopes.get(sector, 0.0))
         intra = float(cell.get("intra") or 0)
-        if persist < persist_min():
-            report["sector persist below floor"] = report.get(
-                "sector persist below floor", 0) + len(names)
-            continue
-        if slope < slope_min():
-            report["sector persistence falling"] = report.get(
-                "sector persistence falling", 0) + len(names)
-            continue
-        if (intra > 0) != long:
-            report["sector moving against its side"] = report.get(
-                "sector moving against its side", 0) + len(names)
-            continue
-        aligned = market_side == 0 or market_side == side
-        if not aligned and persist < counter_persist():
-            report["sector against the market"] = report.get(
-                "sector against the market", 0) + len(names)
-            continue
         legs = {"strength": cell.get("s") or [], "volume": cell.get("v") or [],
                 "structure": cell.get("t") or []}
         leads = cell.get("lead") or []
@@ -505,7 +543,8 @@ def _sector_room(st: dict, sector: str) -> bool:
     return used < cap_per_sector()
 
 
-def _make_setup(st: dict, cand: dict, md) -> dict:
+def _make_setup(st: dict, cand: dict, md, *, provisional: bool = False,
+                seconds_left: int | None = None, age_s: int | None = None) -> dict:
     plan = cand["plan"]
     long = cand["long"]
     risk_pct = (plan.risk / plan.entry * 100.0) if plan.entry else 0.0
@@ -525,9 +564,11 @@ def _make_setup(st: dict, cand: dict, md) -> dict:
             "t_names": list(plan.pivot_names), "score": cand["score"],
             "legs": cand["legs"], "lead": cand["lead"], "persist": cand["persist"],
             "slope": cand["slope"], "run_r": cand["run_r"], "aligned": cand["aligned"],
-            "why": why, "status": "surfaced", "mfe_r": None, "mae_r": None,
-            "hit_1r": None, "stopped": None, "eod_r": None, "mark": None,
-            "scanned_at": None}
+            "why": why, "status": "provisional" if provisional else "surfaced",
+            "provisional": provisional, "confirmed": None,
+            "seconds_left": seconds_left, "age_s": age_s,
+            "mfe_r": None, "mae_r": None, "hit_1r": None, "stopped": None,
+            "eod_r": None, "mark": None, "scanned_at": None}
 
 
 def consider(st: dict, payload: dict, frames: dict, md, last: datetime, *,
@@ -575,7 +616,13 @@ def consider(st: dict, payload: dict, frames: dict, md, last: datetime, *,
              "regime": getattr(md, "regime", "")})
         del st["market"][:-130]
         track(st, frames, last)
-        surfaced = _surface(st, found, md, hhmm, send=send, now=now)
+        # The age is part of the card, not a note added afterwards: a card that says
+        # "93s after the close" is a different instruction from one that says 4s, and
+        # the difference has to be on the user's screen, not only in the PDF.
+        age = _age_after_close(last, now)
+        surfaced = _surface(st, found, md, hhmm, send=send, now=now, age_s=age)
+        _note_age(surfaced, age, st, last)
+        _settle(st, found, hhmm, last, send=send, now=now)
         save_state(st)
         return surfaced
     except Exception:                       # noqa: BLE001 — never cost a candle
@@ -583,32 +630,211 @@ def consider(st: dict, payload: dict, frames: dict, md, last: datetime, *,
         return []
 
 
-def _surface(st: dict, found: list[dict], md, hhmm: str, *, send, now) -> list[dict]:
+def _admit(st: dict, cand: dict, md, hhmm: str, *, send, now,
+           provisional: bool = False, seconds_left: int | None = None,
+           age_s: int | None = None) -> dict | None:
+    """The one place a card is allowed to leave: caps, score, cooldown, send.
+
+    Both passes go through here, so a name can never be admitted by the early pass
+    under a rule the close pass would refuse — and a bot-4 refusal leaves the setup
+    unsent instead of falling back to any other channel.
+    """
+    if len(st.get("setups") or []) >= max_day():
+        return None
+    if cand["score"] < min_score():
+        return None
+    if _surfaced_today(st, cand["raw"]) or not _cooldown_ok(st, cand["raw"], hhmm):
+        return None
+    if not _sector_room(st, cand["sector"]):
+        return None
+    setup = _make_setup(st, cand, md, provisional=provisional,
+                        seconds_left=seconds_left, age_s=age_s)
+    text = format_setup(setup, md, provisional=provisional, seconds_left=seconds_left)
+    if not send(text, dry_run=_dry()):
+        log.warning("bot 4 refused the %s for %s; leaving it unsent",
+                    "provisional card" if provisional else "setup", cand["raw"])
+        return None
+    setup["scanned_at"] = now.strftime("%H:%M:%S")
+    st.setdefault("setups", []).append(setup)
+    st["stats"]["surfaced"] = st["stats"].get("surfaced", 0) + 1
+    if provisional:
+        st["stats"]["provisional"] = st["stats"].get("provisional", 0) + 1
+    log.info("%s #%d %s %s %s @ %s sl=%.2f (%.2f%%) score %.1f%s",
+             "PROVISIONAL" if provisional else "SETUP", setup["id"], setup["side"],
+             setup["sector"], setup["raw"], setup["entry"], setup["sl"],
+             setup["risk_pct"], setup["score"],
+             f" · {seconds_left}s before the close" if provisional else "")
+    return setup
+
+
+def _surface(st: dict, found: list[dict], md, hhmm: str, *, send, now,
+             age_s: int | None = None) -> list[dict]:
     """Take the best ``SCREEN_MAX_DAY`` of them, one alert each. Nothing is entered."""
     out: list[dict] = []
     if hhmm > last_entry():
         return out
     for cand in found:
-        if len(st.get("setups") or []) >= max_day():
-            break
-        if cand["score"] < min_score():
-            continue
-        if _surfaced_today(st, cand["raw"]) or not _cooldown_ok(st, cand["raw"], hhmm):
-            continue
-        if not _sector_room(st, cand["sector"]):
-            continue
-        setup = _make_setup(st, cand, md)
-        if not send(format_setup(setup, md), dry_run=_dry()):
-            log.warning("bot 4 refused the setup for %s; leaving it unsent", cand["raw"])
-            continue
-        setup["scanned_at"] = now.strftime("%H:%M:%S")
-        st.setdefault("setups", []).append(setup)
-        st["stats"]["surfaced"] = st["stats"].get("surfaced", 0) + 1
-        out.append(setup)
-        log.info("SETUP #%d %s %s %s @ %s sl=%.2f (%.2f%%) score %.1f",
-                 setup["id"], setup["side"], setup["sector"], setup["raw"],
-                 setup["entry"], setup["sl"], setup["risk_pct"], setup["score"])
+        setup = _admit(st, cand, md, hhmm, send=send, now=now, age_s=age_s)
+        if setup is not None:
+            out.append(setup)
     return out
+
+
+def _age_after_close(last, now) -> int | None:
+    """Seconds between a candle's close and now — the only honest definition of "late"."""
+    try:
+        closed = to_ist(last) + timedelta(minutes=BAR_MINUTES)
+        return int(max(0.0, (now - closed).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _note_age(surfaced: list[dict], age: int | None, st: dict, last) -> None:
+    """Record how late the cards went out, in seconds after the candle's close.
+
+    "On time" has to be a number or it is an opinion. The loop logs a warning past
+    90 s, which is the point where a 5m setup has stopped being an entry and
+    started being a chart annotation.
+    """
+    if not surfaced or age is None:
+        return
+    stats = st.setdefault("stats", {})
+    stats["age_max"] = max(int(stats.get("age_max") or 0), age)
+    ages = (stats.get("ages") or []) + [age]
+    stats["ages"] = ages[-60:]
+    if age > 90:
+        stats["late"] = stats.get("late", 0) + len(surfaced)
+        log.warning("bot 4 card(s) went out %ds after the %s candle closed — the feed "
+                    "published late; SCREEN_EARLY is the fix, not a shorter timeout", age,
+                    to_ist(last).strftime("%H:%M"))
+
+
+def provisional(st: dict, payload: dict, frames: dict, md, forming, *,
+                send=None, now: datetime | None = None) -> list[dict]:
+    """Send a **PROVISIONAL** card for setups that qualify on the forming candle.
+
+    This is bot 4's answer to *late*. A 5m candle closes at 10:15; Yahoo publishes
+    it tens of seconds later, the loop confirms after that, and the card that
+    "describes 10:15" lands at 10:16 — after the price has moved. So the screen
+    judges the still-forming candle ``EARLY_ALERT_SECONDS`` before its close (the
+    same lead bots 1 and 3 already use), sends the card marked provisional, and
+    then resolves it at the close in ``_settle``: CONFIRMED with the closed
+    candle's own levels, or CANCELLED and its slot freed.
+
+    The sector numbers are the previous *closed* candle's (a sector's persistence
+    is a slow measure — that is the whole reason it works as a gate); the name's
+    own tape is the forming candle's, rebuilt from 1m bars by the caller.
+    """
+    if not screen_enabled() or not early_enabled() or not payload:
+        return []
+    send = send or telegram.send_bot4
+    now = now or now_ist()
+    hhmm = to_ist(forming).strftime("%H:%M")
+    if hhmm > last_entry():
+        return []
+    out: list[dict] = []
+    try:
+        st = reset_if_new_day(st, str(to_ist(forming).date()))
+        try:
+            close_at = to_ist(forming) + timedelta(minutes=BAR_MINUTES)
+            seconds_left = int(max(0.0, (close_at - now).total_seconds()))
+        except (TypeError, ValueError):
+            seconds_left = None
+        report: dict = {}
+        found = candidates(payload, frames, forming, md=md, report=report,
+                           slopes=_slopes(st, payload))
+        st.setdefault("stats", {})["early_passes"] = (
+            st["stats"].get("early_passes", 0) + 1)
+        for cand in found:
+            setup = _admit(st, cand, md, hhmm, send=send, now=now,
+                           provisional=True, seconds_left=seconds_left)
+            if setup is not None:
+                out.append(setup)
+        if out:
+            save(st)
+        elif not (st.get("stats") or {}).get("early_empty_logged_" + hhmm):
+            log.info("bot 4 early %s: %d name(s) qualified on the forming candle, "
+                     "none admissible (cap/score/cooldown) — no provisional card",
+                     hhmm, len(found))
+            st["stats"]["early_empty_logged_" + hhmm] = True
+        return out
+    except Exception:                       # noqa: BLE001 — never cost a candle
+        log.exception("screen provisional pass failed at %s", hhmm)
+        return []
+
+
+def _settle(st: dict, found: list[dict], hhmm: str, last, *, send, now) -> list[dict]:
+    """Resolve every open provisional card at the close: confirm, cancel, or say why not.
+
+    Three outcomes, all said out loud:
+
+    * the name also qualifies on the **closed** candle → the card is upgraded in
+      place (its own id, the closed candle's levels) and one CONFIRMED line is sent;
+    * it no longer qualifies → CANCELLED, and its slot is **freed** so the day can
+      still surface ``SCREEN_MAX_DAY`` real setups;
+    * its candle never got a close pass at all → CANCELLED with that reason, which
+      is the only place a *missed* candle becomes visible instead of silent.
+    """
+    live = {c["raw"]: c for c in found}
+    keep: list[dict] = []
+    resolved: list[dict] = []
+    try:
+        closed = to_ist(last) + timedelta(minutes=BAR_MINUTES)
+        age = int(max(0.0, (now - closed).total_seconds()))
+    except (TypeError, ValueError):
+        age = None
+    for setup in st.get("setups") or []:
+        if not setup.get("provisional") or setup.get("confirmed") is not None:
+            keep.append(setup)
+            continue
+        bar = str(setup.get("bar") or "")
+        if bar == hhmm:
+            cand = live.get(setup["raw"])
+            if cand is not None:
+                plan = cand["plan"]
+                setup.update({"entry": plan.entry, "sl": plan.sl, "risk": plan.risk,
+                              "risk_pct": round((plan.risk / plan.entry * 100.0)
+                                                if plan.entry else 0.0, 2),
+                              "t1": plan.t1, "t2": plan.t2, "t3": plan.t3,
+                              "t_names": list(plan.pivot_names), "score": cand["score"],
+                              "legs": cand["legs"], "lead": cand["lead"],
+                              "persist": cand["persist"], "slope": cand["slope"],
+                              "run_r": cand["run_r"], "aligned": cand["aligned"],
+                              "provisional": False, "confirmed": hhmm,
+                              "status": "surfaced", "age_s": age})
+                if send(format_confirm(setup, age), dry_run=_dry()):
+                    st["stats"]["confirmed"] = st["stats"].get("confirmed", 0) + 1
+                else:
+                    log.warning("bot 4 refused the CONFIRMED line for %s", setup["raw"])
+                keep.append(setup)
+                resolved.append(setup)
+                log.info("SETUP #%d %s CONFIRMED at the %s close (entry %.2f, age %ss)",
+                         setup["id"], setup["raw"], hhmm, setup["entry"], age)
+            else:
+                setup.update({"provisional": False, "confirmed": False,
+                              "status": "cancelled",
+                              "why_close": "did not qualify on the closed candle"})
+                if send(format_cancel(setup), dry_run=_dry()):
+                    st["stats"]["cancelled"] = st["stats"].get("cancelled", 0) + 1
+                st.setdefault("cancelled", []).append(setup)
+                resolved.append(setup)
+                log.info("SETUP #%d %s CANCELLED at the %s close — slot freed",
+                         setup["id"], setup["raw"], hhmm)
+        elif bar < hhmm:
+            # Its candle's close pass never ran: the loop was down, the feed never
+            # published, or the job was handed over at the wrong moment.
+            setup.update({"provisional": False, "confirmed": False,
+                          "status": "cancelled",
+                          "why_close": f"no close pass for its {bar} candle"})
+            send(format_cancel(setup), dry_run=_dry())
+            st.setdefault("cancelled", []).append(setup)
+            resolved.append(setup)
+            log.warning("provisional #%d %s never got a %s close pass — cancelled and "
+                        "recorded as a missed candle", setup["id"], setup["raw"], bar)
+        else:
+            keep.append(setup)
+    st["setups"] = keep
+    return resolved
 
 
 def _dry() -> bool:
@@ -696,16 +922,32 @@ def _tgt(plan_name, value) -> str:
     return f"{plan_name} {value:.2f}" if value is not None else "—"
 
 
-def format_setup(setup: dict, md) -> str:
-    """The setup card. Says what it is, what it costs and that it is not an entry."""
+def format_setup(setup: dict, md, *, provisional: bool = False,
+                 seconds_left: int | None = None) -> str:
+    """The setup card. Says what it is, what it costs and that it is not an entry.
+
+    ``provisional`` is the pre-close card: it names the seconds left, it says the
+    candle has not closed, and it promises the one line that will settle it. The
+    difference matters to a human deciding whether to act on a price that can still
+    move before the bar completes.
+    """
     arrow = "🟢" if setup["side"] == "BUY" else "🔴"
     legs = setup.get("legs") or {}
+    price_note = "forming close" if provisional else "this candle's close"
+    if provisional:
+        state = (f"⏱ <b>PROVISIONAL</b> · forming 5m bar {setup['bar']} · closes in "
+                 f"<b>{seconds_left if seconds_left is not None else '?'}s</b>")
+    else:
+        state = (f"5m bar {setup['bar']} closed"
+                 + (f" · {setup['age_s']}s after the close"
+                    if setup.get("age_s") is not None else ""))
     return (
-        f"🎯 {arrow} <b>SETUP #{setup['id']} — {setup['side']}</b>  |  "
-        f"<b>{setup['name']}</b>  {setup['sector']}  ·  score <b>{setup['score']:.1f}</b>\n"
-        f"5m bar {setup['bar']} closed  ·  Market {getattr(md, 'dir_label', '?')} "
+        f"🎯 {arrow} <b>{'PROVISIONAL ' if provisional else ''}SETUP #{setup['id']} — "
+        f"{setup['side']}</b>  |  <b>{setup['name']}</b>  {setup['sector']}  ·  "
+        f"score <b>{setup['score']:.1f}</b>\n"
+        f"{state}  ·  Market {getattr(md, 'dir_label', '?')} "
         f"({getattr(md, 'dir_conf', '?')}%)\n"
-        f"Entry <b>{setup['entry']:.2f}</b> (this candle's close) · SL {setup['sl']:.2f} "
+        f"Entry <b>{setup['entry']:.2f}</b> ({price_note}) · SL {setup['sl']:.2f} "
         f"({setup['risk_pct']:.2f}% risk) · {_tgt('T1', setup.get('t1'))} · "
         f"{_tgt('T2', setup.get('t2'))} · {_tgt('T3', setup.get('t3'))}\n"
         f"sector persist {setup['persist']} ({setup['slope']:+.0f}) · lead "
@@ -713,9 +955,30 @@ def format_setup(setup: dict, md) -> str:
         f"{legs.get('volume') or 0:.0f} / structure {legs.get('structure') or 0:.0f} · "
         f"run {setup['run_r']:.1f}R\n"
         + "\n".join(f"• {w}" for w in setup.get("why") or [])
-        + "\n<b>Not an entry alert</b> — the screen surfaces, you decide. "
-          f"Levels are the {setup['bar']} candle's own; re-check the price before acting."
+        + ("\n<b>Not an entry alert</b> — the screen surfaces, you decide. Do not "
+           "chase it: one line follows at the close saying CONFIRMED (with the closed "
+           "candle's own levels) or CANCELLED." if provisional else
+           "\n<b>Not an entry alert</b> — the screen surfaces, you decide. "
+           f"Levels are the {setup['bar']} candle's own; re-check the price before acting.")
     )
+
+
+def format_confirm(setup: dict, age_s: int | None = None) -> str:
+    """One line at the close: the provisional card survived, with the closed levels."""
+    return (f"✅ <b>SETUP #{setup['id']} CONFIRMED</b> — {setup['side']} "
+            f"<b>{setup['name']}</b> {setup['sector']} · the {setup['bar']} candle closed "
+            f"in its favour\nEntry <b>{setup['entry']:.2f}</b> · SL {setup['sl']:.2f} "
+            f"({setup['risk_pct']:.2f}%) · {_tgt('T1', setup.get('t1'))} · "
+            f"{_tgt('T2', setup.get('t2'))} · {_tgt('T3', setup.get('t3'))}"
+            + (f" · {age_s}s after the close" if age_s is not None else ""))
+
+
+def format_cancel(setup: dict) -> str:
+    """One line at the close: the provisional card did not survive — stop watching it."""
+    why = setup.get("why_close") or "did not qualify on the closed candle"
+    return (f"✖️ <b>SETUP #{setup['id']} CANCELLED</b> — {setup['side']} "
+            f"<b>{setup['name']}</b> {setup['sector']} · {why}. The slot is free; "
+            f"nothing was entered.")
 
 
 def format_update(setup: dict, kind: str) -> str:

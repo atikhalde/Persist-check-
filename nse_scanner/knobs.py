@@ -80,6 +80,7 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("MARKET_CONF_DELTA", "10"),
     # ── bot 4, the name-first screen ─────────────────────────────────────────
     ("SCREEN_BOT", "1"),
+    ("SCREEN_EARLY", "1"),
     ("SCREEN_MAX_DAY", "6"),
     ("SCREEN_MIN_SCORE", "55"),
     ("SCREEN_PERSIST_MIN", "78"),

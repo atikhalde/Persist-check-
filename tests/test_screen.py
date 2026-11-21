@@ -374,6 +374,138 @@ class TrackingTests(ScreenCase):
         self.assertIn("stop traded", first[0])
 
 
+class OnTimeTests(ScreenCase):
+    """The signal has to arrive *with* its candle, not after it.
+
+    A 5m bar closes at 10:15; Yahoo publishes tens of seconds later, so a
+    close-only card is late by construction. These tests pin the fix: a
+    PROVISIONAL card on the forming candle (``EARLY_ALERT_SECONDS`` before its
+    close), one short line at the close — CONFIRMED with the closed candle's own
+    levels, or CANCELLED with its slot freed — and a visible record of any candle
+    the loop never judged at all.
+    """
+
+    def forming(self, closes=None, n=12):
+        """A frame whose newest row IS the forming candle (same shape as ``provisional_5m``)."""
+        return {data.yahoo_stock("MARUTI"): rising(10_000, 40, n)} if closes is None else \
+            {data.yahoo_stock("MARUTI"): frame(closes)}
+
+    def test_a_provisional_card_goes_out_before_the_close(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            out = screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                                     send=self.send,
+                                     now=candle(11) + timedelta(minutes=4))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["provisional"])
+        self.assertEqual(out[0]["seconds_left"], 60)
+        self.assertIn("PROVISIONAL", self.sent[0])
+        self.assertIn("closes in <b>60s</b>", self.sent[0])
+        self.assertIn("forming close", self.sent[0])
+        self.assertIn("Not an entry alert", self.sent[0])
+
+    def test_the_same_name_is_not_surfaced_again_at_the_close(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                               send=self.send, now=candle(11) + timedelta(minutes=4))
+        out = self.run_candle(payload("10:10"), self.forming(), at=11)
+        self.assertEqual(out, [])                       # settled, not re-admitted
+        self.assertEqual(len(self.st()["setups"]), 1)
+
+    def test_a_card_that_survives_the_close_is_confirmed_with_closed_levels(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                               send=self.send, now=candle(11) + timedelta(minutes=4))
+        self.sent.clear()
+        self.run_candle(payload("10:10"), self.forming(), at=11)
+        st = self.st()
+        self.assertEqual(len(st["setups"]), 1)
+        got = st["setups"][0]
+        self.assertFalse(got["provisional"])
+        self.assertEqual(got["confirmed"], "10:10")
+        self.assertEqual(got["status"], "surfaced")
+        self.assertIsNotNone(got["age_s"])
+        self.assertTrue(any("CONFIRMED" in t for t in self.sent))
+        self.assertEqual(st["stats"].get("confirmed"), 1)
+
+    def test_a_card_the_close_drops_is_cancelled_and_its_slot_freed(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1", "SCREEN_MAX_DAY": "1"}):
+            screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                               send=self.send, now=candle(11) + timedelta(minutes=4))
+            self.assertEqual(len(self.st()["setups"]), 1)
+            self.sent.clear()
+            # The close: the name has lost its high, so it no longer qualifies.
+            closes = [10_000 + 40 * i for i in range(11)] + [10_300]
+            self.run_candle(payload("10:10"), self.forming(closes), at=11)
+            st = self.st()
+        self.assertEqual(st["setups"], [])              # slot freed
+        self.assertEqual(len(st["cancelled"]), 1)
+        self.assertEqual(st["cancelled"][0]["status"], "cancelled")
+        self.assertTrue(any("CANCELLED" in t for t in self.sent))
+        # ...and the freed slot can be used by another name on the next candle.
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1", "SCREEN_MAX_DAY": "1"}):
+            sec = payload()["sectors"]
+            sec["AUTO"]["n"] = ["M&M"]
+            out = self.run_candle(payload("10:15", sectors=sec),
+                                  {data.yahoo_stock("M&M"): rising(5_000, 20, 13)}, at=12)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["raw"], "M&M")
+
+    def test_a_provisional_whose_candle_was_never_judged_says_so(self):
+        """The one case that hides a real failure: the loop skipped its close pass."""
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                               send=self.send, now=candle(11) + timedelta(minutes=4))
+            self.sent.clear()
+            self.run_candle(payload("10:25"), self.forming(), at=14)   # 10:10 skipped
+        st = self.st()
+        self.assertEqual(st["setups"], [])
+        self.assertEqual(len(st["cancelled"]), 1)
+        self.assertIn("no close pass for its 10:10 candle", st["cancelled"][0]["why_close"])
+        self.assertTrue(any("CANCELLED" in t for t in self.sent))
+
+    def test_the_early_pass_can_be_switched_off(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "0"}):
+            out = screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                                     send=self.send, now=candle(11) + timedelta(minutes=4))
+        self.assertEqual(out, [])
+        self.assertEqual(self.sent, [])
+
+    def test_the_early_pass_respects_the_cap_and_the_last_entry_time(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1", "SCREEN_LAST_ENTRY": "10:00"}):
+            out = screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                                     send=self.send, now=candle(11) + timedelta(minutes=4))
+        self.assertEqual(out, [])
+
+    def test_the_age_after_the_close_is_recorded_and_late_cards_are_flagged(self):
+        # A close pass that reaches the candle 140s after it closed.
+        with self.assertLogs("nse_scanner", level="WARNING") as logs:
+            out = screen.consider(self.st(), payload("10:10"), self.forming(), md(),
+                                  candle(11), send=self.send, save_state=screen.save,
+                                  now=candle(12) + timedelta(seconds=140))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["age_s"], 140)
+        self.assertEqual(self.st()["stats"].get("late"), 1)
+        self.assertIn("140s after the 10:10 candle closed", " ".join(logs.output))
+        self.assertIn("140s after the close", self.sent[0])
+
+    def test_an_on_time_card_is_not_flagged(self):
+        out = screen.consider(self.st(), payload("10:10"), self.forming(), md(), candle(11),
+                              send=self.send, save_state=screen.save,
+                              now=candle(12) + timedelta(seconds=12))
+        self.assertEqual(out[0]["age_s"], 12)
+        self.assertEqual(self.st()["stats"].get("late", 0), 0)
+
+    def test_the_pipeline_runs_the_screen_on_the_early_pass(self):
+        import inspect
+
+        from nse_scanner import pipeline
+
+        source = inspect.getsource(pipeline.live_loop)
+        self.assertIn("_screen_early(bar)", source)
+        self.assertIn("run_early(bar)", source)
+        self.assertLess(source.index("run_early(bar)"), source.index("_screen_early(bar)"))
+
+
 class MessageTests(ScreenCase):
     def test_the_card_says_it_is_not_an_entry(self):
         frames = {data.yahoo_stock("MARUTI"): rising(10_000, 40, 12)}

@@ -2444,6 +2444,72 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     return result
 
 
+def _screen_early(bar: datetime) -> None:
+    """Bot 4's pre-close pass: a PROVISIONAL card on the still-forming 5m candle.
+
+    The close pass cannot be on time by construction: the 5m bar closes at :15,
+    Yahoo publishes it tens of seconds later, and the loop confirms after that — so
+    a card that "describes 10:15" lands after 10:16 with the price already gone.
+    Here the screen judges the forming candle ``EARLY_ALERT_SECONDS`` before its
+    close, on the same rebuilt-from-1m bar bots 1 and 3 already use
+    (``data.provisional_5m``, which refuses a stale feed rather than guessing).
+
+    Only the sectors that already pass the gates are fetched — their persistence is
+    read from the last **closed** board candle, because a sector's persistence is a
+    slow measure and that is exactly why it works as a gate. At most three sectors,
+    strongest first: a fetch budget at T-60s is a real constraint.
+    """
+    from . import board as _board
+    from . import screen
+    from .scan1m import load_ledger
+
+    if not screen.screen_enabled() or not screen.early_enabled():
+        return
+    now = now_ist()
+    hhmm = bar.strftime("%H:%M")
+    try:
+        st1 = state.reset_if_new_day(load_ledger(), str(now.date()))
+        book = _board.bars(st1)
+        payload = book[-1] if book else None
+        if not payload:
+            log.info("bot 4 early %s: no closed board candle to project from — skipped", hhmm)
+            return
+        scan = st1.get("scan") or {}
+        md = SimpleNamespace(dir_label=scan.get("label") or "",
+                             dir_conf=scan.get("conf"),
+                             dir_state=int(scan.get("side") or payload.get("tilt") or 0),
+                             pick_sector=scan.get("sector") or payload.get("pick") or "",
+                             regime=scan.get("regime") or "")
+        st4 = screen.load()
+        sectors = screen.ready_sectors(payload, md, slopes=screen._slopes(st4, payload), limit=3)
+        names = list(dict.fromkeys(raw for _, cell, _ in sectors
+                                   for raw in (cell.get("n") or [])))
+        if not names:
+            log.info("bot 4 early %s: no sector passes the gates — nothing to project", hhmm)
+            return
+        tickers = {data.yahoo_stock(raw): raw for raw in names}
+        sm5 = data.fetch_many(tickers, "7d", "5m")
+        sm1 = data.fetch_many(tickers, "7d", "1m")
+        frames = {}
+        for sym in tickers:
+            df = data.provisional_5m(sm5.get(sym), sm1.get(sym), bar, now, _early_max_stale())
+            if df is not None:
+                frames[sym] = df
+        if not frames:
+            log.warning("bot 4 early %s: no live 1m data for %d name(s) — no provisional "
+                        "card (the feed is too delayed to project honestly)",
+                        hhmm, len(tickers))
+            return
+        sent = screen.provisional(st4, payload, frames, md, bar,
+                                  send=telegram.send_bot4, now=now)
+        log.info("bot 4 early %s: %d sector(s), %d/%d name(s) with live 1m data, "
+                 "%d provisional card(s), %.0fs before the close",
+                 hhmm, len(sectors), len(frames), len(tickers), len(sent),
+                 ((bar + timedelta(minutes=5)) - now_ist()).total_seconds())
+    except Exception:                       # noqa: BLE001 — never cost a candle
+        log.exception("bot 4 early pass failed at %s", hhmm)
+
+
 def _screen_candle(payload: dict, frames: dict, md, last: datetime) -> None:
     """Run the name-first screen (bot 4) on one closed candle. Never raises."""
     from . import screen
@@ -2987,6 +3053,12 @@ def live_loop(grace: int | None = None, *, max_minutes: float | None = None,
                 run_early(bar)
             except Exception:
                 log.exception("early pass failed")
+            # Bot 4 goes out on the same lead. Its own failure is its own: a screen
+            # that cannot project must never take bot 1's early pass down with it.
+            try:
+                _screen_early(bar)
+            except Exception:
+                log.exception("bot 4 early pass failed")
         log.info("sleep until %s + %ss", nxt.strftime("%H:%M"), grace)
         _sleep_until(nxt + timedelta(seconds=grace))
         # Same bounded retry path as Actions: skip an old signal, never replay

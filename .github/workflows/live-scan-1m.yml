@@ -205,6 +205,11 @@ jobs:
           # enters. Bot 4 runs on the 5m loop — forwarded here so both workflows
           # resolve every knob identically (the 1m loop does not call the screen).
           SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          # 1 = a PROVISIONAL card on the forming candle,
+          # EARLY_ALERT_SECONDS before its close, then one
+          # CONFIRMED/CANCELLED line at the close. 0 = close-only
+          # cards, which is the late behaviour this removes.
+          SCREEN_EARLY: ${{ vars.SCREEN_EARLY || '1' }}
           SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
           SCREEN_MIN_SCORE: ${{ vars.SCREEN_MIN_SCORE || '55' }}
           SCREEN_PERSIST_MIN: ${{ vars.SCREEN_PERSIST_MIN || '78' }}

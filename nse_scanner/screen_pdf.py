@@ -46,6 +46,15 @@ def _fmt(value, digits: int = 2, dash: str = "—") -> str:
         return str(value)
 
 
+def _median(values) -> float | None:
+    """The middle value — the honest one for a latency table with outliers."""
+    vals = sorted(float(v) for v in (values or []) if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
 def _int(value, dash: str = "—") -> str:
     if value is None:
         return dash
@@ -64,6 +73,41 @@ def config_hash(st: dict | None = None) -> str:
     knobs = dict((st or {}).get("knobs") or screen.knobs())
     blob = json.dumps(knobs, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha1(blob).hexdigest()[:10]
+
+
+def _session_bars() -> list[str]:
+    """Every 5m candle label of an NSE session, 09:15 through 15:25."""
+    out, minute = [], 9 * 60 + 15
+    while minute <= 15 * 60 + 25:
+        out.append(f"{minute // 60:02d}:{minute % 60:02d}")
+        minute += 5
+    return out
+
+
+def _timing_short(x: dict) -> str:
+    """The table cell: ``P60 +9s`` = provisional 60s before the close, sent 9s after it."""
+    lead = x.get("seconds_left") if x.get("provisional") else None
+    age = x.get("age_s")
+    cell = (f"P{_int(lead)} " if lead is not None else "") + \
+           (f"+{_int(age)}s" if age is not None else "—")
+    return cell
+
+
+def _timing(x: dict, long: bool = False) -> str:
+    """How a card got to the user: provisional lead, then the age after the close."""
+    if x.get("provisional"):
+        lead = x.get("seconds_left")
+        base = f"PROVISIONAL {_int(lead)}s early" if lead is not None else "PROVISIONAL"
+    elif x.get("confirmed"):
+        base = "confirmed at the close"
+    else:
+        base = "close card (no provisional)"
+    age = x.get("age_s")
+    if age is not None:
+        base += f" · {_int(age)}s after the close"
+    if long and x.get("scanned_at"):
+        base += f" · sent {x.get('scanned_at')}"
+    return base
 
 
 def _knobs_locked(st: dict) -> dict:
@@ -93,6 +137,17 @@ def _verdict(st: dict) -> str:
             f"stop, {stopped} traded their stop, {done - worked - stopped} are still open. "
             f"Precision {_fmt(prec, 1)}% (the gate is 45%), average MFE "
             f"{_fmt(s.get('avg_mfe_r'))}R, average mark {_fmt(s.get('avg_eod_r'))}R.")
+    stats = st.get("stats") or {}
+    if stats.get("age_max") is not None:
+        text += (f" Cards went out a median of {_fmt(_median(stats.get('ages')), 0)}s and at "
+                 f"worst {_int(stats.get('age_max'))}s after their candle closed"
+                 + (f"; {_int(stats.get('late'))} were past the 90s line, which is the "
+                    "number SCREEN_EARLY exists to keep at zero."
+                    if stats.get("late") else " — none past the 90s line.")
+                 + (f" {_int(stats.get('provisional'))} provisional card(s) went out before "
+                    f"the close, {_int(stats.get('confirmed'))} survived it and "
+                    f"{_int(stats.get('cancelled'))} were cancelled."
+                    if stats.get("provisional") else ""))
     if prec is not None and prec < 45 and worked < 3:
         text += (" Below the 45% bar on a sample this small the honest reading is "
                  "'undecided', not 'wrong': one setup moving the counter changes the "
@@ -256,23 +311,25 @@ def _write_pdf(st: dict, path: Path) -> None:
             "Nothing was surfaced today. Section 8 counts, gate by gate, the names that "
             "were refused and at which number.", sty["body"]))
     else:
-        head = ["#", "bar", "side", "name", "sector", "entry", "SL", "risk%",
-                "T1 / T2 / T3", "score", "prs", "lead", "run", "MFE / MAE", "1R", "stop",
+        head = ["#", "bar", "timing", "side", "name", "sector", "entry", "SL", "risk%",
+                "T1/T2/T3", "score", "prs", "lead", "run", "MFE/MAE", "1R", "stop",
                 "mark", "R"]
         rows = [head]
         for x in setups:
             targets = " / ".join(_fmt(x.get(k), 1) for k in ("t1", "t2", "t3"))
-            rows.append([_int(x.get("id")), str(x.get("bar")), str(x.get("side")),
-                         str(x.get("raw")), str(x.get("sector")), _fmt(x.get("entry")),
-                         _fmt(x.get("sl")), _fmt(x.get("risk_pct")), targets,
+            sent = _timing_short(x)
+            rows.append([_int(x.get("id")), str(x.get("bar")), sent,
+                         str(x.get("side")), str(x.get("raw")), str(x.get("sector")),
+                         _fmt(x.get("entry")), _fmt(x.get("sl")),
+                         _fmt(x.get("risk_pct")), targets,
                          _fmt(x.get("score"), 1), _int(x.get("persist")),
                          _fmt(x.get("lead"), 1), _fmt(x.get("run_r"), 1),
                          f"{_fmt(x.get('mfe_r'))} / {_fmt(x.get('mae_r'))}",
                          str(x.get("hit_1r") or "—"), str(x.get("stopped") or "—"),
                          _fmt(x.get("mark")), _fmt(x.get("eod_r"))])
-        widths = [6 * mm, 10 * mm, 9 * mm, 19 * mm, 12 * mm, 12 * mm, 12 * mm, 9 * mm,
-                  25 * mm, 9 * mm, 8 * mm, 8 * mm, 7 * mm, 15 * mm, 9 * mm, 9 * mm,
-                  12 * mm, 8 * mm]
+        widths = [6 * mm, 9 * mm, 12 * mm, 8 * mm, 18 * mm, 11 * mm, 12 * mm, 12 * mm,
+                  7 * mm, 19 * mm, 7 * mm, 6 * mm, 7 * mm, 6 * mm, 11 * mm, 7 * mm,
+                  7 * mm, 11 * mm, 7 * mm]
         flow.append(table(rows, widths))
         flow.append(Paragraph(
             "1R / stop are the bar the event happened on. Mark is the last traded close the "
@@ -306,9 +363,33 @@ def _write_pdf(st: dict, path: Path) -> None:
                 f"MAE {_fmt(x.get('mae_r'))}R · +1R at {x.get('hit_1r') or '—'} · "
                 f"stop at {x.get('stopped') or '—'} · mark {_fmt(x.get('mark'))} "
                 f"({_fmt(x.get('eod_r'))}R)", sty["small"]),
+            Paragraph(f"timing: {_timing(x, long=True)}", sty["small"]),
             Spacer(1, 6),
         ]
         flow.append(KeepTogether(block))
+
+    cancelled = st.get("cancelled") or []
+    flow.append(Paragraph("5b · Provisional cards the close did not confirm", sty["h"]))
+    if not cancelled:
+        flow.append(Paragraph(
+            "None. Every provisional card either survived its close or none was sent"
+            + ("" if (st.get("stats") or {}).get("provisional") else
+               " (SCREEN_EARLY may be off, or no name qualified before a close)")
+            + ".", sty["body"]))
+    else:
+        rows = [["#", "bar", "side", "name", "sector", "score", "why the close dropped it"]]
+        for x in cancelled:
+            rows.append([_int(x.get("id")), str(x.get("bar")), str(x.get("side")),
+                         str(x.get("raw")), str(x.get("sector")),
+                         _fmt(x.get("score"), 1),
+                         str(x.get("why_close") or "did not qualify on the closed candle")])
+        flow.append(table(rows, [7 * mm, 11 * mm, 10 * mm, 26 * mm, 15 * mm, 11 * mm,
+                                 84 * mm]))
+        flow.append(Paragraph(
+            "A cancelled card is not a loss: its slot was freed, so the day could still "
+            "surface SCREEN_MAX_DAY real setups. A card canned because <b>no close pass "
+            "ran for its candle</b> is the one thing to chase — that candle was missed "
+            "by the loop, not refused by a rule.", sty["small"]))
     flow.append(PageBreak())
 
     # ── the candle-by-candle scan ────────────────────────────────────────────
@@ -319,6 +400,18 @@ def _write_pdf(st: dict, path: Path) -> None:
             "No scan rows: the screen never ran a candle (the 5m loop did not reach the "
             "board sweep, or SCREEN_BOT was off).", sty["body"]))
     else:
+        # A missed candle is invisible in a table of the candles that were judged, so
+        # the report states the count against the session's own grid (09:15-15:25).
+        expected = _session_bars()
+        judged = {str(r.get("b")) for r in scan}
+        missing = [b for b in expected if b not in judged]
+        flow.append(Paragraph(
+            f"{len(judged & set(expected))} of the session's {len(expected)} five-minute "
+            "candles were judged"
+            + (f"; <b>{len(missing)} missed</b> ({', '.join(missing[:12])}"
+               + (" …" if len(missing) > 12 else "") + ") — the loop was not running, the "
+               "feed never published, or the job handed over mid-candle. A missed candle "
+               "is not a refusal." if missing else " — none missed."), sty["body"]))
         rows = [["bar", "qualified", "best", "top names (score)", "refusals on this candle"]]
         for r in scan:
             top = ", ".join(f"{c.get('raw')} {_fmt(c.get('score'), 0)}"
@@ -446,6 +539,12 @@ def _plain_text(st: dict) -> str:
              "", "KNOBS IN FORCE"]
     lines += [f"  {k} = {knobs[k]}" for k in sorted(knobs)]
     lines += ["", "FROZEN 20 NOV HOLDOUT"] + [f"  {a}: {b}" for a, b in _holdout(st)]
+    lines += ["", "TIMING",
+              f"  median {_fmt(_median(stats.get('ages')), 0)}s · worst "
+              f"{_int(stats.get('age_max'))}s after the close · {_int(stats.get('late'))} "
+              f"past 90s · {_int(stats.get('provisional'))} provisional / "
+              f"{_int(stats.get('confirmed'))} confirmed / {_int(stats.get('cancelled'))} "
+              "cancelled"]
     lines += ["", "THE SHORT LIST"]
     for x in st.get("setups") or []:
         lines.append(f"  #{x.get('id')} {x.get('bar')} {x.get('side')} {x.get('raw')} "
@@ -479,8 +578,15 @@ def text_summary(st: dict) -> str:
                 f"{_int(s.get('tracked'))} · +1R first {_int(s.get('worked'))} · stopped "
                 f"{_int(s.get('stopped'))} · precision "
                 f"{_fmt(s.get('precision'), 1)}%")
+    stats = st.get("stats") or {}
     rows.append(f"avg MFE {_fmt(s.get('avg_mfe_r'))}R · avg mark {_fmt(s.get('avg_eod_r'))}R "
-                f"· {_int((st.get('stats') or {}).get('candles'))} candles screened")
+                f"· {_int(stats.get('candles'))} candles screened")
+    if stats.get("age_max") is not None:
+        rows.append(f"timing: median {_int(_median(stats.get('ages')))}s · worst "
+                    f"{_int(stats.get('age_max'))}s after the close · "
+                    f"{_int(stats.get('provisional'))} provisional, "
+                    f"{_int(stats.get('confirmed'))} confirmed, "
+                    f"{_int(stats.get('cancelled'))} cancelled")
     top = sorted((st.get("setups") or []), key=lambda x: -(x.get("mfe_r") or 0))[:3]
     if top:
         rows.append("best: " + " · ".join(
