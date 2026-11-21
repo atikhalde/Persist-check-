@@ -1,0 +1,90 @@
+# Is bot 4 wired correctly? — a one-button check, no live session needed.
+#
+# The failure this exists for: a secret added under the wrong name, or as a
+# *variable* instead of a secret, resolves to an empty string, and the first
+# anyone knows of it is a setup that never arrives. This job checks the two
+# values, sends one text to bot 4's chat, uploads one real audit PDF, and fails
+# loudly if any of it does not work.
+#
+# Nothing here touches bots 1/2/3: it only ever calls telegram.send_bot4 and
+# send_document(..., bot=4).
+#
+# Required secrets: TELEGRAM_BOT_TOKEN_4, TELEGRAM_CHAT_ID_4
+#
+# Run it: Actions → "Bot 4 check" → Run workflow. It is also safe to run while
+# the live scan is going — it sends two messages and exits.
+
+name: Bot 4 check
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only check that the secrets arrived; send nothing to Telegram"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -q -r requirements.txt
+
+      - name: What will actually run (bot 4's knobs)
+        env:
+          SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          SCREEN_EARLY: ${{ vars.SCREEN_EARLY || '1' }}
+          SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
+          SCREEN_MIN_SCORE: ${{ vars.SCREEN_MIN_SCORE || '55' }}
+          SCREEN_PERSIST_MIN: ${{ vars.SCREEN_PERSIST_MIN || '78' }}
+          SCREEN_SLOPE_MIN: ${{ vars.SCREEN_SLOPE_MIN || '0' }}
+          SCREEN_SLOPE_BARS: ${{ vars.SCREEN_SLOPE_BARS || '3' }}
+          SCREEN_STRUCTURE_MIN: ${{ vars.SCREEN_STRUCTURE_MIN || '60' }}
+          SCREEN_STRENGTH_MIN: ${{ vars.SCREEN_STRENGTH_MIN || '55' }}
+          SCREEN_LEAD_MAX: ${{ vars.SCREEN_LEAD_MAX || '2.0' }}
+          SCREEN_RUN_MAX_R: ${{ vars.SCREEN_RUN_MAX_R || '5.0' }}
+          SCREEN_NEAR_HIGH_PCT: ${{ vars.SCREEN_NEAR_HIGH_PCT || '0.20' }}
+          SCREEN_COUNTER_PERSIST: ${{ vars.SCREEN_COUNTER_PERSIST || '90' }}
+          SCREEN_CAP_PER_SECTOR: ${{ vars.SCREEN_CAP_PER_SECTOR || '2' }}
+          SCREEN_COOLDOWN_MIN: ${{ vars.SCREEN_COOLDOWN_MIN || '45' }}
+          SCREEN_LAST_ENTRY: ${{ vars.SCREEN_LAST_ENTRY || '14:30' }}
+        run: |
+          python - <<'PY'
+          from nse_scanner import knobs, screen
+          print("repository variables in this run:")
+          for name, value in sorted(screen.knobs().items()):
+              print(f"  {name} = {value}")
+          for line in knobs.describe():
+              print(line)
+          PY
+
+      - name: Bot 4 credentials, one text, one PDF
+        env:
+          TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
+          TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
+          SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          SCREEN_EARLY: ${{ vars.SCREEN_EARLY || '1' }}
+          SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python -m nse_scanner bot4-check
+
+      - name: Audit PDF (kept as an artifact even if the upload fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot4-audit-preview
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
