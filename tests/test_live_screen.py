@@ -13,8 +13,6 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest import mock
 
-import pandas as pd
-
 import test_screen as base
 from nse_scanner import live_screen, screen
 from nse_scanner.session import to_ist
@@ -176,6 +174,39 @@ class ClosePassTests(unittest.TestCase):
         self.assertIn("MARUTI", sent[0])
         bot1.assert_not_called()
 
+    def test_a_dry_run_does_not_send_its_update_lines(self):
+        """DRY_RUN=1 posted CONFIRMED/CANCELLED to bot 4 before this test existed."""
+        frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12)}
+        st = screen.fresh("2026-11-20")
+        posted = []
+        with mock.patch.dict(os.environ, {"DRY_RUN": "1"}), \
+                mock.patch.object(screen, "load", return_value=st), \
+                mock.patch.object(screen, "save"), \
+                mock.patch.object(screen, "updates", return_value=["CONFIRMED #1"]), \
+                mock.patch.object(live_screen.telegram, "send_bot4",
+                                  side_effect=lambda t, **k: posted.append((t, k)) or True):
+            live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                   last=base.candle(11))
+        self.assertTrue(posted, "the update line should still be attempted")
+        for _text, kwargs in posted:
+            self.assertIs(kwargs.get("dry_run"), True, "a dry run must not post")
+
+    def test_the_fetch_budget_is_the_strongest_books(self):
+        fresh = {"AUTO": {"side": 1, "bull": 92, "bear": 8, "persist_bull": 92,
+                          "persist_bear": 8, "day_ret": 3.1, "intra_ret": 0.4,
+                          "qualified": True}}
+        uni = {"nifty": "^NSEI", "vix": "^INDIAVIX", "sectors": {}}
+        for i, persist in enumerate((99, 95, 90, 88, 85, 82, 80)):
+            code = f"S{i}"
+            fresh[code] = {"side": 1, "bull": persist, "bear": 100 - persist,
+                           "persist_bull": persist, "persist_bear": 100 - persist,
+                           "day_ret": 2.0, "intra_ret": 0.3, "qualified": True}
+            uni["sectors"][code] = {"index": f"^X{i}", "stocks": [f"N{i}"]}
+        got = live_screen.sectors_to_fetch(uni, read(sectors=fresh), {},
+                                           limit=live_screen.EARLY_SECTORS)
+        self.assertEqual(len(got), 3)
+        self.assertEqual(got[0], "S0")          # strongest persistence first
+
     def test_a_failed_pass_never_takes_the_loop_down(self):
         with mock.patch.object(screen, "load", side_effect=RuntimeError("corrupt ledger")):
             out = live_screen.close_pass(uni=UNI, md=read(), frames={},
@@ -201,23 +232,101 @@ class EndOfSessionTests(unittest.TestCase):
 
 
 class WaitForBarTests(unittest.TestCase):
-    def _frame(self, last):
-        return {UNI["nifty"]: pd.DataFrame(
-            {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [1.0], "Volume": [0]},
-            index=[to_ist(last)])}
-
     def test_a_published_bar_is_judged_at_once(self):
         last = base.candle(11)
-        with mock.patch.object(live_screen, "index_frames",
-                               return_value=(self._frame(last), {})):
+        with mock.patch.object(live_screen, "_nifty_last", return_value=to_ist(last)) as poll:
             self.assertTrue(live_screen.wait_for_bar(UNI, last, deadline_s=0))
+        poll.assert_called_once()
 
     def test_an_unpublished_bar_is_skipped_not_guessed(self):
         last = base.candle(11)
-        stale = self._frame(base.candle(10))
-        with mock.patch.object(live_screen, "index_frames", return_value=(stale, {})), \
+        with mock.patch.object(live_screen, "_nifty_last",
+                               return_value=to_ist(base.candle(10))), \
                 mock.patch.object(live_screen.time, "sleep"):
             self.assertFalse(live_screen.wait_for_bar(UNI, last, deadline_s=0))
+
+    def test_polling_asks_for_one_symbol_not_the_whole_tape(self):
+        """Thirteen symbols per poll, every 5s, for two minutes is not a poll."""
+        with mock.patch.object(live_screen.data, "fetch_many",
+                               return_value={UNI["nifty"]: base.rising(20_000, 2, 12)}) as f:
+            live_screen._nifty_last(UNI)
+        self.assertEqual(f.call_args[0][0], [UNI["nifty"]])
+
+
+class _Stop(Exception):
+    """End the scripted loop from inside its own sleep."""
+
+
+class LoopScheduleTests(unittest.TestCase):
+    """The clock: what runs, when, and what must not run while bot 1 is alive."""
+
+    def run_loop(self, *, alive, start, sleeps=6):
+        clock = SimpleNamespace(t=start)
+        calls = {"early": [], "close": [], "eod": 0, "announce": []}
+
+        def sleep_until(target):
+            clock.t = max(clock.t, target)
+            calls.setdefault("sleeps", []).append(target.strftime("%H:%M:%S"))
+            if len(calls["sleeps"]) >= sleeps:
+                raise _Stop
+
+        # should_screen returns (do_it, why): a live 5m scan means "stand down".
+        with mock.patch.object(live_screen, "now_ist", side_effect=lambda: clock.t), \
+                mock.patch.object(live_screen, "_sleep_until", side_effect=sleep_until), \
+                mock.patch.object(live_screen, "should_screen",
+                                  side_effect=lambda **_k: (not alive,
+                                                            "5m run is alive" if alive
+                                                            else "no 5m run")), \
+                mock.patch.object(live_screen, "early_pass",
+                                  side_effect=lambda f, **_k: calls["early"].append(
+                                      f.strftime("%H:%M")) or []), \
+                mock.patch.object(live_screen, "close_pass",
+                                  side_effect=lambda **_k: calls["close"].append(
+                                      _k.get("last").strftime("%H:%M"))
+                                  or {"bar": None, "candidates": 0, "surfaced": [], "setups": 0}), \
+                mock.patch.object(live_screen, "wait_for_bar", return_value=True), \
+                mock.patch.object(live_screen, "end_of_session",
+                                  side_effect=lambda **_k: calls.__setitem__("eod", calls["eod"] + 1)), \
+                mock.patch.object(live_screen, "_announce",
+                                  side_effect=lambda why: calls["announce"].append(why)), \
+                mock.patch.object(live_screen.data, "load_universe", return_value=UNI), \
+                mock.patch.object(live_screen.data, "enable_daily_cache"), \
+                mock.patch("nse_scanner.knobs.describe", return_value=[]):
+            try:
+                reason = live_screen.live_loop_screen(exit_at_close=False)
+            except _Stop:
+                reason = "scripted"
+        return SimpleNamespace(reason=reason, calls=calls, clock=clock)
+
+    def test_a_live_5m_scan_gets_every_candle_and_bot_4_does_nothing(self):
+        run = self.run_loop(alive=True, start=DAY.replace(hour=9, minute=9, second=30))
+        self.assertEqual(run.calls["early"], [])
+        self.assertEqual(run.calls["close"], [])
+        self.assertEqual(run.calls["announce"], [])
+        self.assertGreaterEqual(len(run.calls["sleeps"]), 3)
+
+    def test_a_dead_5m_scan_gets_the_provisional_card_a_minute_early(self):
+        run = self.run_loop(alive=False, start=DAY.replace(hour=9, minute=9, second=30))
+        # the 09:15 candle: provisional pass at 09:19 for 09:15, close pass at 09:20
+        self.assertEqual(run.calls["early"][:1], ["09:15"])
+        self.assertEqual(run.calls["close"][:1], ["09:15"])
+        self.assertIn("09:19:00", run.calls["sleeps"])
+        self.assertIn("09:20:10", run.calls["sleeps"])   # close + POLL_GRACE_SECONDS
+        self.assertTrue(run.calls["announce"], "the takeover is announced")
+
+    def test_a_dead_scan_keeps_screening_candle_after_candle(self):
+        run = self.run_loop(alive=False, start=DAY.replace(hour=9, minute=9, second=30),
+                            sleeps=10)
+        self.assertGreater(len(run.calls["close"]), 1)
+        self.assertEqual(run.calls["close"], sorted(run.calls["close"]))
+
+    def test_the_hello_line_is_sent_once_per_ledger(self):
+        """Restarting the loop must not greet bot 4 on every run of the day."""
+        with mock.patch.object(live_screen.telegram, "send_bot4", return_value=True) as send:
+            live_screen._announce("no 5m scan run is active")
+            live_screen._announce("no 5m scan run is active")
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(send.call_args[0][0].startswith("🎯 Bot 4 screen is live"))
 
 
 class LoopContractTests(unittest.TestCase):

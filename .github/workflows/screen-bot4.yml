@@ -146,7 +146,17 @@ jobs:
           TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
           TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
           DRY_RUN: ${{ inputs.send && '0' || '1' }}
-        run: python -m nse_scanner screen-pdf ${{ inputs.session && format('--session {0}', inputs.session) || '' }}
+          # Passed as an environment variable, not spliced into the command line:
+          # one fewer expression to expand, and the step can be run by hand.
+          SESSION: ${{ inputs.session }}
+        run: |
+          set -euo pipefail
+          SESSION="${SESSION:-}"
+          if [ -n "$SESSION" ]; then
+            python -m nse_scanner screen-pdf --session "$SESSION"
+          else
+            python -m nse_scanner screen-pdf
+          fi
 
       - name: Keep the rebuilt audit
         if: ${{ always() && inputs.action == 'audit-pdf' }}

@@ -145,11 +145,22 @@ def skeleton(uni: dict, md, st4: dict) -> dict:
                         for code, spec in (uni.get("sectors") or {}).items()}}
 
 
-def sectors_to_fetch(uni: dict, md, st4: dict) -> list[str]:
+#: How many qualifying sectors' names are fetched per pass. The gates usually pass
+#: none or one; a broad tape can pass eight. Every extra book is fifteen symbols to
+#: download, so the two passes take the strongest sectors first — the same 3 the 5m
+#: loop's early pass fetches, and 6 at the close where there is a candle of slack.
+#: The cap is the one place bot 4 can differ from bot 1: on a tape with more than
+#: six qualifying books, a name in the seventh can surface in bot 1 and not here.
+EARLY_SECTORS = 3
+CLOSE_SECTORS = 6
+
+
+def sectors_to_fetch(uni: dict, md, st4: dict, *, limit: int | None = None) -> list[str]:
     """Which sectors' names are worth a fetch this candle, strongest first."""
     slots = skeleton(uni, md, st4)
     slopes = screen._slopes(st4, slots)
-    return [code for code, _, _ in screen.ready_sectors(slots, md, slopes=slopes)]
+    return [code for code, _, _ in screen.ready_sectors(slots, md, slopes=slopes,
+                                                       limit=limit)]
 
 
 def payload_for(uni: dict, md, frames: dict, last) -> dict:
@@ -181,6 +192,20 @@ def last_closed(now: datetime | None = None) -> datetime:
                         microsecond=0) - timedelta(minutes=BAR_MINUTES))
 
 
+def _nifty_last(uni: dict):
+    """The newest bar on the Nifty's feed — one symbol, so polling stays cheap."""
+    try:
+        df = data.fetch_many([uni["nifty"]], "7d", "5m").get(uni["nifty"])
+    except Exception:                       # noqa: BLE001 — a poll may fail, retry
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    try:
+        return to_ist(df.index[-1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def wait_for_bar(uni: dict, last, *, deadline_s: float | None = None) -> bool:
     """Poll until the index feed carries the bar ``last``. ``False`` = it never came.
 
@@ -190,12 +215,10 @@ def wait_for_bar(uni: dict, last, *, deadline_s: float | None = None) -> bool:
     """
     deadline = now_ist() + timedelta(seconds=deadline_s if deadline_s is not None
                                       else PUBLISH_WAIT_S)
+    want = to_ist(last)
     while True:
-        m5, _ = index_frames(uni)
-        nifty = m5.get(uni["nifty"])
-        fresh = (nifty is not None and not nifty.empty
-                 and to_ist(nifty.index[-1]) == to_ist(last))
-        if fresh:
+        got = _nifty_last(uni)
+        if got is not None and got == want:
             return True
         if now_ist() >= deadline:
             log.warning("bot 4: the %s bar was not published before the deadline — "
@@ -222,13 +245,16 @@ def close_pass(*, send=None, save=None, now: datetime | None = None,
         if md is None or frames is None:
             uni = uni or data.load_universe()
             md, _, _ = analyse(uni, last=last)
-            wanted = sectors_to_fetch(uni, md, st4)
+            wanted = sectors_to_fetch(uni, md, st4, limit=CLOSE_SECTORS)
             frames = name_frames(uni, wanted) if wanted else {}
         payload = payload_for(uni, md, frames, last)
         surfaced = screen.consider(st4, payload, frames, md, last, send=send,
                                    save_state=save, now=now)
+        # `consider` passes dry_run itself, but these update lines are sent here:
+        # without it, DRY_RUN=1 would still post CONFIRMED/CANCELLED to bot 4.
+        dry = screen._dry()
         for text in screen.updates(st4):
-            if send(text):
+            if (send(text, dry_run=dry) if send is telegram.send_bot4 else send(text)):
                 save(st4)
         return {"bar": payload.get("b"), "candidates": len(surfaced),
                 "surfaced": surfaced, "setups": len(st4.get("setups") or [])}
@@ -251,7 +277,7 @@ def early_pass(forming, *, send=None, now: datetime | None = None) -> list[dict]
         # and the forming candle has no published sector index row to read.
         prev = to_ist(forming) - timedelta(minutes=BAR_MINUTES)
         md, _, _ = analyse(uni, last=prev)
-        wanted = sectors_to_fetch(uni, md, st4)
+        wanted = sectors_to_fetch(uni, md, st4, limit=EARLY_SECTORS)
         if not wanted:
             log.info("bot 4 early %s: no sector passes the gates — nothing to project",
                      to_ist(forming).strftime("%H:%M"))

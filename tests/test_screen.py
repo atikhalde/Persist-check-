@@ -688,6 +688,31 @@ class PdfTests(ScreenCase):
         st["setups"][0]["mark"] = 10_500
         return st
 
+    def test_the_cli_refuses_to_audit_a_ledger_with_no_candle(self):
+        with patch.object(screen, "load", return_value=screen.fresh("2026-11-20")):
+            self.assertEqual(screen_pdf._cli(), 1)
+
+    def test_the_cli_builds_the_audit_for_a_ledger_that_has_one(self):
+        st = self.report_state()
+        with patch.object(screen, "load", return_value=st), \
+                patch.dict(os.environ, {"DRY_RUN": "1"}):
+            self.assertEqual(screen_pdf._cli(), 0)
+
+    def test_a_ledger_with_the_old_sector_shape_still_prints_a_pdf(self):
+        """Board artifacts live 30 days; a re-sent audit must not degrade to text.
+
+        The tape is a list of per-candle rows today. An older ledger held one flat
+        dict, and ``sorted(... for row in secs ...)`` raised on it — the whole audit
+        then fell back to plain text because of the *shape* of one key.
+        """
+        st = self.report_state()
+        st["sectors"] = {name: cell
+                         for row in st.get("sectors") or []
+                         for name, cell in (row.get("sec") or {}).items()}
+        out = screen_pdf.build(st, Path(self.tmp.name) / "audit-old.pdf")
+        self.assertEqual(out.suffix, ".pdf")
+        self.assertEqual(out.read_bytes()[:5], b"%PDF-")
+
     def test_the_pdf_is_written_and_is_a_pdf(self):
         st = self.report_state()
         out = screen_pdf.build(st, Path(self.tmp.name) / "audit.pdf")
