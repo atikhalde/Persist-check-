@@ -169,6 +169,21 @@ def _holdout(st: dict) -> list[tuple[str, str]]:
 
 
 # ── the document ─────────────────────────────────────────────────────────────
+def sector_rows(st: dict) -> list[dict]:
+    """The sector tape as rows of ``{"b": hhmm, "sec": {sector: cell}}``.
+
+    The console rebuilds audits from board artifacts up to thirty days old, and a
+    ledger written by an earlier version of the screen may hold the tape as one
+    flat dict instead of a list of per-candle rows. Either way the report is worth
+    printing: an audit that silently degrades to plain text because of the *shape*
+    of a key is worse than an audit with one sampled column.
+    """
+    secs = st.get("sectors") or []
+    if isinstance(secs, dict):
+        return [{"b": str(st.get("session") or ""), "sec": secs}]
+    return [row for row in secs if isinstance(row, dict)]
+
+
 def build(st: dict | None = None, path: Path | None = None) -> Path:
     """Write the audit PDF for ``st`` and return where it landed. Never raises."""
     st = st or {}
@@ -453,7 +468,7 @@ def _write_pdf(st: dict, path: Path) -> None:
     # ── sector tape ──────────────────────────────────────────────────────────
     flow.append(CondPageBreak(60 * mm))
     flow.append(Paragraph("8 · Sector tape (persistence, slope, side)", sty["h"]))
-    secs = st.get("sectors") or []
+    secs = sector_rows(st)
     if not secs:
         flow.append(Paragraph("No sector rows recorded.", sty["body"]))
     else:
@@ -617,6 +632,14 @@ def report(st: dict | None = None, *, send=None, send_doc=None, dry_run: bool = 
 def _cli(session: str | None = None) -> int:
     """``python -m nse_scanner screen-pdf`` — re-run a missed send, or print the path."""
     st = screen.load()
+    stats = st.get("stats") or {}
+    if not (st.get("setups") or stats.get("candles")):
+        # An audit of nothing is not an audit: on a runner this means the board
+        # artifact carried no state/screen_state.json, and sending bot 4 a PDF of
+        # empty tables would look like a broken screen rather than a missing file.
+        print("No screen ledger with a candle in it — nothing to audit. On a runner "
+              "this means the board artifact had no state/screen_state.json.")
+        return 1
     if session and str(st.get("session") or "") != session:
         log.warning("state holds session %s, not %s — reporting what is there",
                     st.get("session"), session)
