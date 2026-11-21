@@ -9,6 +9,7 @@
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
   python -m nse_scanner screen            # bot 4: screen the last closed candle once
   python -m nse_scanner screen-pdf        # re-send bot 4's audit PDF for today
+  python -m nse_scanner bot4-check        # prove bot 4's secrets work, end to end
 """
 
 from __future__ import annotations
@@ -47,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
     p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest",
                                     "early-check", "dual", "live-dual", "sector-follow",
-                                    "live-sector-follow", "screen", "screen-pdf"],
+                                    "live-sector-follow", "screen", "screen-pdf",
+                                    "bot4-check"],
                    help="once | live | once-1m | live-1m | doctor | backtest | early-check | "
                         "dual | live-dual | sector-follow | live-sector-follow | screen | screen-pdf")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
@@ -151,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         for s in out:
             print(f"  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
         return 0
+    if args.cmd == "bot4-check":
+        return _bot4_check(dry_run=args.dry_run)
     if args.cmd == "screen":
         out = run_screen_once()
         if out["bar"]:
@@ -207,6 +211,72 @@ def main(argv: list[str] | None = None) -> int:
     if out:  # lets the workflow start a successor only on a planned handover
         with open(out, "a", encoding="utf-8") as fh:
             fh.write(f"handoff={'true' if reason == 'budget' else 'false'}\n")
+    return 0
+
+
+def _mask(value: str) -> str:
+    """Say whether a secret arrived, never what it is."""
+    if not value:
+        return "MISSING"
+    return f"set ({len(value)} chars, {value[:3]}…{value[-3:]})"
+
+
+def _bot4_check(*, dry_run: bool = False, send=None, send_doc=None) -> int:
+    """Prove the bot-4 channel works end to end, without needing a live session.
+
+    The failure this exists for: a secret added under the wrong name, or as a
+    *variable* instead of a secret, resolves to an empty string — and the first
+    anyone knows of it is a setup that never arrives. So this checks the two
+    values, sends one text, uploads one real PDF, and exits non-zero on any of it.
+    """
+    from . import screen, screen_pdf, telegram
+    from .session import now_ist
+
+    send = send or telegram.send_bot4
+    send_doc = send_doc or telegram.send_document
+    token, chat = telegram.fourth_config_from_env()
+    print(f"IST now: {now_ist():%Y-%m-%d %H:%M:%S}")
+    print(f"TELEGRAM_BOT_TOKEN_4: {_mask(token)}")
+    print(f"TELEGRAM_CHAT_ID_4:   {_mask(chat)}")
+    print(f"bot 4 screen: {'on' if screen.screen_enabled() else 'off'} · early pass "
+          f"{'on' if screen.early_enabled() else 'off'} · {screen.max_day()}/day · "
+          f"persist >= {screen.persist_min():.0f} · structure >= "
+          f"{screen.structure_min():.0f} · strength >= {screen.strength_min():.0f}")
+    if not token or not chat:
+        print("\nFAILED: bot 4 has no credentials, so nothing can be sent.", file=sys.stderr)
+        print("Add BOTH as repository secrets (Settings → Secrets and variables → "
+              "Actions → Secrets, not Variables):", file=sys.stderr)
+        print("  TELEGRAM_BOT_TOKEN_4 = the token @BotFather gave the bot-4 bot",
+              file=sys.stderr)
+        print("  TELEGRAM_CHAT_ID_4   = the chat the bot-4 bot posts into "
+              "(the bot must be a member)", file=sys.stderr)
+        return 2
+    if dry_run:
+        print("\nDRY-RUN: not calling Telegram; the credentials are present.")
+        return 0
+
+    text = ("🤖 <b>Bot 4 check</b> — this is the screen's own channel.\n"
+            "If you can read this, setups will reach you here.\n"
+            "Next scheduled pass: the 5m live scan, "
+            "starting with the pre-close provisional card.")
+    if not send(text):
+        print("\nFAILED: Telegram refused the text. A wrong token fails here; a wrong "
+              "chat id fails as \"chat not found\" or \"bot is not a member of the "
+              "chat\".", file=sys.stderr)
+        return 3
+    print("\ntext: delivered to bot 4")
+
+    state = screen.load()
+    out = screen_pdf.report(state, send_doc=lambda path, caption, **kw: send_doc(
+        path, caption, bot=4))
+    print(f"pdf:  {out['path']} ({Path(out['path']).stat().st_size} bytes) · uploaded="
+          f"{out['sent']}")
+    if not out["sent"]:
+        print("\nFAILED: the PDF was built but not delivered — sendDocument and "
+              "sendMessage can fail independently (file too large, or the token lacks "
+              "the right chat).", file=sys.stderr)
+        return 4
+    print("\nOK: bot 4's credentials, text and document upload all work.")
     return 0
 
 
