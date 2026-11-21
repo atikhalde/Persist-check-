@@ -150,6 +150,19 @@ def _grid_offset(last: datetime) -> int:
 
 
 # ── the sweep ───────────────────────────────────────────────────────────────
+#: The frames of the most recent successful sweep, kept for the name-first screen
+#: (bot 4). The board fetches the whole universe to score it; the screen judges the
+#: same names on the same candle, so re-fetching them would double the network cost
+#: of every candle and hand the screen *different* bars from the ones the board
+#: counted. Replaced (never appended) so nothing outlives its candle.
+_LAST_FRAMES: dict = {}
+
+
+def last_frames() -> dict:
+    """The frames the last successful sweep scored — for readers of the same candle."""
+    return _LAST_FRAMES
+
+
 def sweep(st: dict | None = None, *, now: datetime | None = None,
           frames: dict | None = None) -> dict | None:
     """Score the whole board on the candle that just closed. ``None`` = not now.
@@ -205,6 +218,8 @@ def sweep(st: dict | None = None, *, now: datetime | None = None,
         if missing:
             known.update(data.fetch_many(missing, board_period(), "5m"))
         frames = known
+        _LAST_FRAMES.clear()
+        _LAST_FRAMES.update(frames)
         secs, names, stale = _score(frames, uni, row, last)
         elapsed = round(time.monotonic() - started, 2)
         meta["names"] = meta.get("names", 0) + names

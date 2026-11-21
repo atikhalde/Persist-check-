@@ -7,6 +7,8 @@
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
+  python -m nse_scanner screen            # bot 4: screen the last closed candle once
+  python -m nse_scanner screen-pdf        # re-send bot 4's audit PDF for today
 """
 
 from __future__ import annotations
@@ -43,7 +45,11 @@ def _setup_log(level: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     p = argparse.ArgumentParser(prog="nse_scanner", description="NIFTY sector + 5m stock Telegram scanner")
-    p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest", "early-check", "dual", "live-dual", "sector-follow", "live-sector-follow"], help="once | live | once-1m | live-1m | doctor | backtest | early-check | dual | live-dual | sector-follow | live-sector-follow")
+    p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest",
+                                    "early-check", "dual", "live-dual", "sector-follow",
+                                    "live-sector-follow", "screen", "screen-pdf"],
+                   help="once | live | once-1m | live-1m | doctor | backtest | early-check | "
+                        "dual | live-dual | sector-follow | live-sector-follow | screen | screen-pdf")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
@@ -55,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lead", type=int, default=60,
                    help="early-check: seconds before the 5m close at which the forming candle is judged")
     p.add_argument("--date", default="2026-10-01", help="backtest session YYYY-MM-DD (IST)")
+    p.add_argument("--session", default=None,
+                   help="screen-pdf: only report this session YYYY-MM-DD")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     args = p.parse_args(argv)
     if args.backfill and not args.dry_run:
@@ -143,6 +151,19 @@ def main(argv: list[str] | None = None) -> int:
         for s in out:
             print(f"  {s['name']:12} {s['symbol']:12} {s['side']:4} {s['price']} @ {s['time']}")
         return 0
+    if args.cmd == "screen":
+        out = run_screen_once()
+        if out["bar"]:
+            print(f"{out['bar']}  qualified {out['candidates']}  surfaced "
+                  f"{len(out['surfaced'])}  ledger {out['setups']} setup(s)")
+            for s_ in out["surfaced"]:
+                print(f"  {s_['side']:4} {s_['name']:12} {s_['sector']:8} "
+                      f"entry {s_['entry']} sl {s_['sl']} score {s_['score']}  (not an entry)")
+        return 0 if out["bar"] else 1
+    if args.cmd == "screen-pdf":
+        from .screen_pdf import _cli as _screen_pdf_cli
+
+        return _screen_pdf_cli(args.session)
     if args.cmd == "early-check":
         from datetime import date as _date
         from .early_check import render, run
@@ -189,6 +210,62 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run_screen_once() -> dict:
+    """One bot-4 pass on the last closed candle — the diagnostic twin of the hook.
+
+    Same board sweep, same frames, same gates as the live loop; it simply does not
+    wait for the loop. Entries are impossible here by construction: the screen only
+    ever sends a setup card, and the market side is read from the board's own tilt
+    (the screen treats the index as a feature, never as a caller of the market).
+    """
+    from types import SimpleNamespace
+
+    from . import screen, telegram
+    from .board import bars, last_frames, sweep
+    from .session import now_ist, to_ist
+
+    now = now_ist()
+    payload = sweep(now=now)
+    if payload is None:
+        from .scan1m import load_ledger      # the board reads bot 1's own ledger
+
+        book = bars(load_ledger())
+        payload = book[-1] if book else None
+    if not payload:
+        print("screen: no board candle to screen (outside 09:20-15:15, already swept, "
+              "or the scan never wrote sector numbers for this candle)")
+        return {"bar": None, "candidates": 0, "surfaced": [], "setups": 0}
+
+    frames = last_frames() or {}
+    hhmm = str(payload.get("b"))
+    last = None
+    for df in frames.values():
+        if df is None or getattr(df, "empty", True):
+            continue
+        hit = [ts for ts in df.index if to_ist(ts).strftime("%H:%M") == hhmm]
+        if hit:
+            last = to_ist(hit[-1])
+            break
+    if last is None:
+        print(f"screen: no frame holds the {hhmm} candle — nothing to judge "
+              "(run this while the live loop is up)")
+        return {"bar": None, "candidates": 0, "surfaced": [], "setups": 0}
+
+    st4 = screen.load()
+    tape = (st4.get("market") or [{}])[-1]
+    md = SimpleNamespace(dir_state=int(payload.get("tilt") or tape.get("side") or 0),
+                         dir_label=tape.get("label") or "",
+                         dir_conf=tape.get("conf"),
+                         regime=tape.get("regime") or "")
+    surfaced = screen.consider(st4, payload, frames, md, last, send=telegram.send_bot4)
+    for text in screen.updates(st4):
+        if telegram.send_bot4(text, dry_run=os.environ.get("DRY_RUN", "0") == "1"):
+            screen.save(st4)
+    last_row = (st4.get("scan") or [{}])[-1]
+    return {"bar": hhmm, "candidates": last_row.get("cands", 0), "surfaced": surfaced,
+            "setups": len(st4.get("setups") or [])}
+
+
 def _doctor() -> int:
     from . import data, telegram
     from .session import now_ist
@@ -214,6 +291,22 @@ def _doctor() -> int:
               "set" if third_token and third_chat else "INCOMPLETE — set both _3 values")
     else:
         print("Telegram bot 3 (1m scan): not configured (live-1m prints instead of sending)")
+    fourth_token, fourth_chat = telegram.fourth_config_from_env()
+    if fourth_token or fourth_chat:
+        print("Telegram bot 4 (screen):",
+              "set" if fourth_token and fourth_chat else "INCOMPLETE — set both _4 values")
+    else:
+        print("Telegram bot 4 (screen): not configured (setups print instead of sending)")
+    from . import screen as _screen
+    print(f"bot 4 screen (early pass {'on' if _screen.early_enabled() else 'off'}): "
+          f"{'on' if _screen.screen_enabled() else 'off'} · "
+          f"max {_screen.max_day()}/day · score >= {_screen.min_score():.0f} · "
+          f"persist >= {_screen.persist_min():.0f} (slope >= {_screen.slope_min():.0f} over "
+          f"{_screen.slope_bars()}) · structure >= {_screen.structure_min():.0f} · "
+          f"strength >= {_screen.strength_min():.0f} · |lead| <= {_screen.lead_max():.1f}pp · "
+          f"run <= {_screen.run_max_r():.1f}R · counter-trend persist >= "
+          f"{_screen.counter_persist():.0f} · {_screen.cap_per_sector()}/sector · "
+          f"cooldown {_screen.cooldown_min()}m · last setup {_screen.last_entry()}")
     from .scan1m import cancel_message, first_minute, market_source
     fm = first_minute()
     source = market_source()
