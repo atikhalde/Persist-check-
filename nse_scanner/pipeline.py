@@ -2098,6 +2098,11 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                 dual_key = f"{alt} {'long' if alt_side == 1 else 'short'}, dual"
                 book[dual_key] = book.get(dual_key, 0) + 1
 
+    # Bot 4 first: its card is stamped with the feed's delay, not with this scan's.
+    # It fetches for itself, so a WAIT day screens too — and nothing below waits on it.
+    if not allow_stale:
+        _screen_pass(md, last, uni)
+
     # market / sector change alerts
     prev_m = st.get("market") or {}
     prev_s = st.get("sector") or {}
@@ -2429,103 +2434,74 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # The whole board for this candle, after every alert of it has gone out. Its
     # own ledger, so it costs nothing to skip when the knob is off.
     try:
-        from .board import last_frames, sweep as _board_sweep
+        from .board import sweep as _board_sweep
 
         payload = _board_sweep(st, frames=sm5)
         if payload is not None:
             _save(st)
-            # Bot 4 screens the very same candle the board just scored, on the very
-            # same frames — no second fetch, and no candle the scan has not closed.
-            # It has its own ledger and its own channel: nothing here can touch the
-            # sends of bots 1/2/3, and the user is told what qualifies, not what to buy.
-            _screen_candle(payload, last_frames() or sm5, md, last)
+            # The board record itself (reports/board-*.jsonl, for replay). Bot 4's
+            # screen ran at the top of this cycle, before any of the work above.
+            log.debug("board record for %s: %d sector(s)", payload.get("b"),
+                      len(payload.get("sectors") or {}))
     except Exception:                       # noqa: BLE001 — never cost a candle
         log.exception("board sweep failed")
     return result
 
 
 def _screen_early(bar: datetime) -> None:
-    """Bot 4's pre-close pass: a PROVISIONAL card on the still-forming 5m candle.
+    """Bot 4's pre-close pass — one implementation, shared with its own loop.
 
-    The close pass cannot be on time by construction: the 5m bar closes at :15,
-    Yahoo publishes it tens of seconds later, and the loop confirms after that — so
-    a card that "describes 10:15" lands after 10:16 with the price already gone.
-    Here the screen judges the forming candle ``EARLY_ALERT_SECONDS`` before its
-    close, on the same rebuilt-from-1m bar bots 1 and 3 already use
+    The provisional card is the answer to *late*: a 5m candle closes at 10:15, Yahoo
+    publishes it tens of seconds later, so a card that "describes 10:15" would land
+    after the price moved. The screen therefore judges the **forming** candle
+    ``EARLY_ALERT_SECONDS`` before its close, on the bar rebuilt from 1m prints
     (``data.provisional_5m``, which refuses a stale feed rather than guessing).
 
-    Only the sectors that already pass the gates are fetched — their persistence is
-    read from the last **closed** board candle, because a sector's persistence is a
-    slow measure and that is exactly why it works as a gate. At most three sectors,
-    strongest first: a fetch budget at T-60s is a real constraint.
+    This used to be its own copy of the logic, reading the previous closed *board*
+    candle from bot 1's ledger. Two things were wrong with that: the board only
+    exists when the engine had a pick (so a WAIT day produced no provisional cards
+    at all), and it was a second implementation of the same gates. It now delegates
+    to ``live_screen.early_pass``, which reads the market for itself — the same code
+    the failover loop runs, so the two hosts cannot drift.
     """
-    from . import board as _board
-    from . import screen
-    from .scan1m import load_ledger
-
-    if not screen.screen_enabled() or not screen.early_enabled():
-        return
-    now = now_ist()
-    hhmm = bar.strftime("%H:%M")
     try:
-        st1 = state.reset_if_new_day(load_ledger(), str(now.date()))
-        book = _board.bars(st1)
-        payload = book[-1] if book else None
-        if not payload:
-            log.info("bot 4 early %s: no closed board candle to project from — skipped", hhmm)
+        from . import live_screen, screen
+
+        if not screen.screen_enabled() or not screen.early_enabled():
             return
-        scan = st1.get("scan") or {}
-        md = SimpleNamespace(dir_label=scan.get("label") or "",
-                             dir_conf=scan.get("conf"),
-                             dir_state=int(scan.get("side") or payload.get("tilt") or 0),
-                             pick_sector=scan.get("sector") or payload.get("pick") or "",
-                             regime=scan.get("regime") or "")
-        st4 = screen.load()
-        sectors = screen.ready_sectors(payload, md, slopes=screen._slopes(st4, payload), limit=3)
-        names = list(dict.fromkeys(raw for _, cell, _ in sectors
-                                   for raw in (cell.get("n") or [])))
-        if not names:
-            log.info("bot 4 early %s: no sector passes the gates — nothing to project", hhmm)
-            return
-        tickers = {data.yahoo_stock(raw): raw for raw in names}
-        sm5 = data.fetch_many(tickers, "7d", "5m")
-        sm1 = data.fetch_many(tickers, "7d", "1m")
-        frames = {}
-        for sym in tickers:
-            df = data.provisional_5m(sm5.get(sym), sm1.get(sym), bar, now, _early_max_stale())
-            if df is not None:
-                frames[sym] = df
-        if not frames:
-            log.warning("bot 4 early %s: no live 1m data for %d name(s) — no provisional "
-                        "card (the feed is too delayed to project honestly)",
-                        hhmm, len(tickers))
-            return
-        sent = screen.provisional(st4, payload, frames, md, bar,
-                                  send=telegram.send_bot4, now=now)
-        log.info("bot 4 early %s: %d sector(s), %d/%d name(s) with live 1m data, "
-                 "%d provisional card(s), %.0fs before the close",
-                 hhmm, len(sectors), len(frames), len(tickers), len(sent),
-                 ((bar + timedelta(minutes=5)) - now_ist()).total_seconds())
+        live_screen.early_pass(bar)
     except Exception:                       # noqa: BLE001 — never cost a candle
-        log.exception("bot 4 early pass failed at %s", hhmm)
+        log.exception("bot 4 early pass failed")
 
 
-def _screen_candle(payload: dict, frames: dict, md, last: datetime) -> None:
-    """Run the name-first screen (bot 4) on one closed candle. Never raises."""
-    from . import screen
+def _screen_pass(md, last: datetime, uni: dict) -> None:
+    """Run bot 4's screen pass NOW — before this cycle plans anything for bots 1/2.
 
-    if not screen.screen_enabled():
-        return
+    Two things were wrong with running it at the end of the cycle, and both were
+    delay the user could see:
+
+    * it sat behind the whole scan — the 1m settle check, the OI read, every name's
+      fire test and every alert of bots 1/2 — so a card that describes 10:15 was
+      stamped with however long that took;
+    * ``run_once`` returns at the WAIT branch before fetching a single name, so on a
+      day the market engine had no pick, a *name-first* screen never ran at all.
+
+    So the screen goes first, and it fetches for itself (``live_screen.close_pass``)
+    instead of borrowing the engine's board. Same functions, same gates, same ledger:
+    the only thing that changed is when, and that it no longer depends on the pick.
+    """
     try:
-        st4 = screen.load()
-        screen.consider(st4, payload, frames, md, last, send=telegram.send_bot4)
-        for text in screen.updates(st4):
-            if telegram.send_bot4(text, dry_run=_dry()):
-                screen.save(st4)
-            else:
-                log.warning("bot 4 refused a setup update; it will be retried next candle")
+        from . import live_screen, screen
+
+        if not screen.screen_enabled():
+            return
+        out = live_screen.close_pass(uni=uni, md=md, last=last)
+        log.info("bot 4 %s: %d candidate(s), %d card(s) · feed +%.1fs · screen %.0fms",
+                 out.get("bar") or to_ist(last).strftime("%H:%M"), out.get("candidates", 0),
+                 len(out.get("surfaced") or []), float(out.get("feed_s") or 0.0),
+                 1000.0 * float(out.get("screen_s") or 0.0))
     except Exception:                       # noqa: BLE001 — the screen is not the scan
-        log.exception("screen (bot 4) failed at %s", payload.get("b"))
+        log.exception("screen (bot 4) failed at %s", to_ist(last).strftime("%H:%M"))
 
 
 def run_until_ready(*, expected_bar: datetime | None = None, force_sector: str | None = None) -> dict:

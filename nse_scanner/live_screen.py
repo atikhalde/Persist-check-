@@ -216,6 +216,7 @@ def wait_for_bar(uni: dict, last, *, deadline_s: float | None = None) -> bool:
     deadline = now_ist() + timedelta(seconds=deadline_s if deadline_s is not None
                                       else PUBLISH_WAIT_S)
     want = to_ist(last)
+    step = poll_s()
     while True:
         got = _nifty_last(uni)
         if got is not None and got == want:
@@ -225,28 +226,101 @@ def wait_for_bar(uni: dict, last, *, deadline_s: float | None = None) -> bool:
                         "this candle is skipped and counted as missed, never judged on "
                         "an older bar", to_ist(last).strftime("%H:%M"))
             return False
-        time.sleep(5)
+        time.sleep(step)
+
+
+def name_wait_s() -> float:
+    """``SCREEN_NAME_WAIT_S`` (8): how long to wait for the names' closed bar.
+
+    The index bar and the stock bars do not publish at the same instant. Judging on
+    the first bar that arrives would screen one name out of fifteen; waiting for a
+    fixed timer would add seconds to every candle. So: poll once a second, return as
+    soon as every fetched name carries the bar, and after this many seconds judge
+    what the feed actually has (the rest are counted stale in the ledger and the PDF).
+    """
+    try:
+        return max(0.0, min(60.0, float(os.environ.get("SCREEN_NAME_WAIT_S", "8"))))
+    except ValueError:
+        return 8.0
+
+
+def poll_s() -> float:
+    """``SCREEN_POLL_SECONDS`` (1): how often a wait re-asks the feed."""
+    try:
+        return max(0.2, min(10.0, float(os.environ.get("SCREEN_POLL_SECONDS", "1"))))
+    except ValueError:
+        return 1.0
+
+
+def _fresh_names(frames: dict, last) -> int:
+    """How many of these frames end on the candle being judged."""
+    want, n = to_ist(last), 0
+    for df in (frames or {}).values():
+        if df is None or getattr(df, "empty", True):
+            continue
+        try:
+            if to_ist(df.index[-1]) == want:
+                n += 1
+        except (TypeError, ValueError, IndexError):
+            continue
+    return n
+
+
+def name_frames_when_ready(uni: dict, sectors: list[str], last, *,
+                           budget_s: float | None = None) -> dict:
+    """The names' frames, polled until every one carries the closed bar or the
+    budget runs out — whichever comes first."""
+    budget = name_wait_s() if budget_s is None else budget_s
+    deadline = now_ist() + timedelta(seconds=budget)
+    frames = name_frames(uni, sectors, last=last)
+    if not frames:
+        return frames
+    while _fresh_names(frames, last) < len(frames) and now_ist() < deadline:
+        time.sleep(poll_s())
+        frames = name_frames(uni, sectors, last=last)
+    return frames
+
+
+def _already_judged(st4: dict, hhmm: str) -> bool:
+    """Has this candle been screened? A retry must not judge (or card) it twice."""
+    rows = st4.get("scan") or []
+    return bool(rows) and str((rows[-1] or {}).get("b") or "") == str(hhmm)
 
 
 def close_pass(*, send=None, save=None, now: datetime | None = None,
-               last=None, uni: dict | None = None, md=None, frames: dict | None = None) -> dict:
+               last=None, uni: dict | None = None, md=None, frames: dict | None = None,
+               wait_for_names: bool = True) -> dict:
     """Judge the closed candle and settle the provisional card it named.
 
-    ``md``/``frames``/``uni`` are for a caller that already has them (the tests, and
-    the CLI's single pass); by default everything is fetched here, which is what the
-    loop does.
+    This is the **one** screen pass, called by both hosts: the 5m loop immediately
+    after its market read (before it plans anything for bots 1/2), and bot 4's own
+    failover loop. It owns its own fetches, so it never waits for — or depends on —
+    which sectors the 5m engine happened to pick, including on a WAIT day, where the
+    engine fetches nothing at all.
+
+    ``frames``/``md``/``uni`` are for a caller that already has them (the tests, and
+    the CLI's single pass).
     """
     send = send or telegram.send_bot4
     save = save or screen.save
     now = now or now_ist()
     last = last or last_closed(now)
+    closed_at = to_ist(last) + timedelta(minutes=BAR_MINUTES)
     try:
         st4 = screen.load()
+        hhmm = to_ist(last).strftime("%H:%M")
+        if _already_judged(st4, hhmm):
+            log.info("bot 4 %s: already screened this candle — nothing to do", hhmm)
+            return {"bar": hhmm, "candidates": 0, "surfaced": [], "setups": 0,
+                    "skipped": True}
         if md is None or frames is None:
             uni = uni or data.load_universe()
             md, _, _ = analyse(uni, last=last)
             wanted = sectors_to_fetch(uni, md, st4, limit=CLOSE_SECTORS)
-            frames = name_frames(uni, wanted) if wanted else {}
+            frames = (name_frames_when_ready(uni, wanted, last)
+                      if wanted and wait_for_names
+                      else name_frames(uni, wanted) if wanted else {})
+        seen_at = now_ist()
         payload = payload_for(uni, md, frames, last)
         surfaced = screen.consider(st4, payload, frames, md, last, send=send,
                                    save_state=save, now=now)
@@ -256,12 +330,41 @@ def close_pass(*, send=None, save=None, now: datetime | None = None,
         for text in screen.updates(st4):
             if (send(text, dry_run=dry) if send is telegram.send_bot4 else send(text)):
                 save(st4)
+        done_at = now_ist()
+        note_latency(st4, last, seen_at, done_at, len(frames),
+                     _fresh_names(frames, last), save=save)
         return {"bar": payload.get("b"), "candidates": len(surfaced),
-                "surfaced": surfaced, "setups": len(st4.get("setups") or [])}
+                "surfaced": surfaced, "setups": len(st4.get("setups") or []),
+                "feed_s": round((seen_at - closed_at).total_seconds(), 2),
+                "screen_s": round((done_at - seen_at).total_seconds(), 3)}
     except Exception:                       # noqa: BLE001 — never take the loop down
         log.exception("bot 4 close pass failed for %s",
                       to_ist(last).strftime("%H:%M") if last is not None else "?")
         return {"bar": None, "candidates": 0, "surfaced": [], "setups": 0}
+
+
+def note_latency(st4: dict, last, seen_at: datetime, done_at: datetime,
+                 frames: int, fresh: int, *, save=None) -> None:
+    """Record this candle's latency in the two parts that can be fixed separately.
+
+    ``feed`` is how long after the close the bars reached the feed — Yahoo's, and
+    nobody else's. ``screen`` is what happened between the bars being in hand and the
+    cards being sent — ours, and the only part a code change can shorten. A single
+    "11s after the close" cannot tell those apart, which is how a scanner talks
+    itself into believing it is fast.
+    """
+    stats = st4.setdefault("stats", {})
+    feed = max(0.0, (seen_at - (to_ist(last) + timedelta(minutes=BAR_MINUTES))).total_seconds())
+    work = max(0.0, (done_at - seen_at).total_seconds())
+    stats.setdefault("feed_s", []).append(round(feed, 2))
+    stats.setdefault("work_s", []).append(round(work, 3))
+    del stats["feed_s"][:-130]
+    del stats["work_s"][:-130]
+    stats["names_stale"] = max(0, int(frames) - int(fresh))
+    if save is not None:
+        save(st4)
+    log.info("bot 4 %s: feed +%.1fs · screen %.0fms · %d name(s) still stale",
+             to_ist(last).strftime("%H:%M"), feed, work * 1000.0, stats["names_stale"])
 
 
 def early_pass(forming, *, send=None, now: datetime | None = None) -> list[dict]:
@@ -335,10 +438,13 @@ def _lead() -> int:
 
 
 def _grace() -> int:
+    """Seconds after the close before the first ask. 1 by default: the loop polls
+    from the first second (``wait_for_bar``) instead of sleeping a fixed grace and
+    then finding the bar had been there for nine of them."""
     try:
-        return max(0, min(120, int(os.environ.get("POLL_GRACE_SECONDS", "10"))))
+        return max(0, min(120, int(os.environ.get("POLL_GRACE_SECONDS", "1"))))
     except ValueError:
-        return 10
+        return 1
 
 
 def _sleep_until(target: datetime) -> None:

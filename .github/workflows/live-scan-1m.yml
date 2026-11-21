@@ -231,6 +231,10 @@ jobs:
           SCREEN_FAILOVER: ${{ vars.SCREEN_FAILOVER || '1' }}
           SCREEN_PERIOD: ${{ vars.SCREEN_PERIOD || '7d' }}
           SCREEN_PUBLISH_WAIT_S: ${{ vars.SCREEN_PUBLISH_WAIT_S || '120' }}
+          # How long bot 4 waits for the closed bars (polling once a second) before
+          # it judges what the feed has, and how often it re-asks.
+          SCREEN_NAME_WAIT_S: ${{ vars.SCREEN_NAME_WAIT_S || '8' }}
+          SCREEN_POLL_SECONDS: ${{ vars.SCREEN_POLL_SECONDS || '1' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also scan the leading sector on the other side of the pick.
