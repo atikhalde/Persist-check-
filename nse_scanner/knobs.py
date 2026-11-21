@@ -95,6 +95,7 @@ AUDITED: tuple[tuple[str, str], ...] = (
     ("SCREEN_CAP_PER_SECTOR", "2"),
     ("SCREEN_COOLDOWN_MIN", "45"),
     ("SCREEN_LAST_ENTRY", "14:30"),
+    ("SCREEN_FAILOVER", "1"),
 )
 
 
