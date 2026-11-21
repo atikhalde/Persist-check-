@@ -596,6 +596,87 @@ class TelegramBot4Tests(TestCase):
                 self.assertIn("t4", url)
 
 
+class Bot4CheckTests(ScreenCase):
+    """The one-button check has to fail *specifically*, or it is not a check.
+
+    Its whole job is to tell a missing secret apart from a wrong token apart from a
+    chat the bot is not a member of — so the exit code names the part, and no path
+    here may send anything when a credential is absent.
+    """
+
+    def check(self, *, token="t4", chat="c4", send=None, send_doc=None):
+        from nse_scanner.__main__ import _bot4_check
+
+        sent = []
+        docs = []
+
+        def fake_send(text, **kw):
+            sent.append(text)
+            return True if send is None else send
+
+        def fake_doc(path, caption, **kw):
+            docs.append((path, caption, kw))
+            return True if send_doc is None else send_doc
+
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_4": token,
+                                     "TELEGRAM_CHAT_ID_4": chat}, clear=False):
+            code = _bot4_check(send=fake_send, send_doc=fake_doc)
+        return code, sent, docs
+
+    def test_a_missing_credential_sends_nothing_at_all(self):
+        for token, chat in (("", "c4"), ("t4", ""), ("", "")):
+            with self.subTest(token=token, chat=chat):
+                code, sent, docs = self.check(token=token, chat=chat)
+                self.assertEqual(code, 2)
+                self.assertEqual(sent, [])
+                self.assertEqual(docs, [])
+
+    def test_a_working_channel_sends_one_text_and_one_pdf(self):
+        code, sent, docs = self.check()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Bot 4 check", sent[0])
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0][2].get("bot"), 4)          # never bots 1/2
+        self.assertTrue(Path(docs[0][0]).exists())
+
+    def test_a_refused_text_is_not_reported_as_a_working_channel(self):
+        code, sent, docs = self.check(send=False)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(docs, [])                          # the PDF is not attempted
+
+    def test_a_refused_document_is_its_own_failure(self):
+        code, sent, docs = self.check(send_doc=False)
+        self.assertEqual(code, 4)
+        self.assertEqual(len(docs), 1)
+
+    def test_dry_run_proves_the_secrets_without_touching_telegram(self):
+        from nse_scanner.__main__ import _bot4_check
+
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_4": "t4",
+                                     "TELEGRAM_CHAT_ID_4": "c4"}, clear=False):
+            code = _bot4_check(dry_run=True, send=lambda *a, **k: self.fail("sent"),
+                               send_doc=lambda *a, **k: self.fail("uploaded"))
+        self.assertEqual(code, 0)
+
+    def test_the_check_never_prints_a_secret(self):
+        from nse_scanner.__main__ import _bot4_check
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN_4": "123456:SUPERSECRET",
+                                     "TELEGRAM_CHAT_ID_4": "-1001234567890"}, clear=False):
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                _bot4_check(dry_run=True)
+        out = buf.getvalue()
+        self.assertNotIn("SUPERSECRET", out)
+        self.assertNotIn("-1001234567890", out)
+        self.assertIn("set (", out)
+
+
 class PdfTests(ScreenCase):
     def report_state(self) -> dict:
         frames = {data.yahoo_stock("MARUTI"): rising(10_000, 40, 12)}
