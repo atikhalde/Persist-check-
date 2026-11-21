@@ -1,0 +1,159 @@
+# Bot 4's console: see what the screen did, and re-send its audit on demand.
+#
+# WHERE BOT 4 ACTUALLY RUNS
+# The screen is not a second market engine — it is a *view over the same board*
+# the 5m scan already scores (every name of every sector, on every candle). So it
+# runs inside "NSE 5m live scan", three times per candle cycle:
+#
+#   * 60s before each close  -> _screen_early()  : the PROVISIONAL card
+#   * right after the close  -> _screen_candle() : the CONFIRMED/CANCELLED line
+#   * at 15:33              -> _screen_report()  : the audit PDF
+#
+# It has its own channel (TELEGRAM_BOT_TOKEN_4 / TELEGRAM_CHAT_ID_4), its own
+# ledger (state/screen_state.json) and its own artifacts, but only ONE copy of the
+# sector numbers — two engines would mean two truths about the same candle.
+#
+# WHAT THIS WORKFLOW IS FOR
+# The loop's state and board record live on the runner; when a session's audit did
+# not go out (loop died before 15:33, Telegram refused a part, the job hit its
+# budget), this rebuilds it from the newest saved board artifact and re-sends it.
+# It is also how you look at what the screen did without reading a long log.
+#
+# Run it: Actions -> "NSE screen · bot 4" -> Run workflow.
+# Required secrets: TELEGRAM_BOT_TOKEN_4, TELEGRAM_CHAT_ID_4 (only for audit-pdf).
+
+name: NSE screen · bot 4
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "status = what the screen did · audit-pdf = rebuild and re-send the EOD audit"
+        type: choice
+        options: [status, audit-pdf]
+        default: status
+      send:
+        description: "audit-pdf: actually send it to bot 4 (off = build it and keep it as an artifact)"
+        type: boolean
+        default: true
+      session:
+        description: "Optional session YYYY-MM-DD to look for (default: the newest board record)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read      # list and download this repository's own board artifacts
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -q -r requirements.txt
+
+      - name: Find the newest board record
+        id: board
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.session }}
+        run: |
+          set -euo pipefail
+          WANT="${WANT:-}"          # an unset input is "" (the newest board), not an error
+          # board-<session>-<run>-<attempt> from the 5m loop; board-1m-* is bot 3's.
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" > /tmp/artifacts.json
+          pick=$(python3 - "$WANT" <<'PY'
+          import json, sys
+          want = sys.argv[1].strip()
+          arts = [a for a in json.load(open("/tmp/artifacts.json")).get("artifacts", [])
+                  if not a.get("expired")
+                  and a["name"].startswith("board-2")
+                  and not a["name"].startswith("board-1m-")
+                  and (not want or want in a["name"])]
+          arts.sort(key=lambda a: a["created_at"], reverse=True)
+          a = arts[0] if arts else None
+          print(f'{a["id"]} {a["name"]} {a["created_at"]}' if a else "")
+          PY
+          )
+          if [ -z "$pick" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No board artifact found. The 5m loop uploads one at the end of every"
+            echo "run since the archiving landed; before that there is no record to"
+            echo "rebuild from — which is the case until the first session after it."
+            exit 0
+          fi
+          ID=$(echo "$pick" | cut -d' ' -f1)
+          NAME=$(echo "$pick" | cut -d' ' -f2)
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Using artifact $NAME (id $ID)"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" > /tmp/board.zip
+          unzip -q -o /tmp/board.zip -d .
+          ls -la state reports 2>/dev/null | head -20
+
+      - name: What the screen did
+        if: ${{ inputs.action == 'status' }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from nse_scanner import screen, screen_pdf
+
+          path = screen.STATE_PATH
+          if not Path(path).exists():
+              raise SystemExit("No screen ledger in this run's board record — the "
+                               "screen had not written a candle yet.")
+          st = screen.load()
+          s = screen.summary(st)
+          stats = st.get("stats") or {}
+          print(f"session      {st.get('session')}")
+          print(f"config       {screen_pdf.config_hash(st)}")
+          print(f"candles      {stats.get('candles')} screened · "
+                f"{stats.get('candidates')} candidate name-candles")
+          print(f"short list   {s.get('setups')} setup(s) · {s.get('tracked')} tracked · "
+                f"{s.get('worked')} reached +1R first · {s.get('stopped')} stopped · "
+                f"precision {s.get('precision')}%")
+          print(f"timing       median {screen_pdf._median(stats.get('ages'))}s · "
+                f"worst {stats.get('age_max')}s after the close · {stats.get('late', 0)} "
+                f"past 90s · {stats.get('provisional', 0)} provisional / "
+                f"{stats.get('confirmed', 0)} confirmed / {stats.get('cancelled', 0)} cancelled")
+          for x in st.get("setups") or []:
+              print(f"  #{x.get('id')} {x.get('bar')} {x.get('side'):4} "
+                    f"{x.get('raw'):12} {x.get('sector'):8} entry {x.get('entry')} "
+                    f"sl {x.get('sl')} score {x.get('score')} · "
+                    f"{screen_pdf._timing(x)} · {x.get('status')} "
+                    f"MFE {x.get('mfe_r')}R MAE {x.get('mae_r')}R")
+          for x in st.get("cancelled") or []:
+              print(f"  (cancelled) #{x.get('id')} {x.get('bar')} {x.get('raw')} — "
+                    f"{x.get('why_close')}")
+          print("\nrefusals, gate by gate:")
+          for gate, n in sorted((stats.get("refused") or {}).items(),
+                                key=lambda kv: -kv[1]):
+              print(f"  {n:5d}  {gate}")
+          print(f"\nknobs in force (frozen at the open): {st.get('knobs')}")
+          PY
+
+      - name: Rebuild and re-send the audit PDF
+        if: ${{ inputs.action == 'audit-pdf' && steps.board.outputs.found == 'true' }}
+        env:
+          TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
+          TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
+          DRY_RUN: ${{ inputs.send && '0' || '1' }}
+        run: python -m nse_scanner screen-pdf ${{ inputs.session && format('--session {0}', inputs.session) || '' }}
+
+      - name: Keep the rebuilt audit
+        if: ${{ always() && inputs.action == 'audit-pdf' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen-audit-resend-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 30
