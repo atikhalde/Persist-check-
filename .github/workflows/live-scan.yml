@@ -306,6 +306,23 @@ jobs:
           path: state/scan_state.json
           key: nse-scan-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # ── The day's raw record, kept so the screen can be REPLAYED ──────────────
+      # reports/board-<session>-<bot>.jsonl is every name of every sector, ranked,
+      # on every candle — the only input a replay of bot 4 (or of any rule change)
+      # needs to reproduce a day exactly. It lives on the runner and used to die
+      # with it, which is why 18-20 Nov cannot be re-run. Kept for 30 days, one
+      # artifact per run, so a handover does not overwrite the earlier half-day.
+      - name: Keep the day's board record (for replay)
+        if: ${{ always() && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: board-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/
+            state/screen_state.json
+          if-no-files-found: warn
+          retention-days: 30
+
       # Only after the state is saved: the successor's guard waits for this run
       # to finish, then restores exactly this snapshot.
       - name: Hand over to a fresh run
