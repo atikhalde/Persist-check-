@@ -17,7 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from nse_scanner import scan1m, screen, screen_pdf, state
+from types import SimpleNamespace
+
+from nse_scanner import live_screen, scan1m, screen, screen_pdf, state
 
 
 @pytest.fixture(autouse=True)
@@ -28,4 +30,19 @@ def _no_repository_ledgers(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(screen, "STATE_PATH", tmp_path / "screen_state.json")
     monkeypatch.setattr(scan1m, "LEDGER", tmp_path / "scan1m_state.json")
     monkeypatch.setattr(screen_pdf, "REPORT_DIR", tmp_path / "reports")
+
+    # The screen pass now runs at the TOP of every 5m cycle, before bots 1/2 do
+    # anything — so every existing test of that cycle would otherwise reach Yahoo
+    # through it. An empty market read means the pass does its real work on an
+    # empty tape: no network, no sends, and the wiring is still exercised.
+    def empty_read(uni, *, last=None):
+        from nse_scanner.session import to_ist
+
+        return (SimpleNamespace(dir_state=0, dir_label="", dir_conf=0, regime="",
+                                pick_sector="", sectors={},
+                                bar_time=to_ist(last).strftime("%H:%M") if last else ""),
+                {}, {})
+
+    monkeypatch.setattr(live_screen, "analyse", empty_read)
+    monkeypatch.setattr(live_screen, "name_frames", lambda *a, **k: {})
     yield

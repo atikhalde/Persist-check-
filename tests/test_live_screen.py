@@ -215,6 +215,110 @@ class ClosePassTests(unittest.TestCase):
         self.assertEqual(out["candidates"], 0)
 
 
+class OnePassPerCandleTests(unittest.TestCase):
+    """The screen runs at the top of the 5m cycle and on a retry — never twice."""
+
+    def test_the_same_candle_is_not_judged_twice(self):
+        frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12)}
+        st = screen.fresh("2026-11-20")
+        sent = []
+        with mock.patch.object(screen, "load", return_value=st), \
+                mock.patch.object(screen, "save"), \
+                mock.patch.object(live_screen.telegram, "send_bot4",
+                                  side_effect=lambda t, **k: sent.append(t) or True):
+            first = live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                           last=base.candle(11))
+            second = live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                            last=base.candle(11))
+        self.assertEqual(len(first["surfaced"]), 1)
+        self.assertTrue(second.get("skipped"))
+        self.assertEqual(second["surfaced"], [])
+        self.assertEqual(len(sent), 1, "the retry carded the same name again")
+
+    def test_the_next_candle_is_judged_again(self):
+        st = screen.fresh("2026-11-20")
+        frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 13)}
+        with mock.patch.object(screen, "load", return_value=st), \
+                mock.patch.object(screen, "save"), \
+                mock.patch.object(live_screen.telegram, "send_bot4", return_value=True):
+            live_screen.close_pass(uni=UNI, md=read(), frames=frames, last=base.candle(11))
+            second = live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                            last=base.candle(12))
+        self.assertFalse(second.get("skipped"))
+
+
+class NameWaitTests(unittest.TestCase):
+    """The index bar and the stock bars publish at different moments."""
+
+    def test_it_polls_until_the_names_carry_the_closed_bar(self):
+        stale, fresh = base.rising(10_000, 8, 11), base.rising(10_000, 8, 12)
+        calls = []
+
+        def fetch(uni, sectors, *, last=None):
+            calls.append(1)
+            return {base.data.yahoo_stock("MARUTI"): (fresh if len(calls) >= 3 else stale)}
+
+        with mock.patch.object(live_screen, "name_frames", side_effect=fetch), \
+                mock.patch.object(live_screen.time, "sleep"):
+            frames = live_screen.name_frames_when_ready(UNI, ["AUTO"], base.candle(11))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(live_screen._fresh_names(frames, base.candle(11)), 1)
+
+    def test_the_wait_is_bounded(self):
+        stale = base.rising(10_000, 8, 11)
+        calls = []
+        with mock.patch.object(live_screen, "name_frames",
+                               side_effect=lambda *a, **k: calls.append(1) or
+                               {base.data.yahoo_stock("MARUTI"): stale}), \
+                mock.patch.object(live_screen.time, "sleep"):
+            live_screen.name_frames_when_ready(UNI, ["AUTO"], base.candle(11), budget_s=0)
+        self.assertEqual(len(calls), 1, "a zero budget must not poll at all")
+
+    def test_a_stale_name_is_counted_not_ignored(self):
+        st = screen.fresh("2026-11-20")
+        last = base.candle(11)
+        seen = to_ist(last) + timedelta(minutes=5, seconds=1.4)
+        live_screen.note_latency(st, last, seen, seen + timedelta(milliseconds=250),
+                                 15, 14, save=None)
+        self.assertEqual(st["stats"]["feed_s"][-1], 1.4)
+        self.assertAlmostEqual(st["stats"]["work_s"][-1], 0.25, places=2)
+        self.assertEqual(st["stats"]["names_stale"], 1)
+
+
+class FactoryWiringTests(unittest.TestCase):
+    """Where in the 5m cycle the screen runs, and that it does not need a pick."""
+
+    def test_it_runs_before_the_engine_plans_anything(self):
+        from nse_scanner import pipeline
+        import inspect
+
+        src = inspect.getsource(pipeline.run_once)
+        call = src.index("_screen_pass(md, last, uni)")
+        self.assertLess(call, src.index("format_market(md"), "the market alert is sent first")
+        self.assertLess(call, src.index('md.pick_sector == "WAIT"'),
+                        "a WAIT day returns before the screen runs")
+        self.assertLess(call, src.index("sm1 = data.fetch_many"),
+                        "the screen waits for the 1m fetch")
+
+    def test_a_wait_day_still_screens(self):
+        from nse_scanner import pipeline
+
+        md = SimpleNamespace(dir_state=0, dir_label="WAIT", dir_conf=0, regime="",
+                             pick_sector="WAIT", sectors={})
+        with mock.patch.object(live_screen, "close_pass",
+                               return_value={"bar": "10:10", "candidates": 0,
+                                             "surfaced": [], "feed_s": 1.0,
+                                             "screen_s": 0.1}) as cp:
+            pipeline._screen_pass(md, base.candle(11), UNI)
+        cp.assert_called_once()
+
+    def test_a_screen_failure_never_reaches_the_scan(self):
+        from nse_scanner import pipeline
+
+        with mock.patch.object(live_screen, "close_pass", side_effect=RuntimeError("boom")):
+            pipeline._screen_pass(read(), base.candle(11), UNI)   # must not raise
+
+
 class EndOfSessionTests(unittest.TestCase):
     def test_a_running_scan_reports_the_audit_itself(self):
         with mock.patch.object(live_screen, "should_screen",
@@ -311,7 +415,11 @@ class LoopScheduleTests(unittest.TestCase):
         self.assertEqual(run.calls["early"][:1], ["09:15"])
         self.assertEqual(run.calls["close"][:1], ["09:15"])
         self.assertIn("09:19:00", run.calls["sleeps"])
-        self.assertIn("09:20:10", run.calls["sleeps"])   # close + POLL_GRACE_SECONDS
+        # close + POLL_GRACE_SECONDS, and POLL_GRACE_SECONDS is 1: the loop asks at
+        # :20:01 and polls, instead of sleeping ten seconds and finding the bar had
+        # been there for nine of them.
+        self.assertIn("09:20:01", run.calls["sleeps"])
+        self.assertNotIn("09:20:10", run.calls["sleeps"])
         self.assertTrue(run.calls["announce"], "the takeover is announced")
 
     def test_a_dead_scan_keeps_screening_candle_after_candle(self):

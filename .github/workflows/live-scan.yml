@@ -189,8 +189,11 @@ jobs:
           TRADE_CAPITAL: ${{ vars.TRADE_CAPITAL || '100000' }}
           # An early print older than this is never shown as live (README: 100).
           EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
-          # Seconds after the close before the confirmed scan asks Yahoo.
-          POLL_GRACE_SECONDS: "10"
+          # Seconds after the close before the confirmed scan asks Yahoo. 2, not
+          # 10: bot 4's screen now runs at the TOP of the cycle, so this sleep was
+          # the floor under a card's age — ten seconds of ours on top of the feed's.
+          # Bot 1 loses nothing: _run_until_ready retries at 5s inside the deadline.
+          POLL_GRACE_SECONDS: "2"
           # Right after the close a candle is judged only once the stock's feed
           # shows a print at/after the close; after this many seconds regardless.
           BAR_SETTLE_SECONDS: "45"
@@ -277,6 +280,10 @@ jobs:
           SCREEN_FAILOVER: ${{ vars.SCREEN_FAILOVER || '1' }}
           SCREEN_PERIOD: ${{ vars.SCREEN_PERIOD || '7d' }}
           SCREEN_PUBLISH_WAIT_S: ${{ vars.SCREEN_PUBLISH_WAIT_S || '120' }}
+          # How long bot 4 waits for the closed bars (polling once a second) before
+          # it judges what the feed has, and how often it re-asks.
+          SCREEN_NAME_WAIT_S: ${{ vars.SCREEN_NAME_WAIT_S || '8' }}
+          SCREEN_POLL_SECONDS: ${{ vars.SCREEN_POLL_SECONDS || '1' }}
           # 1 = look the incumbent pick up in a per-bar log, so the early pass
           # cannot erase the candle before this one (pick cannot flip inside a
           # candle). Off: 17 Nov it would have held REALTY and lost BANKINDIA.

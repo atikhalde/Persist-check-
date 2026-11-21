@@ -124,6 +124,9 @@ jobs:
                 f"worst {stats.get('age_max')}s after the close · {stats.get('late', 0)} "
                 f"past 90s · {stats.get('provisional', 0)} provisional / "
                 f"{stats.get('confirmed', 0)} confirmed / {stats.get('cancelled', 0)} cancelled")
+          if screen_pdf.latency_split(st):
+              print(f"latency      {screen_pdf.latency_split(st)}   "
+                    f"(feed = Yahoo's, screen = ours)")
           for x in st.get("setups") or []:
               print(f"  #{x.get('id')} {x.get('bar')} {x.get('side'):4} "
                     f"{x.get('raw'):12} {x.get('sector'):8} entry {x.get('entry')} "

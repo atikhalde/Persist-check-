@@ -169,6 +169,28 @@ def _holdout(st: dict) -> list[tuple[str, str]]:
 
 
 # ── the document ─────────────────────────────────────────────────────────────
+def latency_split(st: dict) -> str:
+    """``feed +1.2s · screen 180ms`` — the two halves of "how late was the card".
+
+    The feed's half is Yahoo's and nobody can shorten it; the screen's half is ours.
+    Reporting only the sum invites the reader to blame the code for the feed — and to
+    believe the code is fast when it is not.
+    """
+    stats = st.get("stats") or {}
+    feed = _median(stats.get("feed_s") or [])
+    work = _median(stats.get("work_s") or [])
+    if feed is None and work is None:
+        return ""
+    parts = []
+    if feed is not None:
+        parts.append(f"feed +{feed:.1f}s")
+    if work is not None:
+        parts.append(f"screen {work * 1000.0:.0f}ms")
+    if stats.get("names_stale"):
+        parts.append(f"{int(stats['names_stale'])} name(s) still stale")
+    return " · ".join(parts)
+
+
 def sector_rows(st: dict) -> list[dict]:
     """The sector tape as rows of ``{"b": hhmm, "sec": {sector: cell}}``.
 
@@ -560,6 +582,8 @@ def _plain_text(st: dict) -> str:
               f"past 90s · {_int(stats.get('provisional'))} provisional / "
               f"{_int(stats.get('confirmed'))} confirmed / {_int(stats.get('cancelled'))} "
               "cancelled"]
+    if latency_split(st):                 # Yahoo's half and ours, never just the sum
+        lines += [f"  {latency_split(st)}"]
     lines += ["", "THE SHORT LIST"]
     for x in st.get("setups") or []:
         lines.append(f"  #{x.get('id')} {x.get('bar')} {x.get('side')} {x.get('raw')} "
@@ -602,6 +626,8 @@ def text_summary(st: dict) -> str:
                     f"{_int(stats.get('provisional'))} provisional, "
                     f"{_int(stats.get('confirmed'))} confirmed, "
                     f"{_int(stats.get('cancelled'))} cancelled")
+    if latency_split(st):
+        rows.append(f"latency: {latency_split(st)}")
     top = sorted((st.get("setups") or []), key=lambda x: -(x.get("mfe_r") or 0))[:3]
     if top:
         rows.append("best: " + " · ".join(

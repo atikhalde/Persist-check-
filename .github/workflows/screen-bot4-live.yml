@@ -181,12 +181,18 @@ jobs:
           LOG_LEVEL: INFO
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           EARLY_ALERT_SECONDS: "60"
-          POLL_GRACE_SECONDS: "10"
+          # 1s: the loop asks from the first second and polls once a second, so a
+          # card is stamped with the feed's delay — not with a timer of ours.
+          POLL_GRACE_SECONDS: "1"
           EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
           # 1 = stand down while "NSE 5m live scan" is running; 0 = always screen.
           SCREEN_FAILOVER: ${{ vars.SCREEN_FAILOVER || '1' }}
           SCREEN_PERIOD: ${{ vars.SCREEN_PERIOD || '7d' }}
           SCREEN_PUBLISH_WAIT_S: ${{ vars.SCREEN_PUBLISH_WAIT_S || '120' }}
+          # How long bot 4 waits for the closed bars (polling once a second) before
+          # it judges what the feed has, and how often it re-asks.
+          SCREEN_NAME_WAIT_S: ${{ vars.SCREEN_NAME_WAIT_S || '8' }}
+          SCREEN_POLL_SECONDS: ${{ vars.SCREEN_POLL_SECONDS || '1' }}
           SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
           SCREEN_EARLY: ${{ vars.SCREEN_EARLY || '1' }}
           SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
