@@ -7,6 +7,7 @@
   python -m nse_scanner doctor
   python -m nse_scanner once --dry-run --sector IT
   python -m nse_scanner early-check --date YYYY-MM-DD --sector IT
+  python -m nse_scanner live-screen       # bot 4: OWN loop, fails over from the 5m scan
   python -m nse_scanner screen            # bot 4: screen the last closed candle once
   python -m nse_scanner screen-pdf        # re-send bot 4's audit PDF for today
   python -m nse_scanner bot4-check        # prove bot 4's secrets work, end to end
@@ -49,9 +50,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("cmd", choices=["once", "live", "once-1m", "live-1m", "doctor", "backtest",
                                     "early-check", "dual", "live-dual", "sector-follow",
                                     "live-sector-follow", "screen", "screen-pdf",
-                                    "bot4-check"],
+                                    "live-screen", "screen-pass", "bot4-check"],
                    help="once | live | once-1m | live-1m | doctor | backtest | early-check | "
-                        "dual | live-dual | sector-follow | live-sector-follow | screen | screen-pdf")
+                        "dual | live-dual | sector-follow | live-sector-follow | screen | "
+                        "screen-pdf | live-screen | screen-pass")
     p.add_argument("--dry-run", action="store_true", help="print alerts, do not call Telegram")
     p.add_argument("--sector", default=None, help="force sector code (AUTO, IT, BANK, …)")
     p.add_argument("--backfill", action="store_true", help="diagnostic last-session scan; requires --dry-run")
@@ -164,6 +166,32 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {s_['side']:4} {s_['name']:12} {s_['sector']:8} "
                       f"entry {s_['entry']} sl {s_['sl']} score {s_['score']}  (not an entry)")
         return 0 if out["bar"] else 1
+    if args.cmd == "live-screen":
+        from .live_screen import live_loop_screen, should_screen
+
+        do, why = should_screen()
+        print(f"failover: {'screen' if do else 'stand down'} — {why}")
+        if not do:
+            return 0
+        out = live_loop_screen(max_minutes=args.max_minutes, exit_at_close=args.exit_at_close)
+        print(f"bot 4 loop ended: {out}")
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:  # same handover contract as `live` and `live-1m`
+            with open(gh_out, "a", encoding="utf-8") as fh:
+                fh.write(f"handoff={'true' if out == 'budget' else 'false'}\n")
+        return 0
+    if args.cmd == "screen-pass":
+        from .live_screen import close_pass
+
+        # --dry-run prints the card instead of sending it (no Telegram, no bot 4).
+        send = (lambda text, **_k: (print(text), True)[1]) if args.dry_run else None
+        out = close_pass(send=send)
+        print(f"{out['bar'] or '-'}  candidates {out['candidates']}  "
+              f"surfaced {len(out['surfaced'])}  ledger {out['setups']} setup(s)")
+        for s_ in out["surfaced"]:
+            print(f"  {s_['side']:4} {s_['name']:12} {s_['sector']:8} "
+                  f"entry {s_['entry']} sl {s_['sl']} score {s_['score']}  (not an entry)")
+        return 0
     if args.cmd == "screen-pdf":
         from .screen_pdf import _cli as _screen_pdf_cli
 

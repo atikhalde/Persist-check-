@@ -1,0 +1,238 @@
+# Bot 4's own loop — it screens when "NSE 5m live scan" is NOT running.
+#
+# WHY A SECOND WORKFLOW AT ALL
+# The screen first lived inside the 5m loop: 60s before each close, right after it,
+# 15:33 for the audit. That was one engine and one set of numbers, and it had one
+# fatal property — bot 4 died with bot 1. A short list that goes silent because the
+# 5m job hit its budget, crashed or was never started is indistinguishable from a
+# day with no setups, which is the worst way for a scanner to fail.
+#
+# WHY NOT ALWAYS SEPARATE
+# Two processes measuring persistence mostly agree and occasionally do not: a bar in
+# flight, a rounded digit. Both numbers are defensible, but a short list that quotes
+# two different ones for the same candle is worse than one that quotes one. So bot 4
+# does not compete — before every pass it asks the REST API whether a live-scan run
+# is active (live_screen.should_screen) and stands down when one is:
+#
+#   * 5m loop alive  -> bot 4 logs why and does nothing; bot 1 sends the cards and
+#                       the 15:33 audit exactly as before. One set of numbers.
+#   * 5m loop dead   -> bot 4 screens that candle itself, from its own market read:
+#                       run_market + board._score + screen + trade.plan_at, the same
+#                       functions in a separate process, its own ledger and channel.
+#
+# Detection is the API, not a shared file: the two workflows run on different
+# machines and every file they could share is written at the END of a run.
+#
+# NO BOT 1/2/3 TOKENS HERE. This workflow is given TELEGRAM_*_4 only, so it cannot
+# send to the other channels even by mistake. "NSE 5m live scan" and "NSE 1m
+# projected scan" are untouched by this file.
+#
+# SCREEN_FAILOVER=0 makes bot 4 always screen on its own read (fully independent,
+# two views) — set it as a repository variable if that is ever wanted.
+
+name: NSE screen · bot 4 — own loop
+run-name: ${{ inputs.dry_run && 'DRY RUN - NSE screen bot 4' || 'NSE screen · bot 4 — own loop' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      handoff:
+        description: "Planned takeover from a run that reached its time budget"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build the cards and print them instead of sending to bot 4"
+        type: boolean
+        default: false
+  schedule:
+    # Two minutes off the 5m job's grid, so this loop is awake before the first
+    # provisional pass (09:14:00 IST) and does not race the scan's own start.
+    - cron: "39 3 * * 1-5"          # 09:09 IST
+    - cron: "9,39 4-9 * * 1-5"      # 09:39 … 15:09 IST, every 30 min
+
+permissions:
+  contents: read
+  actions: write   # list runs (guard, failover check) and dispatch the successor
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Is a bot 4 loop already running?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          now=$(TZ=Asia/Kolkata date +%u%H%M)
+          dow=${now:0:1}; hm=$((10#${now:1}))
+          if [ "$dow" -gt 5 ] || [ "$hm" -lt 830 ] || [ "$hm" -ge 1533 ]; then
+            echo "outside NSE session (IST $now) - nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry run - starting next to any live loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          answered=false
+          for i in $(seq 1 24); do
+            busy=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/screen-bot4-live.yml/runs?per_page=40" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\" and .id < $GITHUB_RUN_ID and ((.display_title // \"\") | startswith(\"DRY RUN\") | not))] | length" || true)
+            if [ "$busy" = "0" ]; then
+              echo "no other bot 4 loop active - this run becomes the loop"
+              echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            if [ -n "$busy" ]; then answered=true; fi
+            sleep 5
+          done
+          if [ "$answered" = "false" ]; then
+            echo "could not list runs - starting; the concurrency group prevents a double loop"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "bot 4 loop already running ($busy older run active) - standing down"
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+  screen:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      group: nse-screen4${{ inputs.dry_run && '-dry' || '' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -q -r requirements.txt
+
+      - name: Repository variables in force
+        env:
+          REPO_VARS: ${{ toJSON(vars) }}
+        run: |
+          echo "repository variables: ${REPO_VARS}"
+          [ -n "${REPO_VARS}" ] || echo "none are set — every knob is at its workflow default"
+
+      - name: IST date
+        id: ist
+        run: echo "day=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Bot 4's own continuity, in its own key namespace so it can never hand the
+      # 5m loop a ledger without state/scan_state.json in it (a cache entry is
+      # immutable, and bot 1 restores "the newest key for today").
+      - name: Restore bot 4's ledger
+        if: ${{ !inputs.dry_run }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state/screen_state.json
+          key: nse-screen4-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nse-screen4-state-${{ steps.ist.outputs.day }}-
+            nse-screen4-state-
+
+      # First takeover of a session has no cache yet: start from the newest board
+      # record instead, so a candle bot 1 already judged is not judged (and sent)
+      # a second time. Same artifact the console reads; board-1m-* is bot 3's.
+      - name: Adopt the newest board record (first run of the day)
+        id: board
+        if: ${{ !inputs.dry_run && hashFiles('state/screen_state.json') == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A heredoc terminator cannot sit at column 0 inside a YAML block scalar,
+          # so the selection is jq on the saved JSON rather than inline python.
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" > /tmp/artifacts.json
+          pick=$(jq -r '
+            [ .artifacts[]
+              | select((.expired // false) | not)
+              | select(.name | startswith("board-2"))
+              | select((.name | startswith("board-1m-")) | not) ]
+            | sort_by(.created_at) | reverse | .[0] // empty | "\(.id) \(.name)"' \
+            /tmp/artifacts.json)
+          if [ -z "$pick" ]; then
+            echo "No board record yet — starting bot 4's ledger from empty. The card "
+            echo "guard (one name per day) is all that stands between this and a "
+            echo "duplicate card for a name bot 1 already surfaced."
+            exit 0
+          fi
+          ID=$(echo "$pick" | cut -d' ' -f1); NAME=$(echo "$pick" | cut -d' ' -f2)
+          echo "Adopting $NAME"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" > /tmp/board.zip
+          unzip -q -o /tmp/board.zip "state/screen_state.json" -d . || \
+            echo "that record has no screen ledger — starting from empty"
+          ls -l state/screen_state.json 2>/dev/null || true
+
+      - name: Bot 4 loop (own clock · stands down while the 5m scan runs)
+        id: screen
+        env:
+          # Bot 4's channel ONLY. Bots 1/2/3 are not reachable from this workflow.
+          TELEGRAM_BOT_TOKEN_4: ${{ secrets.TELEGRAM_BOT_TOKEN_4 }}
+          TELEGRAM_CHAT_ID_4: ${{ secrets.TELEGRAM_CHAT_ID_4 }}
+          # The failover asks the API whether a 5m run is active.
+          GITHUB_TOKEN: ${{ github.token }}
+          LOG_LEVEL: INFO
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          EARLY_ALERT_SECONDS: "60"
+          POLL_GRACE_SECONDS: "10"
+          EARLY_MAX_STALE_SECONDS: ${{ vars.EARLY_MAX_STALE_SECONDS || '100' }}
+          # 1 = stand down while "NSE 5m live scan" is running; 0 = always screen.
+          SCREEN_FAILOVER: ${{ vars.SCREEN_FAILOVER || '1' }}
+          SCREEN_PERIOD: ${{ vars.SCREEN_PERIOD || '7d' }}
+          SCREEN_PUBLISH_WAIT_S: ${{ vars.SCREEN_PUBLISH_WAIT_S || '120' }}
+          SCREEN_BOT: ${{ vars.SCREEN_BOT || '1' }}
+          SCREEN_EARLY: ${{ vars.SCREEN_EARLY || '1' }}
+          SCREEN_MAX_DAY: ${{ vars.SCREEN_MAX_DAY || '6' }}
+          SCREEN_MIN_SCORE: ${{ vars.SCREEN_MIN_SCORE || '55' }}
+          SCREEN_PERSIST_MIN: ${{ vars.SCREEN_PERSIST_MIN || '78' }}
+          SCREEN_SLOPE_MIN: ${{ vars.SCREEN_SLOPE_MIN || '0' }}
+          SCREEN_SLOPE_BARS: ${{ vars.SCREEN_SLOPE_BARS || '3' }}
+          SCREEN_STRUCTURE_MIN: ${{ vars.SCREEN_STRUCTURE_MIN || '60' }}
+          SCREEN_STRENGTH_MIN: ${{ vars.SCREEN_STRENGTH_MIN || '55' }}
+          SCREEN_LEAD_MAX: ${{ vars.SCREEN_LEAD_MAX || '2.0' }}
+          SCREEN_RUN_MAX_R: ${{ vars.SCREEN_RUN_MAX_R || '5.0' }}
+          SCREEN_NEAR_HIGH_PCT: ${{ vars.SCREEN_NEAR_HIGH_PCT || '0.20' }}
+          SCREEN_COUNTER_PERSIST: ${{ vars.SCREEN_COUNTER_PERSIST || '90' }}
+          SCREEN_CAP_PER_SECTOR: ${{ vars.SCREEN_CAP_PER_SECTOR || '2' }}
+          SCREEN_COOLDOWN_MIN: ${{ vars.SCREEN_COOLDOWN_MIN || '45' }}
+          SCREEN_LAST_ENTRY: ${{ vars.SCREEN_LAST_ENTRY || '14:30' }}
+        run: python -m nse_scanner live-screen --exit-at-close --max-minutes 170
+
+      - name: Validate bot 4's ledger
+        id: validate
+        if: ${{ always() && !inputs.dry_run && hashFiles('state/screen_state.json') != '' }}
+        run: python -c 'from nse_scanner.screen import load; load()'
+
+      - name: Save bot 4's ledger
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: state/screen_state.json
+          key: nse-screen4-state-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # What this loop saw, kept so a day it screened can be replayed without bot 1.
+      - name: Keep bot 4's record of this run
+        if: ${{ always() && !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen4-${{ steps.ist.outputs.day }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            state/screen_state.json
+            reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Hand over to a fresh run
+        if: ${{ steps.screen.outputs.handoff == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh workflow run screen-bot4-live.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          -f handoff=true -f dry_run=${{ inputs.dry_run && 'true' || 'false' }}

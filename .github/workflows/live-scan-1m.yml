@@ -224,6 +224,13 @@ jobs:
           SCREEN_CAP_PER_SECTOR: ${{ vars.SCREEN_CAP_PER_SECTOR || '2' }}
           SCREEN_COOLDOWN_MIN: ${{ vars.SCREEN_COOLDOWN_MIN || '45' }}
           SCREEN_LAST_ENTRY: ${{ vars.SCREEN_LAST_ENTRY || '14:30' }}
+          # Bot 4's own loop stands down while this scan is running (one set of
+          # numbers); 0 = it always screens on its own read. 7d frames for the
+          # screen's names (EMA9 + pivots seeded), and how long its loop waits for
+          # a closed bar to publish before skipping the candle.
+          SCREEN_FAILOVER: ${{ vars.SCREEN_FAILOVER || '1' }}
+          SCREEN_PERIOD: ${{ vars.SCREEN_PERIOD || '7d' }}
+          SCREEN_PUBLISH_WAIT_S: ${{ vars.SCREEN_PUBLISH_WAIT_S || '120' }}
           PICK_STICKY_LOG: ${{ vars.PICK_STICKY_LOG || '0' }}
           SECTOR_FOLLOW_EXTRAS: ${{ vars.SECTOR_FOLLOW_EXTRAS || '1' }}
           # 1 = also scan the leading sector on the other side of the pick.

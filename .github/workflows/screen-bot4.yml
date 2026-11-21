@@ -1,17 +1,20 @@
 # Bot 4's console: see what the screen did, and re-send its audit on demand.
 #
-# WHERE BOT 4 ACTUALLY RUNS
-# The screen is not a second market engine — it is a *view over the same board*
-# the 5m scan already scores (every name of every sector, on every candle). So it
-# runs inside "NSE 5m live scan", three times per candle cycle:
+# WHERE BOT 4 RUNS
+# On a normal day: inside "NSE 5m live scan", which already scores every name of
+# every sector on every candle — one engine, one set of numbers:
+#   (bot 4's failover — "NSE screen · bot 4 — own loop" — screens on its own read
+#    only while that scan is NOT running, and stands down the moment it is, so the
+#    two never quote different persistence for the same candle.)
+#
 #
 #   * 60s before each close  -> _screen_early()  : the PROVISIONAL card
 #   * right after the close  -> _screen_candle() : the CONFIRMED/CANCELLED line
 #   * at 15:33              -> _screen_report()  : the audit PDF
 #
 # It has its own channel (TELEGRAM_BOT_TOKEN_4 / TELEGRAM_CHAT_ID_4), its own
-# ledger (state/screen_state.json) and its own artifacts, but only ONE copy of the
-# sector numbers — two engines would mean two truths about the same candle.
+# ledger (state/screen_state.json) and its own artifacts, and on a normal day only
+# ONE copy of the sector numbers — see the failover above.
 #
 # WHAT THIS WORKFLOW IS FOR
 # The loop's state and board record live on the runner; when a session's audit did
@@ -69,20 +72,16 @@ jobs:
           set -euo pipefail
           WANT="${WANT:-}"          # an unset input is "" (the newest board), not an error
           # board-<session>-<run>-<attempt> from the 5m loop; board-1m-* is bot 3's.
+          # Newest non-expired board record wins; $WANT narrows it to one session.
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" > /tmp/artifacts.json
-          pick=$(python3 - "$WANT" <<'PY'
-          import json, sys
-          want = sys.argv[1].strip()
-          arts = [a for a in json.load(open("/tmp/artifacts.json")).get("artifacts", [])
-                  if not a.get("expired")
-                  and a["name"].startswith("board-2")
-                  and not a["name"].startswith("board-1m-")
-                  and (not want or want in a["name"])]
-          arts.sort(key=lambda a: a["created_at"], reverse=True)
-          a = arts[0] if arts else None
-          print(f'{a["id"]} {a["name"]} {a["created_at"]}' if a else "")
-          PY
-          )
+          pick=$(jq -r --arg want "$WANT" '
+            [ .artifacts[]
+              | select((.expired // false) | not)
+              | select(.name | startswith("board-2"))
+              | select((.name | startswith("board-1m-")) | not)
+              | select($want == "" or (.name | contains($want))) ]
+            | sort_by(.created_at) | reverse | .[0] // empty | "\(.id) \(.name)"' \
+            /tmp/artifacts.json)
           if [ -z "$pick" ]; then
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "No board artifact found. The 5m loop uploads one at the end of every"

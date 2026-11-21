@@ -29,6 +29,9 @@ WORKFLOWS = ("live-scan.yml", "live-scan-1m.yml")
 RUNTIME_ONLY = {
     "GITHUB_OUTPUT", "DRY_RUN", "LOG_LEVEL",
     "BACKFILL", "OI_FILE", "OI_SOURCE", "YF_PERIOD_5M", "YF_PERIOD_1D",
+    # Supplied by the runner, not by the repository: bot 4's own loop asks the REST
+    # API whether the 5m scan is running (live_screen.five_minute_alive).
+    "GITHUB_REPOSITORY", "GITHUB_TOKEN",
 }
 
 

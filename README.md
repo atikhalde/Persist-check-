@@ -919,8 +919,13 @@ Repo **Settings → Secrets and variables → Actions**:
 - Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - Optional secondary mirror: `TELEGRAM_BOT_TOKEN_2`, `TELEGRAM_CHAT_ID_2`
 
-Workflow: `.github/workflows/live-scan.yml` runs the **live loop inside one
-long job** instead of one cold-started job per candle.
+Workflows: `.github/workflows/live-scan.yml` runs the **live loop inside one
+long job** instead of one cold-started job per candle; `live-scan-1m.yml` is bot 3's
+projected scan; `screen-bot4-live.yml` is **bot 4's own loop**, which stands down while
+the 5m scan is running and takes over when it is not; `screen-bot4.yml` is bot 4's
+console (what the screen did, rebuild + re-send the audit). Bot 4 — the 4–6 setups a
+day on its own channel, with the EOD audit PDF — is documented in
+`docs/screen-bot4-2026-11-15.md`.
 
 * Every trigger (`workflow_dispatch` from your external scheduler, or the backup
   crons) only means "make sure the loop is alive". A `guard` job checks for an older
