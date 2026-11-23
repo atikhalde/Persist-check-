@@ -265,6 +265,32 @@ class Bot3EntryRuleTests(FourNameWorld):
         self.assertEqual(self.ledger()["pick_entries"], {"IT long": 3})
         self.assertIn("DDD@10:00", self.ledger()["stats"]["rejected"]["cap"])
 
+    def test_per_candle_entry_budget_is_shared_and_persists_on_retry(self):
+        st = scan1m.load_ledger()
+        scan1m._entry_candle_add(st, BAR)  # a prior catch-up entry on this candle
+        scan1m.save_ledger(st)
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "2", "MAX_ENTRIES_PER_PICK": "0"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+            self.assertEqual(len(out), 1)
+            self.assertEqual(scan1m._entry_candle_count(self.ledger(), BAR), 2)
+            again = scan1m.confirm_pass(BAR, now=CLOSE)
+            self.assertEqual(again, [])
+            self.assertEqual(scan1m._entry_candle_count(self.ledger(), BAR), 2)
+
+    def test_fresh_leader_goes_before_baseline_leader(self):
+        st = scan1m.load_ledger()
+        def snap(label, persist, intra, rank, move):
+            return {"b": label, "sectors": {"IT": {"side": 1, "persist": persist,
+                "intra": intra, "n": ["AAA"], "rank": [rank], "mv": [move], "rk": [1]}}}
+        st.setdefault("stats", {})["board"] = {"bars": [
+            snap("09:50", 70, 0.2, 40, 0.1), snap("09:55", 80, 0.4, 60, 0.5)]}
+        scan1m.save_ledger(st)
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "1", "MAX_ENTRIES_PER_PICK": "0"}):
+            out = scan1m.confirm_pass(BAR, now=CLOSE)
+        self.assertEqual([s["symbol"] for s in out], ["AAA"])
+        decision = self.ledger()["stats"]["fresh_leaders"][f"{BAR:%Y-%m-%d %H:%M}|confirm|AAA"]
+        self.assertEqual(decision["status"], "preferred")
+
     def test_the_leader_is_confirmed_first(self):
         # BBB is the furthest ahead of its sector (+2.0pp) at the lowest score.
         with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
@@ -629,6 +655,14 @@ class AlertCapTests(Bot3EntryRuleTests):
         self.assertEqual(len(self.ledger()["early"]), 3)
         self.assertIn("DDD@10:00", self.ledger()["stats"]["rejected"]["alert_cap"])
         self.assertEqual(self.ledger()["stats"]["alert_capped"], 1)
+
+    def test_projection_cap_is_shared_across_minute_retries(self):
+        with patch.dict("os.environ", {"SCAN1M_ALERT_CAP": "2"}):
+            scan1m.run_minute(BAR, now=MIN1)
+            first = set(self.ledger()["early"])
+            scan1m.run_minute(BAR, now=MIN3)
+            self.assertEqual(set(self.ledger()["early"]), first)
+            self.assertEqual(len(first), 2)
 
     def test_the_ranking_is_the_one_the_entries_use(self):
         # BBB is furthest ahead of its sector (+2pp); the rest are at +0pp, so

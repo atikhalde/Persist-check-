@@ -250,7 +250,8 @@ jobs:
           # the sector is picked and the trade is still valid (stop untouched,
           # fire no older than SCAN1M_LEADER_MAX_MINUTES, move <= MAX_R).
           # Bot 3 only; bot 1 never sends it.
-          # Projections per 5m candle, ranked like the entries (0 = no cap).
+          # Separate per-candle caps for projections and entries; catch-up entries and
+          # confirmations share the entry cap (0 = no cap).
           SCAN1M_ALERT_CAP: ${{ vars.SCAN1M_ALERT_CAP || '3' }}
           # One LATE LEADER message per pick window instead of one per name.
           SCAN1M_CATCHUP_DIGEST: ${{ vars.SCAN1M_CATCHUP_DIGEST || '1' }}
