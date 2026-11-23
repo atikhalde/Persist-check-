@@ -139,7 +139,8 @@ def skeleton(uni: dict, md, st4: dict) -> dict:
     names every five minutes to discover that no sector qualifies — is what makes a
     second scanner expensive for no reason.
     """
-    return {"b": getattr(md, "bar_time", ""), "tilt": int(md.dir_state or 0),
+    return {"b": getattr(md, "bar_time", ""), "sector_bar": str(getattr(md, "bar_time", ""))[-5:],
+            "tilt": int(md.dir_state or 0),
             "pick": md.pick_sector or "",
             "sectors": {code: _cell(md, code, spec)
                         for code, spec in (uni.get("sectors") or {}).items()}}
@@ -177,6 +178,7 @@ def payload_for(uni: dict, md, frames: dict, last) -> dict:
         log.debug("bot 4: %d name frame(s) had not published %s", stale,
                   to_ist(last).strftime("%H:%M"))
     return {"b": to_ist(last).strftime("%H:%M"), "scan": to_ist(last).strftime("%H:%M"),
+            "sector_bar": str(getattr(md, "bar_time", ""))[-5:],
             "tilt": int(md.dir_state or 0), "pick": md.pick_sector or "", "sectors": secs}
 
 
@@ -291,7 +293,7 @@ def name_frames_when_ready(uni: dict, sectors: list[str], last, *,
 def _already_judged(st4: dict, hhmm: str) -> bool:
     """Has this candle been screened? A retry must not judge (or card) it twice."""
     rows = st4.get("scan") or []
-    return bool(rows) and str((rows[-1] or {}).get("b") or "") == str(hhmm)
+    return any(str((row or {}).get("b") or "") == str(hhmm) for row in rows)
 
 
 def close_pass(*, send=None, save=None, now: datetime | None = None,
@@ -310,11 +312,12 @@ def close_pass(*, send=None, save=None, now: datetime | None = None,
     """
     send = send or telegram.send_bot4
     save = save or screen.save
+    fixed_now = now
     now = now or now_ist()
     last = last or last_closed(now)
     closed_at = to_ist(last) + timedelta(minutes=BAR_MINUTES)
     try:
-        st4 = screen.load()
+        st4 = screen.reset_if_new_day(screen.load(), str(to_ist(last).date()))
         hhmm = to_ist(last).strftime("%H:%M")
         if _already_judged(st4, hhmm):
             log.info("bot 4 %s: already screened this candle — nothing to do", hhmm)
@@ -330,7 +333,7 @@ def close_pass(*, send=None, save=None, now: datetime | None = None,
         seen_at = now_ist()
         payload = payload_for(uni, md, frames, last)
         surfaced = screen.consider(st4, payload, frames, md, last, send=send,
-                                   save_state=save, now=now)
+                                   save_state=save, now=fixed_now or now_ist())
         # `consider` passes dry_run itself, but these update lines are sent here:
         # without it, DRY_RUN=1 would still post CONFIRMED/CANCELLED to bot 4.
         dry = screen._dry()
@@ -340,7 +343,9 @@ def close_pass(*, send=None, save=None, now: datetime | None = None,
         done_at = now_ist()
         note_latency(st4, last, seen_at, done_at, len(frames),
                      _fresh_names(frames, last), save=save)
-        return {"bar": payload.get("b"), "candidates": len(surfaced),
+        row = (st4.get("scan") or [{}])[-1]
+        return {"bar": payload.get("b"),
+                "candidates": int(row.get("cands") or 0) if row.get("b") == hhmm else 0,
                 "surfaced": surfaced, "setups": len(st4.get("setups") or []),
                 "feed_s": round((seen_at - closed_at).total_seconds(), 2),
                 "screen_s": round((done_at - seen_at).total_seconds(), 3)}
@@ -354,11 +359,9 @@ def note_latency(st4: dict, last, seen_at: datetime, done_at: datetime,
                  frames: int, fresh: int, *, save=None) -> None:
     """Record this candle's latency in the two parts that can be fixed separately.
 
-    ``feed`` is how long after the close the bars reached the feed — Yahoo's, and
-    nobody else's. ``screen`` is what happened between the bars being in hand and the
-    cards being sent — ours, and the only part a code change can shorten. A single
-    "11s after the close" cannot tell those apart, which is how a scanner talks
-    itself into believing it is fast.
+    The first interval runs from the candle close to data readiness, including
+    fetch/wait time; the second includes scoring and send attempts. Neither
+    measures when the recipient saw the card.
     """
     stats = st4.setdefault("stats", {})
     feed = max(0.0, (seen_at - (to_ist(last) + timedelta(minutes=BAR_MINUTES))).total_seconds())
@@ -370,17 +373,18 @@ def note_latency(st4: dict, last, seen_at: datetime, done_at: datetime,
     stats["names_stale"] = max(0, int(frames) - int(fresh))
     if save is not None:
         save(st4)
-    log.info("bot 4 %s: feed +%.1fs · screen %.0fms · %d name(s) still stale",
+    log.info("bot 4 %s: close-to-data-ready +%.1fs · screen %.0fms · %d name(s) still stale",
              to_ist(last).strftime("%H:%M"), feed, work * 1000.0, stats["names_stale"])
 
 
 def early_pass(forming, *, send=None, now: datetime | None = None) -> list[dict]:
     """Provisional cards on the still-forming candle, ``EARLY_ALERT_SECONDS`` early."""
     send = send or telegram.send_bot4
+    fixed_now = now
     now = now or now_ist()
     if not screen.early_enabled():
         return []
-    st4 = screen.load()
+    st4 = screen.reset_if_new_day(screen.load(), str(to_ist(forming).date()))
     try:
         uni = data.load_universe()
         # The sector read is the last CLOSED candle's: persistence is a slow measure,
@@ -408,7 +412,13 @@ def early_pass(forming, *, send=None, now: datetime | None = None) -> list[dict]
                         to_ist(forming).strftime("%H:%M"), len(tickers))
             return []
         payload = payload_for(uni, md, frames, forming)
-        out = screen.provisional(st4, payload, frames, md, forming, send=send, now=now)
+        decision_at = fixed_now or now_ist()
+        if decision_at >= to_ist(forming) + timedelta(minutes=BAR_MINUTES):
+            log.warning("bot 4 early %s: data arrived after close; no provisional card",
+                        to_ist(forming).strftime("%H:%M"))
+            return []
+        out = screen.provisional(st4, payload, frames, md, forming, send=send,
+                                 now=decision_at)
         log.info("bot 4 early %s: %d sector(s), %d/%d name(s) with live 1m data, "
                  "%d provisional card(s)", to_ist(forming).strftime("%H:%M"), len(wanted),
                  len(frames), len(tickers), len(out))
@@ -473,7 +483,7 @@ def end_of_session(*, now: datetime | None = None) -> bool:
 
 def _announce(why: str) -> None:
     """One line to bot 4 the first time it screens a session — and why it is on."""
-    st4 = screen.load()
+    st4 = screen.reset_if_new_day(screen.load(), str(now_ist().date()))
     if st4.get("announced"):
         return
     if telegram.send_bot4(
@@ -574,7 +584,7 @@ def live_loop_screen(*, max_minutes: float | None = None,
             continue
         closed_streak = 0
         try:
-            close_pass(now=now_ist(), last=forming, uni=uni)
+            close_pass(last=forming, uni=uni)
         except Exception:                   # noqa: BLE001
             log.exception("bot 4 close pass failed")
 

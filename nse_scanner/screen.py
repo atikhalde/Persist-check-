@@ -501,19 +501,36 @@ def _slopes(st: dict, payload: dict) -> dict:
     """
     bars = st.get("sectors") or []
     n = slope_bars()
-    if len(bars) <= n:
+    ref = str(payload.get("sector_bar") or "")
+    if ref:
+        try:
+            target = (datetime.strptime(ref, "%H:%M") - timedelta(minutes=5 * n)).strftime("%H:%M")
+        except ValueError:
+            return {}
+        previous = next((row for row in reversed(bars) if row.get("b") == target), None)
+        if previous is None:
+            return {}
+    else:
+        if len(bars) < n:
+            return {}
+        previous = bars[-n]
+    # Older ledgers stored board bull/bear under "persist"; do not mix metrics.
+    if previous.get("persist_metric") != "directional_persistence":
         return {}
-    then = bars[-1 - n].get("sec") or {}
+    then = previous.get("sec") or {}
     out = {}
     for sector, cell in (payload.get("sectors") or {}).items():
         now = float(cell.get("persist") or 0)
-        was = (then.get(sector) or {}).get("persist")
+        old = then.get(sector) or {}
+        was = old.get("persist")
+        if int(old.get("side") or 1) != int(cell.get("side") or 1):
+            continue
         out[sector] = round(now - float(was), 1) if was is not None else 0.0
     return out
 
 
 def _record_sectors(st: dict, payload: dict, margins: dict) -> None:
-    row = {"b": payload.get("b"), "sec": {}}
+    row = {"b": payload.get("b"), "persist_metric": "directional_persistence", "sec": {}}
     for sector, cell in (payload.get("sectors") or {}).items():
         row["sec"][sector] = {"persist": round(float(cell.get("persist") or 0)),
                               "side": int(cell.get("side") or 1),
@@ -730,6 +747,9 @@ def provisional(st: dict, payload: dict, frames: dict, md, forming, *,
     send = send or telegram.send_bot4
     now = now or now_ist()
     hhmm = to_ist(forming).strftime("%H:%M")
+    if to_ist(now) >= to_ist(forming) + timedelta(minutes=BAR_MINUTES):
+        log.warning("bot 4 early %s: candle already closed; no provisional card", hhmm)
+        return []
     if hhmm > last_entry():
         return []
     out: list[dict] = []
@@ -750,13 +770,12 @@ def provisional(st: dict, payload: dict, frames: dict, md, forming, *,
                            provisional=True, seconds_left=seconds_left)
             if setup is not None:
                 out.append(setup)
-        if out:
-            save(st)
-        elif not (st.get("stats") or {}).get("early_empty_logged_" + hhmm):
+        if not out and not (st.get("stats") or {}).get("early_empty_logged_" + hhmm):
             log.info("bot 4 early %s: %d name(s) qualified on the forming candle, "
                      "none admissible (cap/score/cooldown) — no provisional card",
                      hhmm, len(found))
             st["stats"]["early_empty_logged_" + hhmm] = True
+        save(st)
         return out
     except Exception:                       # noqa: BLE001 — never cost a candle
         log.exception("screen provisional pass failed at %s", hhmm)
