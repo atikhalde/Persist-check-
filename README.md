@@ -611,7 +611,7 @@ the workflow set them as repository *Variables*, no commit needed):
 | `SCAN1M_MAX_STALE_SECONDS` | `100` | skip a stock whose newest 1m print is older than this |
 | `SCAN1M_GRACE_SECONDS` | `6` | seconds after a minute boundary before asking Yahoo |
 | `SCAN1M_SUMMARY` | `1` | `0` disables the 15:33 report entirely; with `EOD_REPORT=0` that report is the short one-message summary |
-| `SCAN1M_ALERT_CAP` | `3` | projections allowed per 5m candle, ranked by sector lead exactly as the entries are ranked (`0` = one message per firing name). 17 Nov put **11 of the 24 names it scanned** into one candle (six FMCG, five PSU banks) and no name could be taken that the cap would not have ranked first; the held-back names are counted in the summary (`· 8 held back by the per-candle cap`) |
+| `SCAN1M_ALERT_CAP` | `3` | Bot 3 maximum projected alerts per 5m candle, and separately maximum actual entries per candle shared by catch-up and confirmation; `0` disables both limits. Candidates with evidence of a strengthening sector and improving top-five name are prioritized, with the existing ranking as fallback. Held-back entries are audited. |
 | `SCAN1M_CATCHUP_DIGEST` | `1` | one `LATE LEADER` message per pick window, best-first, instead of one per name (`0` = per name) |
 | `SCAN1M_REQUIRE_TARGET` | `1` | refuse an entry that has **no pivot target at all** — no exit level, no trade. `MIN_TARGET_R` refuses a target that is too close; this refuses the absence of one. DABUR on 17 Nov was entered with `T1 N/A · T2 N/A · T3 N/A` and lost −0.8R (`0` = old rule) |
 | `SCAN1M_1M_PERIOD` | `1d` | 1m history window fetched every minute (prior sessions come from one 7d fetch per day) |

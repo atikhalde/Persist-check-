@@ -1167,6 +1167,7 @@ _CANCEL_WHY = {
     "no_target": "no pivot target — the trade would have had no exit",
     "oi": "open interest veto at the close",
     "cap": "the sector already had its entries",
+    "candle_cap": "the candle's entry limit was reached",
     "late": "the close scan ran past the alert deadline",
     "pick_wait": "not checked — the pick dropped to WAIT",
     "sector_moved": "not checked — the close picked another sector",
@@ -1175,7 +1176,7 @@ _CANCEL_WHY = {
     "unchecked": "could not be checked in time",
 }
 
-_CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap",
+_CANCEL_WHY_ORDER = ("no_signal", "opposite", "no_stop", "no_target", "oi", "cap", "candle_cap",
                      "late", "pick_wait", "no_free", "follower", "sector_moved",
                      "unchecked")
 
@@ -1337,14 +1338,10 @@ def format_catchup_digest(items: list[dict], pick: dict, bar: datetime, now: dat
 
 # ── one minute of the projection ─────────────────────────────────────────────
 def alert_cap() -> int:
-    """Projection alerts allowed per 5m candle, ranked like the entries (3).
+    """Maximum projections and maximum actual entries per 5m candle (default 3).
 
-    ``MAX_ENTRIES_PER_PICK`` caps what is *taken*; nothing capped what is
-    *announced*, so on 17 Nov 09:21 the scan projected 11 of the 24 names it
-    looked at — six FMCG and five PSU banks — in one candle, and 24 projections
-    produced 3 entries that day. The same ranking the entry cap uses decides
-    which ones are worth a message, so the two layers agree on what is best.
-    ``0`` restores one message per firing name.
+    Catch-up entries and confirmations share an entry budget. Projection alerts
+    have their own budget because a projection is not an entry. Zero disables both.
     """
     try:
         return max(0, int(os.environ.get("SCAN1M_ALERT_CAP", "3")))
@@ -1600,15 +1597,21 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     # The alert layer is capped and ranked exactly like the entry layer: on one
     # candle, ten names can fire and only three can ever be taken.
     cap = alert_cap()
-    if cap and len(ready) > cap:
+    if ready:
+        from .fresh_leaders import prioritize
+
         rank_candidates(ready)
-        for held in ready[cap:]:
+        prioritize(ready, st, bar, sector_of, side_of, stage="projection")
+    already = sum(1 for item in book.values() if item.get("bar") == bar.isoformat())
+    room = max(0, cap - already) if cap else len(ready)
+    if cap and len(ready) > room:
+        for held in ready[room:]:
             _note_reject(st, "alert_cap", held["raw"], f"{held['raw']} {hhmm}", per_bar=hhmm)
             _no_projection(held["raw"], "alert_cap")
-        stats["alert_capped"] = stats.get("alert_capped", 0) + len(ready) - cap
-        log.info("1m %s: %d projections held back by the per-candle cap (%d sent)",
-                 hhmm, len(ready) - cap, cap)
-        ready = ready[:cap]
+        stats["alert_capped"] = stats.get("alert_capped", 0) + len(ready) - room
+        log.info("1m %s: %d projections held back by the per-candle cap (%d slots left)",
+                 hhmm, len(ready) - room, room)
+        ready = ready[:room]
 
     for item in ready:
         raw, best, plan, stamp = item["raw"], item["best"], item["plan"], item["stamp"]
@@ -1640,6 +1643,16 @@ def run_minute(bar: datetime | None = None, *, now: datetime | None = None,
     if skips or catching:
         save_ledger(st)              # the summary reports these counts
     return out
+
+
+def _entry_candle_count(st: dict, bar: datetime) -> int:
+    return int((st.get("entry_candles") or {}).get(bar.isoformat(), 0))
+
+
+def _entry_candle_add(st: dict, bar: datetime) -> None:
+    counts = st.setdefault("entry_candles", {})
+    key = bar.isoformat()
+    counts[key] = int(counts.get(key, 0)) + 1
 
 
 def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: dict,
@@ -1691,8 +1704,18 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
     # "not an entry" while CDUR was the day's pick for 30 candles.
     from .pipeline import take_late_entry
 
+    from .fresh_leaders import prioritize
+
+    prioritize(found, st, bar, sector_of or {}, side_of or {}, stage="catchup")
     kept: list[dict] = []
     for item in found:
+        # A catch-up and the close pass share this candle's entry budget. An
+        # informational catch-up still goes out when the entry budget is full.
+        if alert_cap() and _entry_candle_count(st, bar) >= alert_cap():
+            _note_reject(st, "candle_cap", item["raw"],
+                         f"{item['raw']} {hhmm} — candle entry limit {alert_cap()}", per_bar=hhmm)
+            kept.append(item)
+            continue
         if take_late_entry(st, pick, bar, item, now, bot="1m",
                            send=telegram.send_bot3, save=save_ledger, dry=_dry,
                            side_of=side_of,
@@ -1700,6 +1723,8 @@ def _catch_up(st: dict, pick: dict, catching: list[str], frames: dict, fires: di
                                            int(pick.get("alt_side") or 0))
                            if (sector_of or {}).get(item["raw"])
                            == (pick.get("alt") or "") else ""):
+            _entry_candle_add(st, bar)
+            save_ledger(st)
             out.append({"symbol": item["raw"], "side": item["hit"]["sig"].side,
                         "fired": item["hit"]["sig"].time, "late_entry": True})
         else:
@@ -1961,8 +1986,16 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
                  cand["raw"], cand["best"].time, cand["rank"])
 
     rank_candidates(candidates)
+    from .fresh_leaders import prioritize
+
+    prioritize(candidates, st, bar, sector_of, side_of, stage="confirm")
     for cand in candidates:
         raw, best, plan = cand["raw"], cand["best"], cand["plan"]
+        if alert_cap() and _entry_candle_count(st, bar) >= alert_cap():
+            _note_reject(st, "candle_cap", raw, f"{raw} {best.time} — candle entry limit {alert_cap()}",
+                         per_bar=best.time)
+            reasons[raw] = "candle_cap"
+            continue
         # Charged to the name's own sector *and* its own side: a dual long has a
         # budget of its own, exactly as on bot 1.
         own_key = pick_cap_key(sector_of[raw], side_of.get(raw, pick["side"]))
@@ -1978,6 +2011,7 @@ def confirm_pass(bar: datetime | None = None, *, now: datetime | None = None,
             _note_undelivered(st, raw, bar, now_ist())
             continue
         take_entry_slot(st, own_key)      # charged to the name's own sector
+        _entry_candle_add(st, bar)
         confirmed.add(raw)
         (st.get("undelivered") or {}).pop(f"{raw} {bar:%H:%M}", None)   # delivered now
         sent[raw] = {"code": best.code, "name": best.name, "time": best.time,

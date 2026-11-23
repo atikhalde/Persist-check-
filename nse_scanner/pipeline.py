@@ -986,6 +986,7 @@ _REJECT_TEXT = (
     ("scan_error", "could not be scanned"),
     ("late", "scanned too late"),
     ("cap", "not taken — the pick already had its entries"),
+    ("candle_cap", "not taken — the candle entry limit was reached"),
     ("weak", "not running — sideways, reversing or weak momentum"),
     ("follower", "followers not scanned — outside the sector's top"),
     ("no_target", "without a pivot target"),
