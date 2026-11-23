@@ -1503,10 +1503,20 @@ def run_early(bar: datetime) -> list[dict]:
         dual = str(scan.get("alt_reason") or "") if (alt and sector_of[raw] == alt) else ""
         text = (format_early(best, shown, plan, bar, dual=dual)
                 + f" · price from 1m bar {m1.index[-1]:%H:%M}")
-        if not telegram.send(text, dry_run=_dry()):
+        from .alert_timing import record as record_alert_timing
+
+        send_started = now_ist()
+        delivered = telegram.send(text, dry_run=_dry())
+        response_at = now_ist()
+        timing = record_alert_timing(st, kind="5m-provisional", name=raw, bar=bar,
+                                     decision=stamp, send_start=send_started,
+                                     send_end=response_at, success=delivered)
+        if not delivered:
+            _save(st)
             continue
         book[raw] = {"bar": bar.isoformat(), "side": best.side, "code": best.code,
-                     "name": best.name, "price": plan.entry, "at": stamp.strftime("%H:%M:%S")}
+                     "name": best.name, "price": plan.entry, "at": stamp.strftime("%H:%M:%S"),
+                     "timing": timing}
         _save(st)
         out.append({**best.__dict__, "early": True})
         log.info("EARLY %s %s price=%.2f sl=%.2f @ %s (sent %s IST, %.0fs before close)",
@@ -2134,6 +2144,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         result["pending"] = trail_pending
 
     if md.pick_sector == "WAIT" or md.action == "WAIT":
+        st.pop("continuation_pick", None)
         if ping_on_wait and not market_changed and not sector_changed:
             log.info("WAIT — no complementary persistent sector")
         if not allow_stale:
@@ -2211,6 +2222,9 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     late: list[dict] = []
     # Once per candle, not once per name: the window is a property of the pick.
     late_open = _late_due(st, md, last)
+    from .continuation import note_pick, trigger as continuation_trigger
+
+    note_pick(st, md.pick_sector, md.pick_side, last)
 
     for raw, ysym in zip(stocks, tickers):
         # Only a sector's leaders are judged: the tail is the sector moving, and
@@ -2255,6 +2269,14 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         # the whole day. That table is not a stream of new entry signals.
         fresh = [s for s in fires if s.time == last.strftime("%H:%M")
                  and s.side == ("BUY" if want_buy else "SELL")]
+        # Old crosses never become entries by themselves. Only the primary pick
+        # has an unambiguous qualification timestamp; a new closed-bar breakout
+        # strictly after that pick can create a separate continuation signal.
+        if not fresh and sector_of[raw] == md.pick_sector:
+            continuation = continuation_trigger(st, sector_of[raw],
+                                                side_of.get(raw, md.pick_side), last, df5, fires)
+            if continuation is not None:
+                fresh = [continuation]
         if not fresh:
             same_side_before: list[str] = []
             if fires:
@@ -2344,7 +2366,8 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
         candidates.append({"raw": raw, "best": best, "plan": plan, "reading": reading,
                            "early": early, "lead": lead,
                            "rank": cand_rank if name_rank_mode() == "combined" else None,
-                           "sector": sector_of[raw], "close": close_now})
+                           "sector": sector_of[raw], "close": close_now,
+                           "decision_at": now_ist()})
 
     # The runners of each sector, not the first three names to arrive: the band
     # drops the laggards of the same move (`ENTRY_RANK_BAND`, 0.75 of the sector's
@@ -2364,6 +2387,9 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
     # The cap keeps the names that are moving *within* their sector, not the
     # names with the highest absolute score; score breaks ties.
     rank_candidates(candidates)
+    from .fresh_leaders import prioritize
+
+    prioritize(candidates, st, last, sector_of, side_of, stage="5m-confirm")
     for cand in candidates:
         raw, early, plan, best = cand["raw"], cand["early"], cand["plan"], cand["best"]
         # One sector is one risk factor — counted per sector, not per message, so
@@ -2385,7 +2411,17 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
                             lead=cand.get("lead"), dual=dual_note)
         if early:
             text = _confirm_header(early, plan.entry) + text
-        if not telegram.send(text, dry_run=_dry()):
+        from .alert_timing import record as record_alert_timing
+
+        decision_at = cand["decision_at"]
+        send_started = now_ist()
+        delivered = telegram.send(text, dry_run=_dry())
+        response_at = now_ist()
+        timing = record_alert_timing(st, kind="5m-entry", name=raw, bar=last,
+                                     decision=decision_at, send_start=send_started,
+                                     send_end=response_at, success=delivered)
+        if not delivered:
+            _save(st)
             log.warning("Telegram failed for %s; leaving unsent for retry", raw)
             continue
         if early:
@@ -2407,6 +2443,7 @@ def run_once(*, force_sector: str | None = None, ping_on_wait: bool = False, bac
             "name": best.name,
             "time": best.time,
             "price": best.price,
+            "timing": timing,
         }
         positions[raw] = new_position(best.side, plan, last.isoformat(), session,
                                      sector=sector_of[raw])
@@ -2536,53 +2573,23 @@ _LATE_NOTE = ("the crossover candle is over — this is the fire's own entry and
 def _consider_late(st: dict, late: list[dict], raw: str, df5, fires, want: str,
                    bar: datetime, daily, sector: str,
                    intra: float | None = None) -> None:
-    """Queue a labelled LATE LEADER, or count why it is not worth one.
-
-    The 5m entry loop only takes a fire on the decision candle: a name whose
-    crossover happened before its sector was picked is refused as ``earlier`` and
-    never revisited, so on 18 Nov CDUR could be the pick from 09:45 with a 93→99
-    persistence and alert no CDUR stock at all. This is the same rule bot 3 has
-    had since the 1m round, with the same gates: same session, inside
-    ``SCAN5M_LEADER_MAX_MINUTES``, the fire candle's EMA9 stop untouched since,
-    and the move from that fire no larger than ``SCAN5M_LEADER_MAX_R``.
-    """
+    """Collect an old fire as a watch only, regardless of its old stop/target."""
     if not scan5m_leader_catchup():
         return
-    from .scan1m import catchup_candidate
-    why: dict = {}
-    # The same re-opened window bot 3 has: a pick that arrives late is what makes
-    # the leaders tradeable, so the fire's age is not the test on that candle.
-    # ``_consider_late`` is only reached on a candle inside the window
-    # ``_late_due`` opened for the current pick, so the pick *is* fresh here.
-    # It used to re-ask ``pick_is_fresh``, which compares the candle stored in
-    # ``late_pick["since"]`` with this one: on 20 Nov the pick flipped to BANK at
-    # 12:05 in the scanner's own record (the audit's timeline has it at 12:10),
-    # so the marker was one candle behind and every BANK name fell back to the
-    # plain 40-minute clock — 148 refusals, all five names, all 37 candles.
-    fresh = True
-    try:
-        hit = catchup_candidate(df5, fires, want, bar, now_ist(), daily, report=why,
-                                max_minutes=late_max_minutes(), max_r=late_max_r(),
-                                fresh_pick=fresh, rebase=late_leader_rebase())
-    except Exception:
-        log.exception("late-leader check failed for %s", raw)
+    earlier = [s for s in fires if s.side == want and s.time < bar.strftime("%H:%M")]
+    if not earlier or df5 is None or df5.empty:
         return
-    if hit is None:
-        if why.get("why"):
-            from .scan1m import _note_old_age
-            stats = st.setdefault("stats", {})
-            skips = stats.setdefault("catchup_skip", {})
-            skips[why["why"]] = skips.get(why["why"], 0) + 1
-            _note_old_age(stats, why)
-        return
-    # The catch-up is held to the same quality gate as a fresh entry: a leader
-    # that is now sideways or reversing is a name to watch, not to enter.
     try:
-        runs, why_not, _ = momentum_verdict(df5, bar, hit["price"], want == "BUY", intra)
-    except Exception:
-        runs, why_not = True, ""
-    late.append({"raw": raw, "hit": hit, "sector": sector, "frame": df5,
-                 "runs": runs, "why_not": why_not})
+        sig = min(earlier, key=lambda s: s.time)
+        hour, minute = (int(x) for x in sig.time.split(":"))
+        fire_bar = bar.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        price = float(df5["Close"].iloc[-1])
+        if not isfinite(price) or price <= 0:
+            return
+        late.append({"raw": raw, "sector": sector, "sig": sig,
+                     "fire_bar": fire_bar, "price": price})
+    except (ValueError, TypeError, IndexError, AttributeError):
+        log.warning("invalid historical fire for %s; no watch", raw)
 
 
 # ── the late leader as an entry, not only a heads-up ─────────────────────────
@@ -2709,6 +2716,10 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
     ``send``/``save``/``dry`` are the caller's: bot 3 has its own ledger file and
     its own Telegram bot, and a shared bookkeeper must not write the 5m state.
     """
+    # Bot 5m never promotes a historical crossover on its own. Bot 3 keeps its
+    # separate behavior; a new 5m continuation uses the regular fresh path.
+    if bot == "5m":
+        return False
     raw, hit = item["raw"], item["hit"]
     if isinstance(md, dict):                 # bot 3 passes its pick as a dict
         md = SimpleNamespace(pick_sector=md.get("sector"), dir_label=md.get("label"),
@@ -2762,55 +2773,42 @@ def take_late_entry(st: dict, md, bar: datetime, item: dict, now: datetime, *,
 
 def _send_late_leaders(st: dict, md, bar: datetime, late: list[dict],
                        *, side_of: dict | None = None) -> None:
-    """Send the labelled heads-up — one per name, or one digest for a burst."""
-    from .scan1m import catchup_digest, format_catchup, format_catchup_digest
+    """Historical fires are watch-only; never call the late-entry path for 5m."""
+    from .alert_timing import record as record_alert_timing
 
-    pick = {"sector": md.pick_sector, "label": md.dir_label, "conf": md.dir_conf}
-    # A late leader from the other side of the tape says so, in bot 3's words.
-    alt = str(getattr(md, "alt_sector", "") or "")
-    alt_note = str(getattr(md, "alt_reason", "") or "")
-    now = now_ist()
     sent = st.setdefault("sent", {})
     book = st.setdefault("catchup", {})
     todo = [item for item in late if item["raw"] not in sent and item["raw"] not in book]
-    if not todo:
-        return
-    # A re-based hit carries no distance from the fire (``r`` is None): it sorts
-    # last, and it is never a heads-up — it is an entry or nothing.
-    todo.sort(key=lambda item: -(item["hit"].get("r") or 0.0))
-    # What is still a live trade becomes an entry; what has already paid, been
-    # stopped out or run past 2R stays a heads-up (``LATE_LEADER_ENTRY=0`` keeps
-    # every one of them a heads-up, as on 19 Nov).
-    rest = [item for item in todo
-            if not take_late_entry(st, md, bar, item, now,
-                                   side_of=side_of,
-                                   dual=alt_note if item["sector"] == alt else "")]
-    rest = [item for item in rest if not item["hit"].get("rebase")]
-    if not rest:
-        return
-    todo = rest
-    digest = len(todo) > 1 and catchup_digest()
-    all_sent = (telegram.send(format_catchup_digest(todo, pick, bar, now, bot="5m", closed=True),
-                              dry_run=_dry()) if digest else True)
-    if digest and not all_sent:
-        return
-    for item in todo:
-        raw, hit = item["raw"], item["hit"]
-        if not digest and not telegram.send(
-                format_catchup(raw, hit, pick, bar, now, sector=item["sector"],
-                               bot="5m", closed=True,
-                               dual=alt_note if item["sector"] == alt else ""),
-                dry_run=_dry()):
-            continue
-        book[raw] = {"bar": bar.strftime("%Y-%m-%d %H:%M"), "session": str(session_date(bar)),
-                     "fired": hit["sig"].time, "side": hit["sig"].side,
-                     "code": hit["sig"].code, "price": hit["price"],
-                     "at": now.strftime("%H:%M:%S")}
-        _bump(st, "catchup")
+    from .scan1m import catchup_digest
+
+    groups = [todo[i:i + 8] for i in range(0, len(todo), 8)] if catchup_digest() else [[x] for x in todo]
+    for group in groups:
+        decision = now_ist()
+        lines = ["⏰ <b>LATE LEADER WATCH</b> — historical crossover"]
+        for item in group:
+            sig = item["sig"]
+            age = max(0.0, (decision - (item["fire_bar"] + timedelta(minutes=5))).total_seconds() / 60)
+            lines.append(f"• <b>{telegram.esc(item['raw'])}</b> {sig.side} · "
+                         f"{telegram.esc(item['sector'])} · fired {sig.time} "
+                         f"({age:.0f} min since close) · last close {item['price']:.2f}")
+        lines.append("<b>Not an entry alert</b> — historical crossovers only; wait for a new "
+                     "confirmed trigger. No positions opened.")
+        started = now_ist()
+        delivered = telegram.send("\n".join(lines), dry_run=_dry())
+        response = now_ist()
+        for item in group:
+            raw, sig = item["raw"], item["sig"]
+            timing = record_alert_timing(st, kind="5m-watch", name=raw, bar=bar,
+                                         signal_bar=item["fire_bar"], decision=decision,
+                                         send_start=started, send_end=response, success=delivered)
+            if delivered:
+                book[raw] = {"bar": bar.strftime("%Y-%m-%d %H:%M"), "session": str(session_date(bar)),
+                             "fired": sig.time, "side": sig.side, "code": sig.code,
+                             "price": item["price"], "at": response.strftime("%H:%M:%S"),
+                             "timing": timing}
+                _bump(st, "catchup")
+                log.info("LATE LEADER WATCH %s %s fired %s; no entry", raw, sig.side, sig.time)
         _save(st)
-        log.info("LATE LEADER %s %s fired %s as %s, sector %s picked %s (%.1fR, %.0f min late)",
-                 raw, hit["sig"].side, hit["sig"].time, hit["sig"].name,
-                 md.pick_sector, bar.strftime("%H:%M"), hit["r"], hit["age"])
 
 
 #: How long a candle is polled while today's index bar is still missing (seconds).

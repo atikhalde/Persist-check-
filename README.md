@@ -628,9 +628,9 @@ sector bot 1 would have refused — so they are shared, not forked.
 | `SECTOR_MAX_LAG_BARS` | `2` | how many 5m bars a sector index may trail the decision bar and still be picked (`-1` = no check). A sector further behind is taken out of PERSIST + / PERSIST − and out of the pick, and shown as `⚠ stale index` |
 | `SCAN5M_REQUIRE_TARGET` | `1` | refuse a 5m entry that has **no pivot target at all** — the rule bot 3 has had since 17 Nov (`SCAN1M_REQUIRE_TARGET`). `MIN_TARGET_R` refuses a target that is too close; this refuses the absence of one. 17 Nov entered HINDUNILVR with `T2 N/A · T3 N/A` (−0.6R) and DABUR with `T1 N/A · T2 N/A · T3 N/A` (−0.8R): two of ten entries, neither with an exit level (`0` = old rule) |
 | `SCAN5M_LEADER_CATCHUP` | `1` | report a stock whose 5m signal fired **before its sector was the pick**, as a labelled `⏰ LATE LEADER` instead of dropping it. The entry loop only accepts a fire on the decision candle; every earlier fire was filed as `fired before their sector was picked` and revisited never — 18 Nov CDUR was the pick from 09:45 with PERSIST − 93→99 and a qualified live flow, and **no CDUR stock was alerted all morning** although the sector short had fired at 09:20–09:40. Sends no position and takes no entry slot; bot 3 has had the same alert since the 1m round. `0` = the old silence |
-| `LATE_LEADER_ENTRY` | `1` | take that late leader as an **entry** instead of only announcing it, while the trade is still there: the fire candle's EMA9 stop untouched since, **the nearest target still at least `MIN_TARGET_R` (0.5) of the risk being taken from here**, inside the age/R gates above, and room under `MAX_ENTRIES_PER_PICK` for its sector+side (no cap by default), and the name must still be running — the same momentum gate as a fresh entry. Entry = the price now, stop = the fire candle's. 19 Nov: bot 3's 10:01 list named HAVELLS +1.8R, WHIRLPOOL +1.8R, KALYANKJIL +1.4R, LGEINDIA +1.3R, DIXON +0.4R and VOLTAS +0.3R as "not an entry", and the day's five entries were TECHM, TATAELXSI, HCLTECH, BAJAJ-AUTO, EXIDEIND — AMBER and VOLTAS never became a trade. The ones that had already run stay heads-ups, so the list cannot turn into a chase: M&M at +2.0R was 1.77 points from T1 against a 44-point stop taken from there — 0.04R — and is refused. Bot 1 and bot 3 both honour it. `0` = heads-up only |
-| `LATE_LEADER_REBASE` | `1` | when that late leader's fire is **older than the catch-up window**, the fire's levels are not the trade's: entry = the decision candle's close, stop = that candle's EMA9, targets rebuilt from the current price (`trade.plan_at`), with the same `MIN_TARGET_R` / `TARGET_FALLBACK` gates a fresh entry obeys. The fire still has to exist (it is the evidence of the turn), the name still has to be running and still ahead of its sector, and it only fires inside a window `PICK_CATCHUP` opened, once per name. 20 Nov BANK: the sector crossed the floor at 11:50 and held the pick for 37 candles with every bank having fired at 09:20 — `catchup_skip {"old": 148}`, five kept names, **zero** entries — and AXISBANK still had +1.73pp and INDUSINDBK +1.03pp left after the scan reached it. The old catch-up could not take them even with the window open: +4.3% from a 09:20 entry against a ~1% stop is 4R, past `SCAN5M_LEADER_MAX_R`, and the 09:20 target was behind the price. `0` = the fire's own levels only (refused as stale) |
-| `SCAN5M_LEADER_MAX_MINUTES` / `SCAN5M_LEADER_MAX_R` | `40` / `2.0` | the catch-up's two gates (bot 3's `SCAN1M_LEADER_*`): older than this many minutes since the fire's close, or a move already beyond this many R from the fire, and the name is not reported — it goes into the summary's `not sent:` count with the reason. The fire candle's EMA9 stop must also be untouched since. **40 since 19 Nov** (was 30): AMBER fired 09:20 and was 36 minutes old on the first candle it could be judged on, so the window — not the trade — was what refused it, and the target test in `LATE_LEADER_ENTRY` now decides whether such a name is still worth taking |
+| `LATE_LEADER_ENTRY` | `1` | Bot 3 only: whether a historical leader may be promoted to an entry. Bot 1/5m never promotes an old crossover by itself; it sends a labelled watch instead. |
+| `LATE_LEADER_REBASE` | `1` | Bot 3 only: whether older catch-up candidates can use a new plan. Bot 1/5m old fires remain watch-only regardless of this setting. |
+| `SCAN5M_LEADER_MAX_MINUTES` / `SCAN5M_LEADER_MAX_R` | `40` / `2.0` | Legacy 5m late-entry parameters, retained for compatibility; 5m historical crossovers are now watch-only, so these do not authorize 5m entries. |
 | `SECTOR_FOLLOW_EXTRAS` | `1` | whether a follow scan also scans the *other* leaders' sectors. Each extra sector brings its own `MAX_ENTRIES_PER_PICK` budget (the cap is keyed sector+side), so 17 Nov's `MARKET NEUTRAL 49%` follow fired six entries on one candle from FMCG 73 and CDUR 65. `0` scans the picked sector only — measured **−0.4R** on that session (it removes −2.0R of losses *and* +2.8R of BLUESTARCO), so the default stays as it was until a replay says otherwise |
 | `PICK_STICKY_LOG` | `0` | where the incumbent for `PICK_STICKY_MARGIN` comes from. `0` = the last candle in the ledger, which the early pass overwrites with *this* candle, so the close pass loses the incumbent and decides on raw score (17 Nov 09:45: REALTY 96 held at 09:44, PSUBK 97 took the pick at 09:50, two blocks five seconds apart). `1` = a per-bar log, so the margin always applies — measured **−4.1R** on 17 Nov (it holds REALTY and never sees BANKINDIA, the day's best trade), hence off until a replay |
 | `MIN_TARGET_R` / `MIN_TARGET_PCT` | `0.5` / `0.10` | a pivot closer than this to the entry is not a target (`0` = old behaviour). GODREJCP on 16 Nov: entered 877.25 with T1 at 878.00 — 0.2R, +0.09% — announced as "TARGET HIT +0.2R" |
@@ -1007,3 +1007,24 @@ nifty-live-scanner/
 ```
 
 Push this folder to GitHub, add the two secrets, enable Actions. Run the live loop in ONE place only (Actions *or* your own box): two loops have separate dedupe state and would double-send.
+
+### 5m historical fires and timing
+
+The 5m scan reports historical crossovers as **LATE LEADER WATCH — Not an entry
+alert** and does not open positions from them, even with `LATE_LEADER_ENTRY=1`.
+After the primary sector has been picked, a separately detected new completed-bar
+continuation can enter if the close newly crosses the prior bar's extreme; existing
+stock, risk, freshness, target and selection checks still apply. This continuation
+is not implemented for secondary or dual sectors. Existing **fresh current-bar
+crossover entries remain eligible** and are not required to pass that breakout
+check; this is not a universal continuation/pullback-only rule.
+
+The 5m scanner prioritizes strengthening sector/name combinations using the same
+experimental board-based ordering as bot 3, among sectors the existing picker has
+already selected. It falls back to existing ranking when history is unavailable;
+it does not independently change sector selection or guarantee an edge.
+
+The audit JSON `diagnostics.alert_timing` records the signal candle label and
+close, decision, send start and Telegram API response for 5m entry, provisional
+and watch alerts. API acceptance is not recipient-device delivery. A failed
+request is recorded as such, never as a successful entry.
