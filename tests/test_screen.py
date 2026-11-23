@@ -688,6 +688,19 @@ class PdfTests(ScreenCase):
         st["setups"][0]["mark"] = 10_500
         return st
 
+    def test_empty_verdict_does_not_claim_all_names_refused(self):
+        st = screen.fresh("2026-11-23")
+        st["stats"]["candidates"] = 1
+        verdict = screen_pdf._verdict(st)
+        self.assertIn("entry cutoff", verdict)
+        self.assertIn("Missing", verdict)
+        self.assertNotIn("refused every", verdict)
+
+    def test_latency_does_not_attribute_all_delay_to_feed(self):
+        text = screen_pdf.latency_split({"stats": {"feed_s": [12], "work_s": [0.2]}})
+        self.assertIn("close-to-data-ready +12.0s", text)
+        self.assertNotIn("feed +", text)
+
     def test_the_cli_refuses_to_audit_a_ledger_with_no_candle(self):
         with patch.object(screen, "load", return_value=screen.fresh("2026-11-20")):
             self.assertEqual(screen_pdf._cli(), 1)
