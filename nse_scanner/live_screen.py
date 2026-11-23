@@ -166,6 +166,13 @@ def sectors_to_fetch(uni: dict, md, st4: dict, *, limit: int | None = None) -> l
 def payload_for(uni: dict, md, frames: dict, last) -> dict:
     """The board's own payload shape, scored by the board's own scorer."""
     secs, names, stale = board._score(frames, uni, _row(md), last)
+    # board._score uses bull/bear for direction and ranking, but its persist field
+    # is derived from those short-term scores. The screen gate and slope must use
+    # the actual persistence used by the sector prefilter.
+    for code, cell in secs.items():
+        snap = (getattr(md, "sectors", {}) or {}).get(code) or {}
+        key = "persist_bull" if cell["side"] == 1 else "persist_bear"
+        cell["persist"] = round(float(snap.get(key) or 0))
     if stale:
         log.debug("bot 4: %d name frame(s) had not published %s", stale,
                   to_ist(last).strftime("%H:%M"))

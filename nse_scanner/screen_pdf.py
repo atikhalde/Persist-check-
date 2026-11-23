@@ -124,9 +124,10 @@ def _verdict(st: dict) -> str:
     setups = s.get("setups") or 0
     done = s.get("tracked") or 0
     if not setups:
-        return ("No setup was surfaced. The screen refused every name on every candle; "
-                "the appendix lists each gate and the number of names it refused, which "
-                "is where the tuning starts — not in the levels.")
+        return ("No setup was surfaced in this ledger. Qualified candidates may have been "
+                "ineligible for admission, including after the entry cutoff. Missing "
+                "candle rows do not establish whether another runner screened them; "
+                "no trading performance can be inferred without outcomes.")
     if not done:
         return (f"{setups} setup(s) surfaced and none has a candle after it yet: the "
                 "session ended at the bar that surfaced them. Nothing can be concluded "
@@ -170,11 +171,10 @@ def _holdout(st: dict) -> list[tuple[str, str]]:
 
 # ── the document ─────────────────────────────────────────────────────────────
 def latency_split(st: dict) -> str:
-    """``feed +1.2s · screen 180ms`` — the two halves of "how late was the card".
+    """Close-to-data-ready and processing intervals, not delivery latency.
 
-    The feed's half is Yahoo's and nobody can shorten it; the screen's half is ours.
-    Reporting only the sum invites the reader to blame the code for the feed — and to
-    believe the code is fast when it is not.
+    The first interval includes fetching and processing through data readiness; it
+    is not a direct measure of feed publication or recipient delivery.
     """
     stats = st.get("stats") or {}
     feed = _median(stats.get("feed_s") or [])
@@ -183,7 +183,7 @@ def latency_split(st: dict) -> str:
         return ""
     parts = []
     if feed is not None:
-        parts.append(f"feed +{feed:.1f}s")
+        parts.append(f"close-to-data-ready +{feed:.1f}s")
     if work is not None:
         parts.append(f"screen {work * 1000.0:.0f}ms")
     if stats.get("names_stale"):
@@ -296,7 +296,8 @@ def _write_pdf(st: dict, path: Path) -> None:
     flow.append(Paragraph(
         "\"Candidates\" is name-candles that passed every gate before the daily cap, the "
         "sector cap and the cooldown; \"candles\" is how many closed 5m candles the screen "
-        "actually judged. A day with many candidates and few setups was capped, not blind.",
+        "recorded in this ledger. Candidates may be excluded by the entry cutoff, score "
+        "floor, caps, cooldown or send failure; the counts alone do not identify why.",
         sty["small"]))
 
     flow.append(Paragraph("2 · Knobs in force (frozen at the open)", sty["h"]))
@@ -324,7 +325,9 @@ def _write_pdf(st: dict, path: Path) -> None:
     for k in sorted(knobs):
         rows.append([k, str(knobs[k]), meaning.get(k, "")])
     flow.append(table(rows, [40 * mm, 16 * mm, 112 * mm]))
-    flow.append(Paragraph("3 · Frozen 20 Nov holdout", sty["h"]))
+    flow.append(Paragraph("3 · Frozen 20 Nov name-list comparison", sty["h"]))
+    flow.append(Paragraph("This is a name-list intersection, not an independent holdout test: "
+                          "it does not establish opportunity, availability or outcomes.", sty["small"]))
     flow.append(table([["test", "result"]] + [list(r) for r in _holdout(st)], [45 * mm, 123 * mm]))
     flow.append(Paragraph("How to read this", sty["h"]))
     flow.append(Paragraph(
@@ -333,11 +336,9 @@ def _write_pdf(st: dict, path: Path) -> None:
         "each candle · <b>7</b> the market tape · <b>8</b> the sector tape (persistence, slope, "
         "side) · <b>9</b> every gate with the knob behind it and the number that refused · "
         "<b>10</b> what the day could not see.<br/><br/>"
-        "To tune the screen from this document: start at section 9 and find the gate that "
-        "refused the most names relative to the candle count on page 1. If the short list "
-        "was right and short, that gate is too tight; if it was wrong, look at section 5 "
-        "for whether the losing cards shared a leg value the winners did not — that is the "
-        "gate to move, and the knob that holds it is printed next to it.", sty["body"]))
+        "Refusals are first-failure name-candle events, not independent names. Gate order "
+        "affects counts. Compare rejected and accepted candidates with subsequent outcomes "
+        "across multiple sessions and an untouched holdout before changing thresholds.", sty["body"]))
     flow.append(PageBreak())
 
     # ── page 2: the short list ───────────────────────────────────────────────
@@ -425,8 +426,8 @@ def _write_pdf(st: dict, path: Path) -> None:
         flow.append(Paragraph(
             "A cancelled card is not a loss: its slot was freed, so the day could still "
             "surface SCREEN_MAX_DAY real setups. A card canned because <b>no close pass "
-            "ran for its candle</b> is the one thing to chase — that candle was missed "
-            "by the loop, not refused by a rule.", sty["small"]))
+            "ran for its candle</b> requires investigation of the runner and its ledger; "
+            "the absence of a close pass here does not establish what another runner did.", sty["small"]))
     flow.append(PageBreak())
 
     # ── the candle-by-candle scan ────────────────────────────────────────────
@@ -434,8 +435,8 @@ def _write_pdf(st: dict, path: Path) -> None:
     scan = st.get("scan") or []
     if not scan:
         flow.append(Paragraph(
-            "No scan rows: the screen never ran a candle (the 5m loop did not reach the "
-            "board sweep, or SCREEN_BOT was off).", sty["body"]))
+            "No scan rows in this ledger. This does not establish whether another runner "
+            "screened candles; inspect run logs and artifacts.", sty["body"]))
     else:
         # A missed candle is invisible in a table of the candles that were judged, so
         # the report states the count against the session's own grid (09:15-15:25).
@@ -444,11 +445,10 @@ def _write_pdf(st: dict, path: Path) -> None:
         missing = [b for b in expected if b not in judged]
         flow.append(Paragraph(
             f"{len(judged & set(expected))} of the session's {len(expected)} five-minute "
-            "candles were judged"
-            + (f"; <b>{len(missing)} missed</b> ({', '.join(missing[:12])}"
-               + (" …" if len(missing) > 12 else "") + ") — the loop was not running, the "
-               "feed never published, or the job handed over mid-candle. A missed candle "
-               "is not a refusal." if missing else " — none missed."), sty["body"]))
+            "candle labels are recorded in this ledger"
+            + (f"; <b>{len(missing)} absent from this ledger</b> ({', '.join(missing[:12])}"
+               + (" …" if len(missing) > 12 else "") + ") — check run logs and artifacts; absence here does not prove a candle was "
+               "not screened and is not a refusal." if missing else " — none absent."), sty["body"]))
         rows = [["bar", "qualified", "best", "top names (score)", "refusals on this candle"]]
         for r in scan:
             top = ", ".join(f"{c.get('raw')} {_fmt(c.get('score'), 0)}"
@@ -533,7 +533,7 @@ def _write_pdf(st: dict, path: Path) -> None:
         "no levels": ("trade.plan_at", "stop/targets must exist"),
         "already run too far": ("SCREEN_RUN_MAX_R", knobs.get("SCREEN_RUN_MAX_R")),
     }
-    rows = [["gate", "knob", "value", "names refused", "share"]]
+    rows = [["gate", "knob", "value", "events", "share"]]
     total = sum(int(v or 0) for v in refused.values()) or 0
     for gate in list(gate_knob) + [g for g in refused if g not in gate_knob]:
         knob, value = gate_knob.get(gate, ("—", "—"))
@@ -543,10 +543,9 @@ def _write_pdf(st: dict, path: Path) -> None:
     rows.append(["TOTAL", "", "", _int(total), "100%" if total else "—"])
     flow.append(table(rows, [50 * mm, 38 * mm, 42 * mm, 20 * mm, 16 * mm]))
     flow.append(Paragraph(
-        "A gate that refused nothing all day is as informative as one that refused "
-        "everything: the first is a knob with slack, the second is the knob that shaped "
-        "the session. Counts are per name per candle, so one name refused on 40 candles "
-        "counts 40 times — divide by the candle count above for the per-candle view.",
+        "These are first-failure events among observations reaching each gate, not "
+        "independent names. Earlier gates and sector fetch limits affect later counts; "
+        "a zero count does not prove a gate has slack or that all feeds were healthy.",
         sty["small"]))
     flow.append(Paragraph("10 · What the day could not see", sty["h"]))
     flow.append(Paragraph(
@@ -575,7 +574,7 @@ def _plain_text(st: dict) -> str:
              f"avg mark {_fmt(s.get('avg_eod_r'))}R",
              "", "KNOBS IN FORCE"]
     lines += [f"  {k} = {knobs[k]}" for k in sorted(knobs)]
-    lines += ["", "FROZEN 20 NOV HOLDOUT"] + [f"  {a}: {b}" for a, b in _holdout(st)]
+    lines += ["", "FROZEN 20 NOV HOLDOUT (name-list comparison only; not validation)"] + [f"  {a}: {b}" for a, b in _holdout(st)]
     lines += ["", "TIMING",
               f"  median {_fmt(_median(stats.get('ages')), 0)}s · worst "
               f"{_int(stats.get('age_max'))}s after the close · {_int(stats.get('late'))} "
@@ -633,7 +632,7 @@ def text_summary(st: dict) -> str:
         rows.append("best: " + " · ".join(
             f"{x.get('raw')} {_fmt(x.get('mfe_r'))}R" for x in top))
     take, avoid = _holdout(st)
-    rows.append(f"holdout — {take}: {avoid[0]}")
+    rows.append(f"20 Nov name-list comparison (not validation) — {take}: {avoid[0]}")
     rows.append("Every gate, its knob and the count that refused it are in the PDF.")
     return "\n".join(rows)
 

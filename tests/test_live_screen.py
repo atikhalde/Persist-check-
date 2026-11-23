@@ -54,6 +54,18 @@ class PayloadTests(unittest.TestCase):
         self.assertLess(abs(pl["sectors"]["AUTO"]["lead"][0]), 2.0)
         self.assertEqual(pl["sectors"]["BANK"]["n"], [])         # nothing fetched
 
+    def test_payload_uses_persistence_not_direction_scores(self):
+        md = read(sectors={"AUTO": {"side": 1, "bull": 60, "bear": 40,
+                                    "persist_bull": 91, "persist_bear": 10},
+                           "BANK": {"side": -1, "bull": 20, "bear": 70,
+                                    "persist_bull": 5, "persist_bear": 86}})
+        pl = live_screen.payload_for(UNI, md, {}, base.candle(11))
+        for code, side, persist in (("AUTO", 1, 91), ("BANK", -1, 86)):
+            self.assertEqual(pl["sectors"][code]["side"], side)
+            self.assertEqual(pl["sectors"][code]["persist"], persist)
+            self.assertEqual(pl["sectors"][code]["persist"],
+                             live_screen._cell(md, code, UNI["sectors"][code])["persist"])
+
     def test_the_screen_judges_it_both_ways(self):
         frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12),
                   base.data.yahoo_stock("HDFCBANK"): base.falling(1_600, 2, 12)}
