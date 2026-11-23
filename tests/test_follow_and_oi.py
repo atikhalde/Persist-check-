@@ -60,9 +60,11 @@ class FollowScanTests(TestCase):
         # The pick is counted once per candle; the sector it dragged along is a
         # separate clause, so the numbers add up to "with a sector pick 1".
         self.assertIn("Sectors picked (candles): PHA long, follow 1 · followed: ENE 1", text)
-        self.assertIn("Signals not alerted: 2 fired before their sector was picked "
-                      "(ABC 09:30, XYZ 09:40) · 2 on the opposite side to the pick "
+        # Historical fires were delivered as watch alerts and are no longer
+        # reported as never alerted; opposite-side signals remain refused.
+        self.assertIn("Signals not alerted: 2 on the opposite side to the pick "
                       "(PQR 10:00, XYZ 10:00)", text)
+        self.assertIn("LATE LEADER catch-ups 2", text)
 
     def test_summary_says_so_when_nothing_fired_or_nothing_was_picked(self):
         self.scan.side_effect = None

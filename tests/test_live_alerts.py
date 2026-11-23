@@ -469,10 +469,13 @@ class LiveAlertTests(TestCase):
         self.assertEqual(pipeline.run_once()["signals"], [])
         self.assertEqual(self.send.call_count, 2)
 
-    def test_historical_table_row_is_never_sent(self):
+    def test_historical_table_row_is_watch_only(self):
         self.scan.return_value = [signal("09:50")]
         self.assertEqual(pipeline.run_once()["signals"], [])
-        self.assertEqual([call.args[0] for call in self.send.call_args_list], ["market"])
+        texts = [call.args[0] for call in self.send.call_args_list]
+        self.assertTrue(any("LATE LEADER WATCH" in text and "Not an entry alert" in text for text in texts))
+        self.assertNotIn("ABC", state.load()["positions"])
+
 
     def test_mixed_old_and_current_fires_only_send_current(self):
         # Nov 6's KALYANKJIL @09:20 and TITAN @09:30 were both sent at
@@ -1324,17 +1327,15 @@ class LateLeaderTests(LiveAlertTests):
 
     def test_a_stock_that_fired_before_the_pick_is_reported(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
-        pipeline.run_once()                       # BAR is 10:00, 11 minutes later
+        pipeline.run_once()
         texts = [c.args[0] for c in self.send.call_args_list]
-        late = [t for t in texts if "LATE LEADER" in t]
-        self.assertEqual(len(late), 1, texts)
-        self.assertIn("fired before its sector was picked", late[0])
-        self.assertIn("Fired <b>09:55</b>", late[0])
+        late = [t for t in texts if "LATE LEADER WATCH" in t]
+        self.assertEqual(len(late), 1)
+        self.assertIn("fired 09:55", late[0])
         self.assertIn("Not an entry alert", late[0])
-        self.assertIn("no position", late[0].replace("no position was opened for it", "no position"))
-        self.assertEqual(state.load()["stats"]["catchup"], 1)
-        self.assertNotIn("ABC", state.load()["positions"])       # never a trade
+        self.assertNotIn("ABC", state.load()["positions"])
         self.assertIn("ABC", state.load()["catchup"])
+
 
     def test_it_is_not_sent_twice_on_the_next_candle(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
@@ -1349,23 +1350,22 @@ class LateLeaderTests(LiveAlertTests):
         self.uni["sectors"]["IT"]["stocks"] = ["ABC", "XYZ"]
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
         pipeline.run_once()
-        late = [c.args[0] for c in self.send.call_args_list if "LATE LEADER" in c.args[0]]
-        self.assertEqual(len(late), 1, late)      # one message, not one per name
-        self.assertIn("×2", late[0])
-        self.assertIn("ABC", late[0])
-        self.assertIn("XYZ", late[0])
-        self.assertIn("Not entry alerts", late[0])
+        late = [c.args[0] for c in self.send.call_args_list if "LATE LEADER WATCH" in c.args[0]]
+        self.assertEqual(len(late), 1)
+        self.assertIn("ABC", late[0]); self.assertIn("XYZ", late[0])
+        self.assertIn("Not an entry alert", late[0])
         self.assertEqual(state.load()["stats"]["catchup"], 2)
 
-    def test_a_stop_taken_since_the_fire_is_refused_and_counted(self):
+
+    def test_a_stopped_historical_fire_is_only_a_watch(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
-        taken = quiet_bars(*self.times, low=98.0)          # traded through the SL since
+        taken = quiet_bars(*self.times, low=98.0)
         self.fetch_many.side_effect = lambda tickers, period, interval: {
             t: (taken if t == "ABC.NS" else bars(*self.times)) for t in tickers}
         pipeline.run_once()
-        self.assertEqual([c for c in self.send.call_args_list if "LATE LEADER" in c.args[0]], [])
-        self.assertEqual(state.load()["stats"]["catchup_skip"]["stop"], 1)
-        self.assertIn("stop taken since the fire 1", pipeline.format_summary(state.load()))
+        self.assertTrue(any("Not an entry alert" in c.args[0] for c in self.send.call_args_list))
+        self.assertNotIn("ABC", state.load()["positions"])
+
 
     def test_the_knob_switches_the_alert_off_but_not_the_reject_book(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
@@ -1392,32 +1392,21 @@ class LateLeaderEntryTests(LiveAlertTests):
         self.times = ([BAR - timedelta(minutes=5 * i) for i in range(9, 0, -1)]
                       + [BAR, BAR + timedelta(minutes=5)])
 
-    def test_a_late_leader_before_its_target_is_entered(self):
+    def test_old_fire_is_watch_even_when_late_entry_setting_is_enabled(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
         pipeline.run_once()
         texts = [c.args[0] for c in self.send.call_args_list]
-        entry = [t for t in texts if "LATE LEADER ENTRY" in t]
-        self.assertEqual(len(entry), 1, texts)
-        self.assertIn("Catch-up entry", entry[0])
-        self.assertIn("Fired <b>09:55</b>", entry[0])
-        self.assertNotIn("Not an entry alert", entry[0])
-        st = state.load()
-        self.assertEqual(st["stats"]["late_entries"], 1)
-        self.assertEqual(st["stats"]["entries"], 1)
-        self.assertEqual(st["positions"]["ABC"]["entry"], 100.0)
-        self.assertLess(st["positions"]["ABC"]["sl"], 100.0)   # the fire candle's EMA9 stop
-        self.assertTrue(st["catchup"]["ABC"]["entry"])
+        self.assertTrue(any("LATE LEADER WATCH" in t and "Not an entry alert" in t for t in texts))
+        self.assertFalse(any("LATE LEADER ENTRY" in t for t in texts))
+        self.assertNotIn("ABC", state.load()["positions"])
 
-    def test_the_entry_fills_the_pick_cap(self):
+
+    def test_watch_does_not_consume_a_pick_cap(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
         with patch.dict("os.environ", {"MAX_ENTRIES_PER_PICK": "1"}):
             pipeline.run_once()
-            self.now = BAR + timedelta(minutes=11)
-            self.times = self.times + [BAR + timedelta(minutes=10)]
-            pipeline.run_once()
-        st = state.load()
-        self.assertEqual(st["stats"]["late_entries"], 1)
-        self.assertEqual(st["pick_entries"], {"IT long": 1})
+        self.assertEqual(state.load().get("pick_entries", {}), {})
+
 
     def test_a_trade_that_has_already_paid_is_refused_by_the_plan(self):
         plan = TradePlan(100.0, 99.0, 99.0, 1.0, 103.0, 104.0, 105.0)
@@ -1442,53 +1431,24 @@ class LateLeaderEntryTests(LiveAlertTests):
         far = TradePlan(100.0, 99.0, 99.0, 1.0, 105.0, 106.0, 108.0)    # target worth it
         self.assertIsNotNone(pipeline.late_plan({**hit, "plan": far, "price": 100.5}))
 
-    def test_a_fire_older_than_the_window_is_re_based_on_this_candle(self):
-        """20 Nov BANK: the pick arrives after every name in the sector has fired.
-
-        With the window at 10 minutes the 09:20 fire is 41 minutes old on the
-        10:00 candle — `old`, on every candle the sector held the pick. The fire's
-        entry, stop and target are hours of trend out of date by the time the
-        sector qualifies, so the trade taken is this candle's: 1R from here, not
-        4R from there. ``plan_at`` supplies it and the fire supplies the reason.
-        """
-        plan = TradePlan(100.0, 99.0, 98.5, 1.5, 102.25, 105.0, 108.0)
+    def test_very_old_fire_is_watch_not_rebased_entry(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:20")]
-        with patch.dict("os.environ", {"SCAN5M_LEADER_MAX_MINUTES": "10"}), \
-                patch.object(pipeline.trade, "plan_at", return_value=plan) as at:
+        with patch.dict("os.environ", {"SCAN5M_LEADER_MAX_MINUTES": "10"}):
             pipeline.run_once()
         texts = [c.args[0] for c in self.send.call_args_list]
-        entry = [t for t in texts if "LATE LEADER ENTRY (re-based)" in t]
-        self.assertEqual(len(entry), 1, texts)
-        self.assertIn("levels re-based on this candle", entry[0])
-        self.assertIn("this candle's EMA9 stop", entry[0])
-        self.assertNotIn("R from the fire", entry[0])
-        self.assertEqual(at.call_count, 1)
-        st = state.load()
-        self.assertEqual(st["stats"]["rebased_entries"], 1)
-        self.assertEqual(st["stats"]["late_entries"], 1)
-        self.assertEqual(st["positions"]["ABC"]["sl"], 98.5)   # this candle's, not the fire's
-        self.assertTrue(st["catchup"]["ABC"]["entry"])
+        self.assertTrue(any("LATE LEADER WATCH" in t for t in texts))
+        self.assertFalse(any("LATE LEADER ENTRY" in t for t in texts))
+        self.assertNotIn("ABC", state.load()["positions"])
 
-    def test_the_re_base_knob_leaves_only_the_fires_own_levels(self):
-        """With the re-base off, the window is open but there is nothing to take.
 
-        ``PICK_CATCHUP`` re-opens the catch-up for a late pick, so the refusal is
-        no longer ``old`` — it is the fire's own plan that refuses (its entry,
-        its stop, its targets are hours stale). That is the whole reason the
-        re-base exists, and ``LATE_LEADER_REBASE=0`` restores exactly it.
-        """
+    def test_rebase_knob_cannot_promote_old_fire_on_5m(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:20")]
-        with patch.dict("os.environ", {"SCAN5M_LEADER_MAX_MINUTES": "10",
-                                       "LATE_LEADER_REBASE": "0"}):
-            pipeline.run_once()
-        texts = [c.args[0] for c in self.send.call_args_list]
-        self.assertEqual([t for t in texts if "LATE LEADER ENTRY" in t], [])
-        st = state.load()
-        self.assertNotIn("ABC", st["positions"])
-        self.assertNotIn("rebased_entries", st["stats"])
-        skips = st["stats"]["catchup_skip"]
-        self.assertEqual(skips.get("old"), None)          # the window was re-opened
-        self.assertEqual(sum(skips.values()), 1)          # and the fire's plan refused
+        for setting in ("0", "1"):
+            with patch.dict("os.environ", {"LATE_LEADER_REBASE": setting}):
+                pipeline.run_once()
+        self.assertNotIn("ABC", state.load()["positions"])
+        self.assertFalse(any("LATE LEADER ENTRY" in c.args[0] for c in self.send.call_args_list))
+
 
     def test_the_knob_restores_the_plain_heads_up(self):
         self.scan.side_effect = lambda raw, *a, **k: [signal(time="09:55")]
@@ -1528,3 +1488,30 @@ class TradeRecordTests(TestCase):
         from nse_scanner import scan1m
         self.assertIn("new_position", inspect.getsource(scan1m.confirm_pass))
         self.assertNotIn('"risk":', inspect.getsource(scan1m.confirm_pass))
+
+
+class NewContinuationIntegrationTests(LiveAlertTests):
+    def test_old_fire_then_new_break_after_pick_opens_fresh_entry(self):
+        from nse_scanner import continuation
+        self.scan.side_effect = lambda raw, *args, **kwargs: [signal(time="09:20")]
+        prior = state.reset_if_new_day({}, str(BAR.date()))
+        continuation.note_pick(prior, "IT", 1, BAR - timedelta(minutes=5))
+        state.save(prior)
+        prices = quiet_bars(*self.times)
+        prices.loc[BAR - timedelta(minutes=10), ["High", "Close"]] = [100.0, 99.0]
+        prices.loc[BAR - timedelta(minutes=5), ["High", "Close"]] = [101.0, 100.0]
+        prices.loc[BAR, ["High", "Low", "Close"]] = [103.0, 100.0, 102.0]
+        self.fetch_many.side_effect = lambda tickers, period, interval: {
+            t: (prices if t.endswith(".NS") else bars(*self.times)) for t in tickers}
+        plan = TradePlan(102.0, 101.0, 100.0, 2.0, 105.0, 107.0, 109.0)
+        with patch.object(pipeline, "build_plan", return_value=plan), \
+             patch.object(pipeline, "momentum_verdict", return_value=(True, "", 75.0)):
+            result = pipeline.run_once()
+        self.assertEqual(len(result["signals"]), 1)
+        self.assertEqual(result["signals"][0]["name"], "NEW CONTINUATION BUY")
+        st = state.load()
+        self.assertIn("ABC", st["positions"])
+        timing = st["sent"]["ABC"]["timing"]
+        self.assertEqual(timing["kind"], "5m-entry")
+        self.assertEqual(timing["signal_bar"], BAR.isoformat())
+        self.assertTrue(timing["send_succeeded"])

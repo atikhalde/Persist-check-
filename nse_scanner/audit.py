@@ -202,6 +202,7 @@ def build(st: dict, *, bot: str = "5m") -> dict:
             "no_index": stats.get("no_index") or {},
             "catchup_skip": stats.get("catchup_skip") or {},
             "fresh_leaders": stats.get("fresh_leaders") or {},
+            "alert_timing": stats.get("alert_timing") or [],
             "undelivered": len(st.get("undelivered") or {}),
             "secondary_failures": _secondary_failures(),
         },
