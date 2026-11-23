@@ -186,6 +186,18 @@ class ClosePassTests(unittest.TestCase):
         self.assertIn("MARUTI", sent[0])
         bot1.assert_not_called()
 
+    def test_result_counts_qualified_candidates_not_only_cards(self):
+        st = screen.fresh("2026-11-20")
+        frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12)}
+        with mock.patch.dict(os.environ, {"SCREEN_LAST_ENTRY": "09:30"}), \
+                mock.patch.object(screen, "load", return_value=st), \
+                mock.patch.object(screen, "save"), \
+                mock.patch.object(live_screen.telegram, "send_bot4", return_value=True):
+            out = live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                         last=base.candle(11))
+        self.assertEqual(out["candidates"], 1)
+        self.assertEqual(out["surfaced"], [])
+
     def test_a_dry_run_does_not_send_its_update_lines(self):
         """DRY_RUN=1 posted CONFIRMED/CANCELLED to bot 4 before this test existed."""
         frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12)}
@@ -246,6 +258,27 @@ class OnePassPerCandleTests(unittest.TestCase):
         self.assertTrue(second.get("skipped"))
         self.assertEqual(second["surfaced"], [])
         self.assertEqual(len(sent), 1, "the retry carded the same name again")
+
+    def test_previous_session_same_label_does_not_skip_new_day(self):
+        st = screen.fresh("2026-11-19")
+        st["scan"] = [{"b": "10:10"}]
+        frames = {base.data.yahoo_stock("MARUTI"): base.rising(10_000, 8, 12)}
+        with mock.patch.object(screen, "load", return_value=st), \
+                mock.patch.object(screen, "save"), \
+                mock.patch.object(live_screen.telegram, "send_bot4", return_value=True):
+            out = live_screen.close_pass(uni=UNI, md=read(), frames=frames,
+                                         last=base.candle(11))
+        self.assertFalse(out.get("skipped"))
+        self.assertEqual(st["session"], "2026-11-20")
+        self.assertEqual(len(out["surfaced"]), 1)
+
+    def test_retry_of_earlier_recorded_bar_is_not_judged(self):
+        st = screen.fresh("2026-11-20")
+        st["scan"] = [{"b": "10:10"}, {"b": "10:15"}]
+        with mock.patch.object(screen, "load", return_value=st):
+            out = live_screen.close_pass(uni=UNI, md=read(), frames={},
+                                         last=base.candle(11))
+        self.assertTrue(out["skipped"])
 
     def test_the_next_candle_is_judged_again(self):
         st = screen.fresh("2026-11-20")

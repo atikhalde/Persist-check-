@@ -129,9 +129,9 @@ def _verdict(st: dict) -> str:
                 "candle rows do not establish whether another runner screened them; "
                 "no trading performance can be inferred without outcomes.")
     if not done:
-        return (f"{setups} setup(s) surfaced and none has a candle after it yet: the "
-                "session ended at the bar that surfaced them. Nothing can be concluded "
-                "about them today; they are listed so tomorrow's tape can be compared.")
+        return (f"{setups} setup(s) surfaced and none has a tracked outcome in this "
+                "ledger. Later observations may be missing; no performance conclusion "
+                "can be drawn without them.")
     prec = s.get("precision")
     worked, stopped = s.get("worked") or 0, s.get("stopped") or 0
     text = (f"{setups} setup(s) surfaced, {done} tracked: {worked} reached +1R before the "
@@ -549,9 +549,9 @@ def _write_pdf(st: dict, path: Path) -> None:
         sty["small"]))
     flow.append(Paragraph("10 · What the day could not see", sty["h"]))
     flow.append(Paragraph(
-        "The screen judges only closed 5m candles of names whose bar published. A stale "
-        "feed is counted as \"no candle for the name\" above and nothing else; there is no "
-        "back-fill and no late entry. Setups are measured, not traded — no money, no "
+        "Close passes use published 5m candles; provisional passes use forming bars. "
+        "Sectors and names not fetched or stopped by an earlier gate cannot be diagnosed "
+        "from later refusal counts. Setups are measured, not traded — no money, no "
         "position, no stop order was ever placed by this module.", sty["body"]))
     flow.append(Paragraph(
         f"<b>Reproduce:</b> python -m nse_scanner screen-pdf --session {session}  ·  "
@@ -666,8 +666,9 @@ def _cli(session: str | None = None) -> int:
               "this means the board artifact had no state/screen_state.json.")
         return 1
     if session and str(st.get("session") or "") != session:
-        log.warning("state holds session %s, not %s — reporting what is there",
-                    st.get("session"), session)
+        log.error("state holds session %s, not %s — refusing to report the wrong session",
+                  st.get("session"), session)
+        return 1
     out = report(st, dry_run=os.environ.get("DRY_RUN", "0") == "1")
     print(f"audit: {out['path']}  sent={out['sent']}")
     return 0 if out["path"].exists() else 1

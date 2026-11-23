@@ -168,6 +168,40 @@ class GateTests(ScreenCase):
         sec["AUTO"]["persist"] = 55
         self.refuses(sectors=sec, gate="sector persist below floor")
 
+    def test_slope_uses_exact_number_of_prior_observations(self):
+        st = screen.fresh("2026-11-20")
+        for i, value in enumerate((90, 91, 92)):
+            screen._record_sectors(st, {"b": str(i), "sectors": {
+                "AUTO": {"persist": value, "side": 1}}}, {})
+        with patch.dict(os.environ, {"SCREEN_SLOPE_BARS": "3"}):
+            self.assertEqual(screen._slopes(st, {"sectors": {
+                "AUTO": {"persist": 95}}})["AUTO"], 5)
+        with patch.dict(os.environ, {"SCREEN_SLOPE_BARS": "1"}):
+            self.assertEqual(screen._slopes(st, {"sectors": {
+                "AUTO": {"persist": 95}}})["AUTO"], 3)
+
+    def test_sector_slope_uses_sector_candle_for_early_and_missing_bars(self):
+        st = screen.fresh("2026-11-20")
+        for bar, value in (("09:55", 80), ("10:00", 82), ("10:05", 87)):
+            screen._record_sectors(st, {"b": bar, "sectors": {
+                "AUTO": {"persist": value, "side": 1}}}, {})
+        with patch.dict(os.environ, {"SCREEN_SLOPE_BARS": "1"}):
+            pl = {"sector_bar": "10:05", "sectors": {
+                "AUTO": {"persist": 87, "side": 1}}}
+            self.assertEqual(screen._slopes(st, pl)["AUTO"], 5)
+            pl["sector_bar"] = "10:15"
+            self.assertEqual(screen._slopes(st, pl), {})
+            pl["sector_bar"] = "10:05"
+            pl["sectors"]["AUTO"]["side"] = -1
+            self.assertEqual(screen._slopes(st, pl), {})
+
+    def test_slope_does_not_mix_old_and_new_persistence_metrics(self):
+        st = screen.fresh("2026-11-20")
+        st["sectors"] = [{"b": "10:00", "sec": {"AUTO": {"persist": 50}}}]
+        with patch.dict(os.environ, {"SCREEN_SLOPE_BARS": "1"}):
+            self.assertEqual(screen._slopes(st, {"sectors": {
+                "AUTO": {"persist": 95}}}), {})
+
     def test_a_falling_sector_is_refused(self):
         """Persistence 92 -> 92 -> 85: still above the floor, but falling."""
         sec = payload()["sectors"]
@@ -402,6 +436,24 @@ class OnTimeTests(ScreenCase):
         self.assertIn("closes in <b>60s</b>", self.sent[0])
         self.assertIn("forming close", self.sent[0])
         self.assertIn("Not an entry alert", self.sent[0])
+
+    def test_no_provisional_card_after_candle_has_closed(self):
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            out = screen.provisional(self.st(), payload(), self.forming(), md(), candle(11),
+                                     send=self.send,
+                                     now=candle(11) + timedelta(minutes=5))
+        self.assertEqual(out, [])
+        self.assertEqual(self.sent, [])
+
+    def test_empty_provisional_pass_is_recorded(self):
+        sec = payload()["sectors"]
+        sec["AUTO"]["persist"] = 10
+        with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
+            out = screen.provisional(self.st(), payload(sectors=sec), self.forming(), md(),
+                                     candle(11), send=self.send,
+                                     now=candle(11) + timedelta(minutes=4))
+        self.assertEqual(out, [])
+        self.assertEqual(self.st()["stats"]["early_passes"], 1)
 
     def test_the_same_name_is_not_surfaced_again_at_the_close(self):
         with patch.dict(os.environ, {"SCREEN_EARLY": "1"}):
@@ -704,6 +756,13 @@ class PdfTests(ScreenCase):
     def test_the_cli_refuses_to_audit_a_ledger_with_no_candle(self):
         with patch.object(screen, "load", return_value=screen.fresh("2026-11-20")):
             self.assertEqual(screen_pdf._cli(), 1)
+
+    def test_cli_does_not_send_a_different_session(self):
+        st = self.report_state()
+        with patch.object(screen, "load", return_value=st), \
+                patch.object(screen_pdf, "report") as send:
+            self.assertEqual(screen_pdf._cli(session="2026-11-19"), 1)
+            send.assert_not_called()
 
     def test_the_cli_builds_the_audit_for_a_ledger_that_has_one(self):
         st = self.report_state()

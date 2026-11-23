@@ -2534,7 +2534,7 @@ def _screen_pass(md, last: datetime, uni: dict) -> None:
         if not screen.screen_enabled():
             return
         out = live_screen.close_pass(uni=uni, md=md, last=last)
-        log.info("bot 4 %s: %d candidate(s), %d card(s) · feed +%.1fs · screen %.0fms",
+        log.info("bot 4 %s: %d candidate(s), %d card(s) · close-to-data-ready +%.1fs · screen %.0fms",
                  out.get("bar") or to_ist(last).strftime("%H:%M"), out.get("candidates", 0),
                  len(out.get("surfaced") or []), float(out.get("feed_s") or 0.0),
                  1000.0 * float(out.get("screen_s") or 0.0))
