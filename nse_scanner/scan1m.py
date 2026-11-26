@@ -2498,14 +2498,35 @@ _PERSIST_FWD_MIN_STRUCTURE = 55.0
 _PERSIST_FWD_MIN_PERSIST = 70.0
 
 
-def _persist_fwd_miss_reason(stats: dict, raw: str) -> str:
-    """Best-effort reason the original scan did not enter this name."""
+def _persist_fwd_hhmm(text: str) -> str | None:
+    """Extract first HH:MM token from reject detail/key text."""
+    import re
+
+    m = re.search(r"\b([01]\d|2[0-3]):([0-5]\d)\b", str(text or ""))
+    return f"{m.group(1)}:{m.group(2)}" if m else None
+
+
+def _persist_fwd_minutes(hhmm: str | None) -> int | None:
+    if not hhmm or ":" not in hhmm:
+        return None
+    try:
+        hh, mm = hhmm.split(":")[:2]
+        return int(hh) * 60 + int(mm)
+    except (TypeError, ValueError):
+        return None
+
+
+def _persist_fwd_miss_info(stats: dict, raw: str) -> dict:
+    """Best-effort original miss reason and signal fired time."""
     rejected = (stats or {}).get("rejected") or {}
     for kind in ("earlier", "follower", "no_target", "oi", "chased", "late"):
         book = rejected.get(kind) or {}
-        if any(str(k) == raw or str(k).startswith(f"{raw}@") for k in book):
-            return kind
-    return "not_alerted"
+        for k, detail in book.items():
+            key = str(k)
+            if key == raw or key.startswith(f"{raw}@"):
+                fired = _persist_fwd_hhmm(key) or _persist_fwd_hhmm(str(detail))
+                return {"miss_reason": kind, "signal_fired_at": fired}
+    return {"miss_reason": "not_alerted", "signal_fired_at": None}
 
 
 def _persist_fwd_candidates(st: dict) -> list[dict]:
@@ -2583,6 +2604,12 @@ def _persist_fwd_candidates(st: dict) -> list[dict]:
             need = _PERSIST_FWD_MIN_TOP5 if len(recent) >= _PERSIST_FWD_MIN_TOP5 else max(2, len(recent) - 1)
             if top5 < need and top2 < 3:
                 continue
+            miss_info = _persist_fwd_miss_info(stats, raw)
+            fired_at = miss_info.get("signal_fired_at")
+            bar_hhmm = str(latest.get("b") or "")
+            fired_m = _persist_fwd_minutes(fired_at)
+            bar_m = _persist_fwd_minutes(bar_hhmm)
+            delay_min = (bar_m - fired_m) if fired_m is not None and bar_m is not None and bar_m >= fired_m else None
             out.append({
                 "key": key, "name": raw, "sector": sector, "side": side,
                 "rank": round(rank, 1), "pos": pos, "mv": round(mv, 2),
@@ -2590,8 +2617,10 @@ def _persist_fwd_candidates(st: dict) -> list[dict]:
                 "top5": top5, "top2": top2, "bars": len(recent),
                 "persist": round(persist, 1), "picked": bool(sec.get("pick")),
                 "gate": bool(sec.get("gate")),
-                "miss_reason": _persist_fwd_miss_reason(stats, raw),
-                "bar": str(latest.get("b") or ""),
+                "miss_reason": miss_info.get("miss_reason", "not_alerted"),
+                "signal_fired_at": fired_at,
+                "delay_min": delay_min,
+                "bar": bar_hhmm,
             })
     out.sort(key=lambda r: (-r["rank"], -r["top5"], -abs(r["mv"])))
     return out
@@ -2611,12 +2640,17 @@ def _format_persist_fwd_alert(c: dict) -> str:
         "not_alerted": "original: not alerted/entered",
     }.get(c.get("miss_reason", ""), c.get("miss_reason", "not_alerted"))
     pick_txt = "PICK" if c.get("picked") else ("QUALIFIED" if c.get("gate") else "STRONG")
+    fired_at = c.get("signal_fired_at") or "unknown"
+    alert_at = c.get("bar") or "unknown"
+    delay = c.get("delay_min")
+    delay_txt = f"{int(delay)} min" if isinstance(delay, (int, float)) else "unknown"
     return (
         f"🔬 <b>[FORWARD TEST] PERSISTENT LEADER</b> — observation only, not an entry\n"
         f"<b>{c['name']}</b> ({c['sector']} · {side_txt}) · {pick_txt}\n"
         f"Rank {c['rank']:.1f} · #{c['pos']} in sector · top5 {c['top5']}/{c['bars']} bars · "
         f"top2 {c['top2']}/{c['bars']}\n"
         f"Move {c['mv']:+.2f}% · structure {c['structure']:.0f}{lead_txt} · sector persist {c['persist']:.0f}\n"
+        f"Signal fired: {fired_at} · Forward-test alert: {alert_at} · Delay: {delay_txt}\n"
         f"{miss}\n"
         f"<i>Forward-test alert based on 2026-11-25 edge audit: persistent leaders missed as earlier/follower. "
         f"Track outcome; does not affect original 1m scan.</i>"
@@ -2650,6 +2684,8 @@ def run_persist_fwd_alerts(now: datetime | None = None) -> int:
                 "bar": c["bar"], "name": c["name"], "sector": c["sector"],
                 "side": c["side"], "rank": c["rank"], "mv": c["mv"],
                 "top5": c["top5"], "miss_reason": c["miss_reason"],
+                "signal_fired_at": c.get("signal_fired_at"),
+                "delay_min": c.get("delay_min"),
                 "sent": bool(ok), "ts": now.isoformat(),
             }
             if ok:
