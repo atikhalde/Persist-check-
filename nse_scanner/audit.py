@@ -163,6 +163,7 @@ def build(st: dict, *, bot: str = "5m") -> dict:
             "confirmed": stats.get("confirmed"), "cancelled": stats.get("cancelled"),
             "catchup": stats.get("catchup"), "late_entries": stats.get("late_entries"),
             "alerts": len(st.get("sent") or {}),
+            "persist_fwd_alerts": len(stats.get("persist_fwd_alerted") or {}),
         },
         "books": books,
         "trades": closed,
@@ -211,6 +212,9 @@ def build(st: dict, *, bot: str = "5m") -> dict:
         "costs": {"bps_per_side": costs.cost_bps(), "min_per_order": costs.cost_min(),
                   "capital_per_trade": costs.trade_capital()},
         "alerts": {raw: rec for raw, rec in (st.get("sent") or {}).items()},
+        "forward_test": {
+            "persist_fwd_alerted": stats.get("persist_fwd_alerted") or {},
+        },
     }
 
 

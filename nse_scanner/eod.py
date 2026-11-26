@@ -475,6 +475,33 @@ def _blocked(st: dict) -> list[str]:
     return lines
 
 
+def _persist_fwd(st: dict) -> list[str]:
+    """Forward-test persistent leader alerts (observation only, separate from entries)."""
+    stats = st.get("stats") or {}
+    alerted = stats.get("persist_fwd_alerted") or {}
+    if not alerted:
+        return []
+    rows = list(alerted.values())
+    rows.sort(key=lambda r: (str(r.get("bar") or ""), str(r.get("name") or "")))
+    sent_n = sum(1 for r in rows if r.get("sent"))
+    lines = [f"<b>Forward-test persistent leader alerts (observation only)</b> — {_n(len(rows), 'alert')}"]
+    lines.append("Separate from original 1m scan entries; not written to sent/positions/early.")
+    for r in rows[:20]:
+        side = "BUY" if int(r.get("side") or 0) == 1 else "SELL"
+        mark = "sent" if r.get("sent") else "not delivered"
+        mv = r.get("mv")
+        mv_txt = f" · mv {float(mv):+.2f}%" if mv is not None else ""
+        lines.append(
+            f"• {r.get('bar','?')} {r.get('name','?')} {r.get('sector','?')} {side}"
+            f" · rank {float(r.get('rank') or 0):.1f} · top5 {int(r.get('top5') or 0)}"
+            f"{mv_txt} · miss {r.get('miss_reason','?')} · {mark}"
+        )
+    if len(rows) > 20:
+        lines.append(f"… {len(rows) - 20} more in audit/state")
+    lines.append(f"Delivered: {sent_n}/{len(rows)}. Forward-test only — track outcomes before promoting.")
+    return lines
+
+
 def _trades(st: dict) -> list[str]:
     """The trader's ledger: size, both prices, costs, rupees and R."""
     rows = ledger.closed_rows(st)
@@ -648,7 +675,7 @@ def _observations(st: dict) -> list[str]:
 def format_eod(st: dict, *, bot: str = "5m") -> str:
     """The whole day, in one (long) text. Split it with :func:`chunks` to send."""
     blocks = [_head(st, bot), _day_shape(st), _timeline(st), _persistence(st),
-              _leadership(st), _entry_ranks(st), _blocked(st), _trades(st), _health(st),
+              _leadership(st), _entry_ranks(st), _blocked(st), _persist_fwd(st), _trades(st), _health(st),
               _rules(),
               _observations(st)]
     return "\n\n".join("\n".join(b for b in block if b) for block in blocks if block)
