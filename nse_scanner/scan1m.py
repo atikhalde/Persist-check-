@@ -232,6 +232,15 @@ def leader_max_r() -> float:
     return max(0.5, _env_float("SCAN1M_LEADER_MAX_R", 2.0))
 
 
+def persist_fwd_alert() -> bool:
+    """Emit separate forward-test alerts for persistent leaders missed by original scan (1).
+
+    This is an observation-only alert path for forward testing. It never writes
+    to ``sent``/``positions``/``early`` and never changes original scan behavior.
+    """
+    return os.environ.get("SCAN1M_PERSIST_FWD_ALERT", "1") != "0"
+
+
 # ── ledger ───────────────────────────────────────────────────────────────────
 def ledger_path():
     if _dry():
@@ -2480,6 +2489,182 @@ def _end_of_session(now: datetime) -> None:
         log.exception("1m session summary failed")
 
 
+# ── forward-test: persistent leader alerts (observation only) ───────────────
+_PERSIST_FWD_MIN_RANK = 72.0
+_PERSIST_FWD_MIN_TOP5 = 4
+_PERSIST_FWD_LOOKBACK_BARS = 8
+_PERSIST_FWD_MIN_MOVE_PP = 0.5
+_PERSIST_FWD_MIN_STRUCTURE = 55.0
+_PERSIST_FWD_MIN_PERSIST = 70.0
+
+
+def _persist_fwd_miss_reason(stats: dict, raw: str) -> str:
+    """Best-effort reason the original scan did not enter this name."""
+    rejected = (stats or {}).get("rejected") or {}
+    for kind in ("earlier", "follower", "no_target", "oi", "chased", "late"):
+        book = rejected.get(kind) or {}
+        if any(str(k) == raw or str(k).startswith(f"{raw}@") for k in book):
+            return kind
+    return "not_alerted"
+
+
+def _persist_fwd_candidates(st: dict) -> list[dict]:
+    """Persistent top leaders missed by original scan, from board bars.
+
+    Observation-only forward-test signal. It never mutates sent/positions/early.
+    """
+    stats = st.get("stats") or {}
+    board = stats.get("board") or {}
+    bars = board.get("bars") or []
+    if not bars:
+        return []
+    recent = bars[-_PERSIST_FWD_LOOKBACK_BARS:]
+    latest = recent[-1]
+    sectors = latest.get("sectors") or {}
+    sent = st.get("sent") or {}
+    positions = st.get("positions") or {}
+    early = st.get("early") or {}
+    already = stats.get("persist_fwd_alerted") or {}
+
+    out: list[dict] = []
+    for sector, sec in sectors.items():
+        if not isinstance(sec, dict):
+            continue
+        side = int(sec.get("side") or 0)
+        if side not in (1, -1):
+            continue
+        persist = float(sec.get("persist") or 0)
+        if not (sec.get("pick") or sec.get("gate") or persist >= _PERSIST_FWD_MIN_PERSIST):
+            continue
+        names = sec.get("n") or []
+        ranks = sec.get("rank") or []
+        rks = sec.get("rk") or []
+        moves = sec.get("mv") or []
+        structs = sec.get("t") or []
+        leads = sec.get("lead") or []
+        for i, raw in enumerate(names):
+            if i >= len(rks) or i >= len(ranks):
+                continue
+            try:
+                pos = int(rks[i])
+                rank = float(ranks[i])
+                mv = float(moves[i]) if i < len(moves) and moves[i] is not None else None
+                structure = float(structs[i]) if i < len(structs) and structs[i] is not None else 0.0
+                lead_pp = leads[i] if i < len(leads) else None
+            except (TypeError, ValueError):
+                continue
+            if pos > 2 or rank < _PERSIST_FWD_MIN_RANK:
+                continue
+            if structure < _PERSIST_FWD_MIN_STRUCTURE:
+                continue
+            if mv is None or (side == 1 and mv < _PERSIST_FWD_MIN_MOVE_PP) or (side == -1 and mv > -_PERSIST_FWD_MIN_MOVE_PP):
+                continue
+            key = f"{sector}|{raw}|{side}"
+            if key in already or raw in sent or raw in positions or raw in early:
+                continue
+            # Persistence: count top5 appearances in recent bars.
+            top5 = 0
+            top2 = 0
+            for b in recent:
+                bsec = (b.get("sectors") or {}).get(sector) or {}
+                bn = bsec.get("n") or []
+                brk = bsec.get("rk") or []
+                if raw in bn:
+                    j = bn.index(raw)
+                    if j < len(brk):
+                        try:
+                            p = int(brk[j])
+                        except (TypeError, ValueError):
+                            p = 99
+                        if p <= 5:
+                            top5 += 1
+                        if p <= 2:
+                            top2 += 1
+            need = _PERSIST_FWD_MIN_TOP5 if len(recent) >= _PERSIST_FWD_MIN_TOP5 else max(2, len(recent) - 1)
+            if top5 < need and top2 < 3:
+                continue
+            out.append({
+                "key": key, "name": raw, "sector": sector, "side": side,
+                "rank": round(rank, 1), "pos": pos, "mv": round(mv, 2),
+                "structure": round(structure, 1), "lead_pp": lead_pp,
+                "top5": top5, "top2": top2, "bars": len(recent),
+                "persist": round(persist, 1), "picked": bool(sec.get("pick")),
+                "gate": bool(sec.get("gate")),
+                "miss_reason": _persist_fwd_miss_reason(stats, raw),
+                "bar": str(latest.get("b") or ""),
+            })
+    out.sort(key=lambda r: (-r["rank"], -r["top5"], -abs(r["mv"])))
+    return out
+
+
+def _format_persist_fwd_alert(c: dict) -> str:
+    side_txt = "BUY" if c["side"] == 1 else "SELL"
+    lead = c.get("lead_pp")
+    lead_txt = f" · lead {lead:+.2f}pp" if isinstance(lead, (int, float)) else ""
+    miss = {
+        "earlier": "original missed: earlier (fired before pick)",
+        "follower": "original missed: follower (outside top-N at signal time)",
+        "no_target": "original missed: no target",
+        "oi": "original missed: OI filter",
+        "chased": "original missed: chased",
+        "late": "original missed: late",
+        "not_alerted": "original: not alerted/entered",
+    }.get(c.get("miss_reason", ""), c.get("miss_reason", "not_alerted"))
+    pick_txt = "PICK" if c.get("picked") else ("QUALIFIED" if c.get("gate") else "STRONG")
+    return (
+        f"🔬 <b>[FORWARD TEST] PERSISTENT LEADER</b> — observation only, not an entry\n"
+        f"<b>{c['name']}</b> ({c['sector']} · {side_txt}) · {pick_txt}\n"
+        f"Rank {c['rank']:.1f} · #{c['pos']} in sector · top5 {c['top5']}/{c['bars']} bars · "
+        f"top2 {c['top2']}/{c['bars']}\n"
+        f"Move {c['mv']:+.2f}% · structure {c['structure']:.0f}{lead_txt} · sector persist {c['persist']:.0f}\n"
+        f"{miss}\n"
+        f"<i>Forward-test alert based on 2026-11-25 edge audit: persistent leaders missed as earlier/follower. "
+        f"Track outcome; does not affect original 1m scan.</i>"
+    )
+
+
+def run_persist_fwd_alerts(now: datetime | None = None) -> int:
+    """Send separate forward-test persistent-leader alerts. Observation only.
+
+    Never writes to sent/positions/early. Dedupe in stats.persist_fwd_alerted.
+    """
+    if not persist_fwd_alert():
+        return 0
+    from .session import now_ist
+
+    now = now or now_ist()
+    try:
+        st = load_ledger()
+        stats = st.setdefault("stats", {})
+        cands = _persist_fwd_candidates(st)
+        if not cands:
+            return 0
+        alerted = stats.setdefault("persist_fwd_alerted", {})
+        sent_n = 0
+        for c in cands:
+            if c["key"] in alerted:
+                continue
+            text = _format_persist_fwd_alert(c)
+            ok = telegram.send_bot3(text, dry_run=_dry())
+            alerted[c["key"]] = {
+                "bar": c["bar"], "name": c["name"], "sector": c["sector"],
+                "side": c["side"], "rank": c["rank"], "mv": c["mv"],
+                "top5": c["top5"], "miss_reason": c["miss_reason"],
+                "sent": bool(ok), "ts": now.isoformat(),
+            }
+            if ok:
+                sent_n += 1
+                log.info("persist-fwd alert: %s %s %s rank=%s top5=%s/%s miss=%s",
+                         c["name"], c["sector"], c["side"], c["rank"], c["top5"], c["bars"], c["miss_reason"])
+            else:
+                log.warning("persist-fwd alert not delivered: %s %s", c["name"], c["sector"])
+        save_ledger(st)
+        return sent_n
+    except Exception:
+        log.exception("persist-fwd alert pass failed")
+        return 0
+
+
 def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = False,
                  force_sector: str | None = None) -> str:
     """Minute-aligned loop: project inside the candle, confirm at its close."""
@@ -2536,6 +2721,8 @@ def live_loop_1m(*, max_minutes: float | None = None, exit_at_close: bool = Fals
                 run_minute(bar, now=now, force_sector=force_sector)
             # The whole board, once per candle, after the alerts of this minute.
             sweep_board(now=now)
+            # Forward-test observation alerts (separate from original scan/entries).
+            run_persist_fwd_alerts(now=now)
             # Holiday detection, exactly as the 5m loop does it: three candles in
             # a row with no NSE bar today and the day is treated as closed.
             if _session_closed(now):
