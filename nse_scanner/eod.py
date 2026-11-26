@@ -491,10 +491,13 @@ def _persist_fwd(st: dict) -> list[str]:
         mark = "sent" if r.get("sent") else "not delivered"
         mv = r.get("mv")
         mv_txt = f" · mv {float(mv):+.2f}%" if mv is not None else ""
+        fired = r.get("signal_fired_at") or "?"
+        delay = r.get("delay_min")
+        delay_txt = f"{int(delay)}m" if isinstance(delay, (int, float)) else "?"
         lines.append(
             f"• {r.get('bar','?')} {r.get('name','?')} {r.get('sector','?')} {side}"
             f" · rank {float(r.get('rank') or 0):.1f} · top5 {int(r.get('top5') or 0)}"
-            f"{mv_txt} · miss {r.get('miss_reason','?')} · {mark}"
+            f"{mv_txt} · fired {fired} · delay {delay_txt} · miss {r.get('miss_reason','?')} · {mark}"
         )
     if len(rows) > 20:
         lines.append(f"… {len(rows) - 20} more in audit/state")
